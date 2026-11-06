@@ -2171,6 +2171,14 @@ static void lower_plop3(L *l, const Insn *x) {
         {0x80, 0, 0}, {0xfe, 1, 1}, {0xa8, 0, 1}, {0xea, 1, 0}, {0xf8, 0, 1}, {0xc0, 0, 0}, {0xfc, 1, 0}, {0x96, 2, 2},
         {0x78, 0, 2}, {0x3c, 1, 2}, {0xe8, 2, 1}, {0xb8, 0, 0},
     };
+    // An input that is PT (7) or !PT (15) is a constant: only the table rows where it has that value count, so a
+    // table of two inputs (a ^ b with c = PT, the usual 0x28) matches the three-input candidates that agree on them.
+    uint32_t care = 0xff;
+    for (uint32_t v = 0; v < 8; v++) {
+        if ((a & 7) == 7 && ((v >> 2 & 1) != !(a >> 3))) care &= ~(1u << v);
+        if ((b & 7) == 7 && ((v >> 1 & 1) != !(b >> 3))) care &= ~(1u << v);
+        if ((c & 7) == 7 && ((v & 1) != !(c >> 3))) care &= ~(1u << v);
+    }
     // The table of (a op_ab b) op_c c over inputs negated by n (bit 2 a, bit 1 b, bit 0 c) for each candidate.
     for (uint32_t n = 0; n < 8; n++) {
         for (unsigned i = 0; i < sizeof tables / sizeof tables[0]; i++) {
@@ -2181,7 +2189,7 @@ static void lower_plop3(L *l, const Insn *x) {
                 r = tables[i].op_c == 0 ? (ab & vc) : tables[i].op_c == 1 ? (ab | vc) : (ab ^ vc);
                 t |= r << v;
             }
-            if (t != lut) continue;
+            if ((t ^ lut) & care) continue;
             uint32_t na = a ^ ((n >> 2 & 1) << 3), nb = b ^ ((n >> 1 & 1) << 3), nc = c ^ ((n & 1) << 3);
             emit(l, 0x5090000000000000ull | l->pred | 7 | ((uint64_t)pd << 3) | ((uint64_t)(nc & 7) << 12) | ((uint64_t)(nc >> 3) << 15) |
                         ((uint64_t)tables[i].op_ab << 24) | ((uint64_t)(nb & 7) << 29) | ((uint64_t)(nb >> 3) << 32) |
