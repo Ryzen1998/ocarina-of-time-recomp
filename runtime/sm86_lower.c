@@ -1738,7 +1738,8 @@ static void lower_movm(L *l, const Insn *x) {
 // uniform register at 40-45; 0x361 TEX.B: handle in the operand list). dimension 61-63, mask 72-75, second
 // destination 64-71, offsets 76, depth compare 78, fp16 results 79, lod mode 87-89, nodep 90. The operand list
 // is (array index), coordinates, [handle], [lod], [offsets], [reference], packed into Ra then Rb: up to four
-// values are split evenly (1+1, 2+1, 2+2), five or more as 4+n. Maxwell TEX takes the coordinates in Ra.. and
+// values are split evenly (1+1, 2+1, 2+2), five or more as 4+n; with bit 60 clear the coordinates are Ra's and the
+// rest Rb's. Maxwell TEX takes the coordinates in Ra.. and
 // the rest in Rb..; TEX.B takes the handle first in Rb. Values already lying that way are used in place, the
 // others go through scratch. Bank 2 is the game's texture constant buffer, which the translator knows as the
 // bound descriptors (TEX with the word index); another bank loads the handle for TEX.B.
@@ -1759,12 +1760,14 @@ static void lower_tex(L *l, const Insn *x, uint32_t op) {
     if (dim == 6 || bits(x, 77, 1) || bits(x, 81, 3) != 7 || bits(x, 59, 1) != (op == 0x361 ? 1u : 0u) ||
         (lod > 3 && lod != 6 && lod != 7) || (dc && mask != 1) || mask == 0)
         return (void)fail(l, "TEX mode");
-    if (!bits(x, 60, 1) && op != 0x361) return (void)fail(l, "TEX unpacked operands");
     uint32_t coords = coord_count[dim];
     int has_lod = lod == 2 || lod == 3 || lod == 6 || lod == 7;
     uint32_t handle_slot = op == 0x361 ? 1 : 0;
     uint32_t count = coords + handle_slot + has_lod + offsets + dc;
-    uint32_t in_a = op == 0x361 && !bits(x, 60, 1) ? coords : count <= 4 ? (count + 1) / 2 : op == 0x361 ? coords : 4;
+    // Bit 60 clear: Ra holds the coordinates and Rb everything after them, for TEX as for TEX.B (measured on the
+    // 3D fetches of one fragment shader, coordinates in Ra..Ra+2, then the LOD in Rb and the packed offsets in Rb+1;
+    // other combinations of unpacked operands are assumed to follow the same rule, not seen).
+    uint32_t in_a = !bits(x, 60, 1) ? coords : count <= 4 ? (count + 1) / 2 : op == 0x361 ? coords : 4;
     uint32_t tid = bits(x, 40, 14), bank = bits(x, 54, 5);
     uint32_t v[8];
     for (uint32_t i = 0; i < count && i < 8; i++)
