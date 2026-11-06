@@ -304,6 +304,39 @@ never fired because the SDK does not call that one there. Left as is: `hostfn_tr
 thread they started on across a call that can move a fiber (`c->thread` before the call), so with asynchronous
 preemption on the host depth of a moved fiber is counted on the wrong thread.
 
+## Status (2026-11-06, the mesh stages measured): the level's scene is drawn by mesh tasks
+
+With the start-up crash gone, the quick route (`--replay build/logs/a-spam.txt --skip-movies`, 110 s) reaches the
+Deku Tree's dialogue over a black scene every time. Measured on the way:
+- The NVN2 stubs now log their call count at 10, 100, 1,000... (`nvn_procs.c` NVN_STUB). In about 40 s of the level
+  the game made 10,000 to 99,999 `nvnCommandBufferDrawMeshTasksIndirect` and 1,000 to 9,999
+  `nvnCommandBufferDrawMeshTasks` calls (run-85), so at least about ten mesh draws a frame, against about 100
+  ordinary draws.
+- The frame dump of frame 2000 (dump-84) has no scene pass at all: 59 dispatches and 86 render passes, the largest
+  960x540 (10 passes, 36 draws), then the 2560x1440 composition with the subtitles. The mesh draws, being stubs, do
+  not reach the dump; everything the scene is made of goes through them.
+- 110 distinct programs fail to lower in the level (51,824 log lines, the same programs retried): unknown opcodes
+  57, scratch pressure 17, `RED address` 10, uniform datapath opcodes 8, `PLOP3` 6, and smaller groups.
+- The corpus holds 12 mesh-pipeline programs, 9 mesh and 3 task, all from the agl package
+  (`ApplicationPackage.Nin_Ounce_NVN2.release.sarc.zs/AglShader.sharcb`), 16 to 616 instructions: a few generic
+  mesh programs feed the materials' thousands of pixel shaders. None lowers: the stages write their outputs (and the
+  task stage its payload) with `ISBEWR` and read their inputs with `ISBERD`, whose immediates are undocumented. The
+  smallest mesh program, 28b308906146a98b (112 instructions, workgroup 32), reads `ISBERD [0x0]`, writes
+  `ISBEWR 0x3ff` and `0x30a` (likely the vertex and primitive counts), then per vertex `0x4`/`0x6`, `0x8012`/`0x8018`,
+  `0x100ff`, `0x18014`, `0x20000`/`0x20008`, `0x28001`/`0x28009` (an attribute word address with what may be a
+  component in bits 15-17) and per primitive `0x40d`, `0x505`, `0x607`, `0x707`, `0x805`, `0x90f`, `0x8002`, `0x3`,
+  `0x1000a`, `0x1800b`. The task program 9d61d62aa9337355 (16 instructions) writes `0x1001` and `0x400`.
+
+What the mesh stages need, in order: decode the `ISBEWR`/`ISBERD` address encoding from these programs and what the
+game draws with them; lower them (`sm86_lower.c`) to an output form the translator can take; a translator patch for
+SPIR-V's `MeshEXT`/`TaskEXT` execution models (per-vertex and per-primitive output arrays, `SetMeshOutputsEXT`, the
+task payload, `EmitMeshTasksEXT`), which Ryujinx 1.3.2 lacks; and on the host `VK_EXT_mesh_shader` pipelines with
+task and mesh stages and `vkCmdDrawMeshTasks*EXT` for the eight NVN2 entry points, still stubs. The first step is the
+uncertain one.
+
+Also fixed: `tools/shader_census.py --lower` lowered nothing when the repository's path held a space (the helper's
+batch request is split at spaces); it now passes paths relative to the output folder.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485
