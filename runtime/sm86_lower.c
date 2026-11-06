@@ -1546,7 +1546,15 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
 static void lower_stg(L *l, const Insn *x, uint32_t op) {
     uint32_t data = bits(x, 32, 8), size = bits(x, 73, 3), address = bits(x, 24, 8), offset = bits(x, 40, 24);
     if (size > 6 || bits(x, 16, 8)) return (void)fail(l, "STG mode");
-    if (data == RZ && size > 4) return (void)fail(l, "STG of wide zeros");
+    if (data == RZ && size > 4) {
+        // A wide store of zeros needs an aligned run of zeroed registers: scratch from index 4 on (0 to 3 serve the
+        // address), moved up to the alignment.
+        uint32_t n = size == 6 ? 4 : 2, first = S(l, 4);
+        int k = 4 + (int)((n - first % n) % n);
+        data = S(l, k);
+        for (uint32_t i = 0; i < n; i++) mov_imm(l, S(l, k + (int)i), 0);
+        if (l->failed) return;
+    }
     if (op == 0x986) {
         uint32_t ubase = ur_pair(l, bits(x, 64, 6), 2);
         int descriptor = (x->w[2] & ~(0x3fu | 0xe00u)) == 0x0c101100u;
