@@ -1404,7 +1404,9 @@ static void lower_mufu(L *l, const Insn *x) {
 }
 
 // IPA: the attribute field at 64-73 counts dwords (28 = position.x at a[0x70], 32 = a[0x80]); sample mode 76-77,
-// constant (.PASS) 78, the interpolation weight register in the b slot (RZ: the usual one).
+// constant (.PASS) 78, the interpolation weight register in the b slot (RZ: the usual one). Ra (an offset for the
+// offset mode, which is refused) is ignored, so IPA 0x526, whose Ra is a uniform register (bit 91; UR4 holding 0 in
+// the two fragment shaders that use it), lowers as 0x326 does.
 static void lower_ipa(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), attr = bits(x, 64, 10);
     if (bits(x, 32, 8) != RZ || bits(x, 76, 2) > 1 || bits(x, 79, 1) || bits(x, 81, 3) != 7 || attr * 4 > 0x3ff)
@@ -2764,7 +2766,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x309: case 0xd09: return lower_popc_flo(l, x, 0);
     case 0x301: return lower_brev(l, x);
     case 0x230: case 0x430: case 0x630: return lower_hadd2(l, x, op);
-    case 0x326: return lower_ipa(l, x);
+    case 0x326: case 0x526: return lower_ipa(l, x);
     case 0x321: return lower_ald_ast(l, x, 0);
     case 0x322: return lower_ald_ast(l, x, 1);
     case 0xb82: return lower_ldc(l, x);
