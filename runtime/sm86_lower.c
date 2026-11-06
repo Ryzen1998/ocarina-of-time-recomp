@@ -2206,6 +2206,33 @@ static void lower_plop3(L *l, const Insn *x) {
             return;
         }
     }
+    // The rest of the three-input tables: any order of the inputs (a & !(b & c) is b, c first), and the second PSETP
+    // destination, which holds (!(X op Y)) op Z where the first holds (X op Y) op Z. Tried after the fixed forms
+    // above so the lowering of programs that already lowered stays as it was.
+    static const uint8_t perms[6][3] = {{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}};
+    const uint32_t in[3] = {a, b, c};
+    for (int second = 0; second < 2; second++)
+        for (int pi = 0; pi < 6; pi++)
+            for (uint32_t n = 0; n < 8; n++)
+                for (uint32_t oab = 0; oab < 3; oab++)
+                    for (uint32_t oc = 0; oc < 3; oc++) {
+                        uint32_t t = 0;
+                        for (uint32_t v = 0; v < 8; v++) {
+                            uint32_t val[3] = {v >> 2 & 1, v >> 1 & 1, v & 1}, x = val[perms[pi][0]] ^ (n >> 2 & 1),
+                                     y = val[perms[pi][1]] ^ (n >> 1 & 1), z = val[perms[pi][2]] ^ (n & 1);
+                            uint32_t xy = oab == 0 ? (x & y) : oab == 1 ? (x | y) : (x ^ y);
+                            if (second) xy ^= 1;
+                            t |= (oc == 0 ? (xy & z) : oc == 1 ? (xy | z) : (xy ^ z)) << v;
+                        }
+                        if ((t ^ lut) & care) continue;
+                        uint32_t nx = in[perms[pi][0]] ^ ((n >> 2 & 1) << 3), ny = in[perms[pi][1]] ^ ((n >> 1 & 1) << 3),
+                                 nz = in[perms[pi][2]] ^ ((n & 1) << 3);
+                        emit(l, 0x5090000000000000ull | l->pred | (second ? pd : 7) | ((uint64_t)(second ? 7 : pd) << 3) |
+                                    ((uint64_t)(nz & 7) << 12) | ((uint64_t)(nz >> 3) << 15) | ((uint64_t)oab << 24) |
+                                    ((uint64_t)(ny & 7) << 29) | ((uint64_t)(ny >> 3) << 32) | ((uint64_t)(nx & 7) << 39) |
+                                    ((uint64_t)(nx >> 3) << 42) | ((uint64_t)oc << 45));
+                        return;
+                    }
     (void)fail(l, "PLOP3 table");
 }
 
