@@ -468,3 +468,14 @@ lowering, translating and `spirv-val` offline (no game run):
 - Corpus: 14,306 of 14,363 lower (was 13,569 after the previous commit), every newly lowered vs/ps/cs program
   translates and validates. Left: mesh and task stages (12), UPLOP3 (13), PLOP3 reading a swapped predicate (10), the
   uniform-predicate budget of 10 vertex shaders, FCHK, IABS with an immediate, one TLD.
+
+Update (2026-11-06, the Great Deku Tree scene): a real session (build/logs/run-51.log) had 24 distinct programs refused,
+all compute kernels but one vertex shader. All 24 now lower, translate and pass `spirv-val` offline. What did it:
+UPLOP3 (through the PLOP3 lowering); a PLOP3 whose real input is the predicate a uniform one is swapped into (copied to a
+free predicate first); PLOP3 tables in any input order and through PSETP's second destination; a retry with the uniform
+predicates swapped through a register when the free predicates run out; opcode 0x243 (F2IP.U8.F32, clamp and pack two
+floats into bytes; the rounding numbering is an assumption), IABS from a constant, LEA with a subtracted addend, TLD with
+texel offsets (2D: x and y in Ra, Rb the LOD then the offsets; seen on 40 fetches), and SURED (0x59f). The register that
+holds the uniform predicates could not be register 0 before. Corpus: 14,332 of 14,363 lower; left are the mesh and
+task stages (12), six compute programs stopped by one more opcode, ten vertex shaders short of a register for the
+uniform predicates and three short of a uniform register pair.
