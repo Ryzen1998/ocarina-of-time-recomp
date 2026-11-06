@@ -103,6 +103,7 @@ typedef struct {
     int scanned;                                   // needs_reg is final: a read of another register is a scan bug
     uint32_t used_preds;                           // predicates the program touches (bit n = Pn)
     uint8_t up_map[8];                             // uniform predicate -> predicate (0xff unmapped, 7 = UPT)
+    int force_swap;                                // up_swap although predicates are free (a retry)
     int up_swap;                                   // no predicate is free: UPn lives in bit n of up_reg and is
                                                    // swapped into Pn around each instruction naming it
     uint32_t up_reg;
@@ -449,7 +450,7 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
         b_reg = 1;
     int c_reg = base < 0x100 ? 1 : 0;                              // ALU: a register at 64 in every form
     int store = base == 0x186 || base == 0x187 || base == 0x188 || base == 0x122 || base == 0x18e || base == 0x127 ||
-                base == 0x19b || base == 0x19c || base == 0x19e;
+                base == 0x19b || base == 0x19c || base == 0x19e || base == 0x19f;
     int no_dst = store || base == 0x118 || base == 0x11a || base == 0x192 || base == 0x11d || base == 0x004 || base == 0x01c ||
                  (base == 0x00b) || (base == 0x00c) || (base == 0x034);   // FSETP, ISETP, HSETP2: predicates only
     // The destination's width: loads by their size (73-75: 6 = 128 bits, 5 = 64), texture ops by their mask (the
@@ -489,6 +490,10 @@ static void insn_regs(const Insn *x, uint64_t use[4], uint64_t def[4]) {
         else set_run(use, f16, 2);
     }
     if (base == 0x03b && !predicated) set_run(def, f16, 1u << bits(x, 72, 2));   // LDSM: count registers
+    if (base == 0x19f) {                                          // SURED: coordinates by the dimension, one data register
+        static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
+        set_run(use, f24, coords[bits(x, 61, 3)]);
+    }
     if (base == 0x19b) {                                          // SUST: coordinates by the dimension, data by the mask
         static const uint8_t coords[8] = {1, 1, 2, 2, 3, 3, 1, 1};
         set_run(use, f24, coords[bits(x, 61, 3)]);
@@ -655,13 +660,16 @@ static void scan_uniform(L *l) {
         }
     }
     memset(l->up_map, 0xff, sizeof l->up_map);
-    l->up_swap = (l->used_preds & 0x7f) == 0x7f;
+    // The uniform predicates are swapped through a register when no real predicate is free, or when a first attempt
+    // ran out of free ones (force_swap: three compute kernels of the Great Deku Tree scene name four uniform
+    // predicates and leave three free).
+    l->up_swap = l->force_swap || (l->used_preds & 0x7f) == 0x7f;
     // The registers the lowering needs for the program's length: one per uniform register no forwarding covers,
     // one for the uniform predicates when they are swapped through a register. The scratch block starts above them.
     uint32_t nur = 0;
     for (uint32_t n = 0; n < 63; n++)
         if (l->needs_reg[n]) nur++;                               // defined or not (a read before any definition)
-    if ((l->used_preds & 0x7f) == 0x7f)                           // the uniform predicates' register (up_swap)
+    if (l->up_swap)                                               // the uniform predicates' register (up_swap)
         for (uint32_t i = 0; i < l->n; i++) if (up_fields(&l->in[i])) { nur++; break; }
     l->scratch_base = l->ur_next + nur > 255 ? 255 : l->ur_next + nur;
     for (uint32_t r = l->ur_next; r < l->scratch_base; r++) l->reserved[r / 64] |= 1ull << (r % 64);
@@ -1160,7 +1168,17 @@ static void lower_lea(L *l, const Insn *x, uint32_t op) {
     int ext = bits(x, 74, 1);
     uint32_t cin = bits(x, 87, 3), cin_inv = bits(x, 90, 1);
     if (!ext && bits(x, 87, 4) != 15) return (void)fail(l, "LEA carry in without .X");
-    if (neg_b) return (void)fail(l, "LEA negated addend");
+    if (neg_b && (ext || cout != 7 || neg_a)) return (void)fail(l, "LEA negated addend");
+    if (neg_b && !bits(x, 80, 1)) {
+        // Rd = (a << shift) - b: the shift (when there is one), then IADD with the second operand negated (bit 48).
+        uint32_t t = a.reg, rb = to_reg(l, b, 1, 0, 0);
+        if (shift) {
+            t = S(l, 2);
+            emit(l, base(l, 0x3848000000000000ull, t, a.reg) | ((uint64_t)shift << 20));
+        }
+        emit(l, base(l, 0x5c10000000000000ull, rd, t) | ((uint64_t)rb << 20) | ((uint64_t)1 << 48));
+        return;
+    }
     if (bits(x, 80, 1)) {
         // LEA.HI: Rd = Rb + the high word of (Rc:Ra << shift): SHF.L Rt = (Rc:Ra) << shift high, or a right shift
         // of Ra by 32 - shift when Rc is RZ (sign-extended by 73); then the add, with a carry out when asked.
@@ -1174,7 +1192,7 @@ static void lower_lea(L *l, const Insn *x, uint32_t op) {
         }
         uint32_t rb = to_reg(l, b, 1, 0, 0);
         if (cout == 7 && !ext) {
-            emit(l, base(l, 0x5c10000000000000ull, rd, t) | ((uint64_t)rb << 20));
+            emit(l, base(l, 0x5c10000000000000ull, rd, t) | ((uint64_t)rb << 20) | ((uint64_t)neg_b << 48));   // 48: -b
             return;
         }
         emit(l, base(l, 0x5c10000000000000ull, t, t) | ((uint64_t)rb << 20));
@@ -1610,6 +1628,24 @@ static void lower_suld(L *l, const Insn *x) {
     if (!cbuf_ok(&h)) return (void)fail(l, "SULD handle");
     uint32_t hr = to_reg(l, h, 4, 0, 0);
     emit(l, 0xeb00000000000000ull | l->pred | rd | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)PT << 30) |
+                ((uint64_t)dim << 33) | ((uint64_t)hr << 39));
+}
+
+// SURED (0x59f, 2026-11-06: the Great Deku Tree scene's compute kernel b9141b0b, 1164 requests): a reduction of one
+// 32-bit value into a surface texel. Data 32-39, coordinates 24-31, the handle's constant word as SUST's (index 40-53,
+// bank 54-58), dimension 61-63 (1 buffer, 3 2D), reduction 87-89 (Add, Min, Max, Inc, Dec, And, Or, Xor on both
+// sides); the rest of the word must be the one seen (U32, strong, GPU scope). Maxwell SURED.B (bindless, Ryujinx
+// InstSuredB): data 0-7, coordinates 8-15, size 20-22 (U32 = 0), operation 24-26, dimension 33-35, handle 39-46.
+// Fields as Lichii's Ampere front end reads them (GPL, for the field meanings only).
+static void lower_sured(L *l, const Insn *x) {
+    uint32_t coord = bits(x, 24, 8), data = bits(x, 32, 8), dim = bits(x, 61, 3);
+    if ((x->w[2] & ~0x03800000u) != 0x0010e000u || (dim != 1 && dim != 3) || bits(x, 59, 2) || coord > 253)
+        return (void)fail(l, "SURED mode");
+    Src h = {0};
+    h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
+    if (!cbuf_ok(&h)) return (void)fail(l, "SURED handle");
+    uint32_t hr = to_reg(l, h, 4, 0, 0);
+    emit(l, 0xeb50000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)bits(x, 87, 3) << 24) |
                 ((uint64_t)dim << 33) | ((uint64_t)hr << 39));
 }
 
@@ -2615,22 +2651,29 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), rd2 = bits(x, 64, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8);
     uint32_t mask = bits(x, 72, 4), dim = bits(x, 61, 3), tid = bits(x, 40, 14), bank = bits(x, 54, 5), lod = bits(x, 87, 3);
     int array = dim == 5, volume = dim == 2, level = lod == 3, bindless = op == 0xf66;
-    if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || bits(x, 76, 5) || bits(x, 81, 3) != 7 ||
+    // Texel offsets (bit 76, 2D only): x and y in Ra and Ra+1, then Rb holds the LOD (level fetches) and the packed
+    // offsets after it, as Maxwell's TLD.AOFFI reads Ra and Rb. Taken from the 2D fetches of the Great Deku Tree
+    // scene's compute kernels (Ra constant, Rb the offsets register, 40 fetches); other dimensions are refused.
+    int offsets = bits(x, 76, 1);
+    if (offsets && dim != 1) return (void)fail(l, "TLD mode");
+    if (!bits(x, 60, 1) || (dim != 0 && dim != 1 && !array && !volume) || bits(x, 77, 4) || bits(x, 81, 3) != 7 ||
         (lod != 1 && !level) || bits(x, 59, 1) || mask == 0 || (bindless && (bits(x, 46, 13) || !bits(x, 91, 1))) ||
         (!bindless && bank >= 18))
         return (void)fail(l, "TLD mode");
     uint32_t coords[3], n = 0, lev = RZ;
     if (array || volume) coords[n++] = ra, coords[n++] = ra + 1, coords[n++] = rb;
+    else if (dim == 1 && offsets) coords[n++] = ra, coords[n++] = ra == RZ ? RZ : ra + 1;
     else if (dim == 1) coords[n++] = ra, coords[n++] = rb;
     else coords[n++] = ra;
-    if (level) lev = (array || volume || dim == 1) ? rb + 1 : rb;
+    if (level) lev = (array || volume || (dim == 1 && !offsets)) ? rb + 1 : rb;
     if (level && dim == 0) lev = rb;
+    uint32_t offs = offsets ? (level ? rb + 1 : rb) : RZ;
     int contiguous = coords[0] != RZ;
     for (uint32_t i = 1; i < n; i++) contiguous &= coords[i] == coords[0] + i;
     uint32_t c0 = coords[0];
     if (!contiguous) { for (uint32_t i = 0; i < n; i++) mov_reg(l, S(l, (int)i), coords[i]); c0 = S(l, 0); }
     int bound = !bindless && bank == 2;
-    uint32_t m0 = lev;
+    uint32_t m0 = level ? lev : offs;                    // the LOD and the offsets lie side by side in Rb, Rb + 1
     if (!bound) {
         if (bindless) to_reg_into(l, ur_src(l, bits(x, 40, 6)), S(l, 4));
         else {
@@ -2638,7 +2681,9 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
             if (!cbuf_ok(&h)) return (void)fail(l, "TLD handle address");
             mov_cbuf(l, S(l, 4), &h);
         }
-        if (level) mov_reg(l, S(l, 5), lev);
+        int next = 5;
+        if (level) mov_reg(l, S(l, next++), lev);
+        if (offsets) mov_reg(l, S(l, next++), offs);
         m0 = S(l, 4);
     }
     uint32_t components = (uint32_t)__builtin_popcount(mask);
@@ -2648,7 +2693,7 @@ static void lower_tld(L *l, const Insn *x, uint32_t op) {
     uint32_t mdim = array ? 3 : volume ? 4 : dim == 1 ? 2 : 0;
     emit(l, (bound ? 0xdc00000000000000ull : 0xdd00000000000000ull) | l->pred | target | ((uint64_t)c0 << 8) | ((uint64_t)m0 << 20) |
                 ((uint64_t)mdim << 28) | ((uint64_t)mask << 31) | ((uint64_t)(bound ? tid : 0) << 36) | ((uint64_t)bits(x, 90, 1) << 49) |
-                ((uint64_t)7 << 51) | ((uint64_t)level << 55));
+                ((uint64_t)7 << 51) | ((uint64_t)level << 55) | ((uint64_t)offsets << 35));
     if (direct) return;
     for (uint32_t i = 0; i < components; i++) {
         uint32_t t = (!split || i < 2) ? (rd == RZ ? RZ : rd + i) : rd2 + (i - 2);
@@ -2900,6 +2945,7 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0xb60: case 0xf60: case 0x361: return lower_tex(l, x, op);
     case 0xb9b: return lower_sust(l, x);
     case 0xb97: return lower_suld(l, x);
+    case 0x59f: return lower_sured(l, x);
     case 0x231: case 0x431: case 0x631: case 0x831: case 0xa31: return lower_hfma2(l, x, op);
     case 0x23e: return lower_f2fp(l, x, op);
     case 0x234: case 0x434: return lower_hsetp2(l, x, op);
@@ -2947,8 +2993,8 @@ int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, 
     return sm86_lower_ex(code, code_size, control, control_size, out, sm86_lower_tensor_cores);
 }
 
-int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out,
-                  int tensor) {
+static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size,
+                         Sm86Lowered *out, int tensor, int force_swap) {
     memset(out, 0, sizeof *out);
     Sm86Control c;
     if (!sm86_control_parse(control, control_size, &c) || c.code_size > code_size) {
@@ -2956,6 +3002,7 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         return 0;
     }
     L l = {0};
+    l.force_swap = force_swap;
     l.stage = c.stage;
     l.graphics = c.stage != 5;
     l.tensor = tensor && !l.graphics && c.local[0] * c.local[1] * c.local[2] % 32 == 0;
@@ -3050,4 +3097,11 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
     }
     free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out);
     return !l.failed;
+}
+
+int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out,
+                  int tensor) {
+    if (lower_attempt(code, code_size, control, control_size, out, tensor, 0)) return 1;
+    if (strcmp(out->error, "no predicate free for a uniform predicate")) return 0;
+    return lower_attempt(code, code_size, control, control_size, out, tensor, 1);
 }
