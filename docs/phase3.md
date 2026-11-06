@@ -447,3 +447,24 @@ stub and `"\mp4"` escape to report upstream.
   `src/video_core/shader_environment.cpp`. Behaviour only, never code.
 - Nothing from the game is committed; everything extracted or decompressed stays under `build/` (the decompressed
   bfsha of this session lived in the scratchpad and is gone; regenerate it from the RomFS image).
+
+## Status (2026-11-06, lowering refusals of the first level)
+
+A play session to the first level logged 192 refused draws, which were 33 distinct programs (`.fail.ctl` / `.fail.code`
+files in the shader cache; `tools/sm86_dis.py` reads the code). Seven of them are not in the RomFS corpus the census
+reads (a 3D fragment shader, two fragment shaders with IPA 0x526, four compute programs). Changes, each checked by
+lowering, translating and `spirv-val` offline (no game run):
+
+- TEX with bit 60 clear (128 of the 192 draws, one program): Ra holds the coordinates, Rb the LOD then the packed
+  offsets (x, y, z in nibbles), as for TEX.B. Seen only on 3D fetches with LOD and offsets; other combinations are
+  assumed to follow the same rule.
+- IPA 0x526: Ra is a uniform register (UR4, always 0 there), ignored as the offset-free modes ignore Ra.
+- The skinning vertex shaders (660 corpus programs: up to 247 live registers, no run of four free): a wide LDG with a
+  uniform base keeps the base in its own destination, IMAD.WIDE writes Rd, Rd+1 directly or reuses the multiplier's
+  scratch. Checked by interpreting old and new lowerings of random LDG / IMAD.WIDE sequences over symbolic registers
+  (0 differences in 4000 programs; a deliberate bug is caught).
+- RED with a forwarded uniform pair aligns its scratch pair; PLOP3 tables are matched only on the rows consistent with
+  PT / !PT inputs; STG of wide zeros stores from zeroed scratch.
+- Corpus: 14,306 of 14,363 lower (was 13,569 after the previous commit), every newly lowered vs/ps/cs program
+  translates and validates. Left: mesh and task stages (12), UPLOP3 (13), PLOP3 reading a swapped predicate (10), the
+  uniform-predicate budget of 10 vertex shaders, FCHK, IABS with an immediate, one TLD.
