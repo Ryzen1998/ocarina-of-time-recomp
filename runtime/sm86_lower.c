@@ -106,6 +106,7 @@ typedef struct {
     int up_swap;                                   // no predicate is free: UPn lives in bit n of up_reg and is
                                                    // swapped into Pn around each instruction naming it
     uint32_t up_reg;
+    int up_reg_set;                                // up_reg is allocated (register 0 is a valid choice)
     uint64_t pred;                                 // the current instruction's predicate, in Maxwell's bits 16-19
     int tensor;                                    // HMMA to the MMA marker (sm86_lower_tensor_cores, compute)
     int hmma_count;                                // HMMAs lowered so far (OOT_TENSOR_HMMA_MASK)
@@ -2322,6 +2323,18 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
         y.w[2] = (x->w[2] & ~(0x7u << 23) & ~(1u << 27)) | (up(l, bits(x, 87, 3)) << 23);
         return lower_sel(l, &y, 0);
     }
+    case 0x09c: {                                             // UPLOP3: PLOP3 over uniform predicates
+        // Same fields as PLOP3 (table 64-66 and 72-76, inputs 87-90, 77-80, 68-71, outputs 81-83 and 84-86), every
+        // predicate a uniform one (UPT = 7 reads true). Each goes through up(): a free predicate, or the swapped
+        // slot, whose new value lower_one merges back into the register standing for the uniform predicates.
+        Insn y = *x;
+        uint32_t f[5] = {bits(x, 87, 4), bits(x, 77, 4), bits(x, 68, 4), bits(x, 81, 3), bits(x, 84, 3)};
+        for (int i = 0; i < 3; i++) f[i] = (f[i] & 8) | up(l, f[i] & 7);
+        for (int i = 3; i < 5; i++) f[i] = up(l, f[i]);
+        y.w[2] = (x->w[2] & ~(0xfu << 23 | 0xfu << 13 | 0xfu << 4 | 1u << 3 | 7u << 17 | 7u << 20 | 1u << 27)) | f[0] << 23 | f[1] << 13 |
+                 f[2] << 4 | f[3] << 17 | f[4] << 20;
+        return lower_plop3(l, &y);
+    }
     case 0x082:                                               // UMOV: register (0xc82, UR at 32-37) or immediate (0x882)
         if (bits(x, 16, 8) == 63 || !ur_has_reg(l, bits(x, 16, 8))) return;   // URZ, or every use forwards
         if (op == 0x882) return mov_imm(l, ur(l, bits(x, 16, 8)), x->w[1]);
@@ -2730,7 +2743,9 @@ static void lower_one(L *l, const Insn *x) {
         // slot is the instruction's result, kept out of the merge and the restore (2026-11-06: the upscaler's
         // first layer ends its tile loop on PLOP3 P0 = UP0; restoring P0 made the loop run until its counters
         // wrapped, 2.2 s per dispatch and a GPU timeout in play); an input in one would read the uniform value.
-        uint32_t wr = 0, rd = 0, op = x->w[0] & 0xfff;
+        uint32_t wr = 0, rd = 0, op = x->w[0] & 0xfff, temps = 0;
+        uint8_t copy_from[8] = {0};
+        Insn y = *x;                                          // the instruction with its conflicting inputs redirected
         if (op == 0x81c) {
             uint32_t pd = bits(x, 81, 3), pd2 = bits(x, 84, 3), a = bits(x, 87, 3), b = bits(x, 77, 3);
             if (pd != 7) wr |= 1u << pd;
@@ -2738,21 +2753,42 @@ static void lower_one(L *l, const Insn *x) {
             if (a != 7) rd |= 1u << a;
             if (b != 7) rd |= 1u << b;
             if (!bits(x, 67, 1) && bits(x, 68, 3) != 7) rd |= 1u << bits(x, 68, 3);
-            if (rd & swap) return (void)fail(l, "PLOP3 reads the predicate a uniform one is swapped into");
+            if (rd & swap) {
+                // A real input names the predicate a uniform one is swapped into (P0 = P0 & UP0 is the usual form,
+                // 2026-11-06: 10 compute kernels of the Great Deku Tree scene). Each such input is copied into a
+                // predicate the instruction does not name before the swap, and read from the copy; the copy's
+                // predicate is saved with the swapped ones and restored after.
+                uint32_t named = swap | wr | rd | (bits(x, 12, 3) != 7 ? 1u << bits(x, 12, 3) : 0), conflict = rd & swap;
+                for (uint32_t n = 0; n < 7; n++) {
+                    if (!(conflict >> n & 1)) continue;
+                    uint32_t k = 0;
+                    while (k < 7 && (named >> k & 1)) k++;
+                    if (k == 7) return (void)fail(l, "PLOP3 reads the predicate a uniform one is swapped into");
+                    named |= 1u << k, temps |= 1u << k;
+                    if (bits(x, 87, 3) == n) y.w[2] = (y.w[2] & ~(7u << 23)) | k << 23;
+                    if (bits(x, 77, 3) == n) y.w[2] = (y.w[2] & ~(7u << 13)) | k << 13;
+                    if (!bits(x, 67, 1) && bits(x, 68, 3) == n) y.w[2] = (y.w[2] & ~(7u << 4)) | k << 4;
+                    copy_from[k] = (uint8_t)n;
+                }
+                x = &y;
+            }
         }
         uint32_t keep = swap & ~wr;
-        if (!l->up_reg) {
+        if (!l->up_reg_set) {
             l->up_reg = l->liveness && l->ur_next >= l->scratch_base ? alloc_dead(l, 0, l->n - 1) : alloc_gpr(l);
             if (l->up_reg == NOREG) return (void)fail(l, "no general register free for the uniform predicates");
+            l->up_reg_set = 1;
         }
         uint32_t save = S(l, 7);
-        emit(l, 0x38e8000000070000ull | save | ((uint64_t)RZ << 8) | ((uint64_t)swap << 20));
+        emit(l, 0x38e8000000070000ull | save | ((uint64_t)RZ << 8) | ((uint64_t)(swap | temps) << 20));
+        for (uint32_t k = 0; k < 7; k++)                      // PSETP Pk = Pn & PT & PT: the real input before the swap
+            if (temps >> k & 1)
+                emit(l, 0x5090000000000000ull | 7 | ((uint64_t)k << 3) | ((uint64_t)PT << 12) | ((uint64_t)PT << 29) |
+                            ((uint64_t)copy_from[k] << 39) | ((uint64_t)7 << 16));
         emit(l, 0x38f0000000070000ull | ((uint64_t)l->up_reg << 8) | ((uint64_t)swap << 20));
         lower_one_inner(l, x);
-        if (keep) {
-            emit(l, 0x38e8000000070000ull | l->up_reg | ((uint64_t)l->up_reg << 8) | ((uint64_t)keep << 20));
-            emit(l, 0x38f0000000070000ull | ((uint64_t)save << 8) | ((uint64_t)keep << 20));
-        }
+        if (keep) emit(l, 0x38e8000000070000ull | l->up_reg | ((uint64_t)l->up_reg << 8) | ((uint64_t)keep << 20));
+        if (keep | temps) emit(l, 0x38f0000000070000ull | ((uint64_t)save << 8) | ((uint64_t)(keep | temps) << 20));
         return;
     }
     lower_one_inner(l, x);
