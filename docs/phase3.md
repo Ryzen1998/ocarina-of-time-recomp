@@ -282,6 +282,28 @@ Open, in order:
   quick route (`tools/run.py --replay build/logs/a-spam.txt --skip-movies`) reaches the level in about 75 s.
   The game has no button to skip the opening (the user).
 
+## Status (2026-11-06, the start-up crash): two host threads on one fiber stack
+
+The death right after the first frame (about one run in two: an access violation executing a heap or guest address,
+or in `kern_fiber_finalize`, often on two host threads at once) was not the SDK abort in MultiWait, nor the
+asynchronous preemption (`OOT_ASYNC_PREEMPT=0`: 4 of 10 runs died, against 2 of 10 with it). Every dump had the same
+guest stack: `nn::os` waits (`obs_ev_trywait`, `InternalWaitAnyImpl`) down to a `WaitSynchronization` (SVC 0x18)
+whose return landed on garbage. `OOT_FIBER_LOG=1` (new: a line per InitializeFiber, FinalizeFiber, SwitchToFiber
+and fiber return, with guest and host thread) showed the pattern before each death: SDK 22's `nn::async` coordinator
+yields a fiber with `SwitchToFiber(nullptr)` on one worker, another worker picks it up, and the fiber returns there.
+`fiber_main` then switched to the base fiber of the thread it had *started* on: clang took the address of the
+thread-local `tcur` once at entry and kept it in a callee-saved register across `rt_call` (LLVM treats a
+thread-local's address as fixed within a function). That base fiber was already running on its own thread, so two
+host threads ran one stack. `kernel.c` now reads `tcur` after a switch only through the out-of-line `tcur_now()`
+(in `fiber_main` and after `SwitchToFiber` in `fiber_switch_to`, which also wrote the context's host depth into the
+thread it had left). Result: 20 runs of 12 s, none died (before: 8 of 12, 2 of 10, 4 of 10 in three series).
+
+Also: the SDK's argument-less `nn::diag::detail::AbortImpl()` (the one `InternalWaitAnyImpl` calls) gets an observer
+in `ov_oot.c` that, for the MultiWait abort, lists the holders by vtable; the observer on the four-argument overload
+never fired because the SDK does not call that one there. Left as is: `hostfn_tracked` and `rt_original` keep the
+thread they started on across a call that can move a fiber (`c->thread` before the call), so with asynchronous
+preemption on the host depth of a moved fiber is counted on the wrong thread.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485
