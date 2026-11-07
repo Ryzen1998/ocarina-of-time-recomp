@@ -405,6 +405,7 @@ static const char *fault_address_type(VkDeviceFaultAddressTypeEXT t) {
 
 // The query runs once per process. Threads that hit the loss at the same time wait on the lock until it is logged, so
 // none of them reaches its rt_fatal and ends the process before the report is written.
+void vk_exec_count_dump(void);   // vk_exec_draw.c (OOT_SM86_COUNT)
 void vk_device_fault_report(VkResult r) {
     static SRWLOCK lock = SRWLOCK_INIT;
     static int done;
@@ -414,6 +415,7 @@ void vk_device_fault_report(VkResult r) {
     done = 1;
     vk_crumbs_report();
     vk_exec_fault_ops();
+    vk_exec_count_dump();
     VkCtx *c = vk_ctx();
     PFN_vkGetDeviceFaultInfoEXT get =
         c && c->has_device_fault ? (PFN_vkGetDeviceFaultInfoEXT)vkGetDeviceProcAddr(c->device, "vkGetDeviceFaultInfoEXT")

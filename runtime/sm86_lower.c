@@ -3493,7 +3493,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         if (probe.on && !l.graphics && l.index == 0) probe_emit(&l, 1);
         if (l.mesh == 7 && l.index == 0) mesh_prologue(&l);
         if (l.mesh == 6 && l.index == 0) task_prologue(&l);
-        if (cnt.on && !l.graphics && !l.mesh)
+        if (cnt.on && !l.graphics)
             for (uint32_t k = 0; k < cnt.n; k++)
                 if (cnt.at[k] == header + l.index * 16) count_emit(&l, k);
         lower_one(&l, &l.in[l.index]);

@@ -977,6 +977,7 @@ static struct {
 
 static uint32_t ptr_count(int st);
 static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
+static int cnt_on(void);
 static void mesh_c0(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     for (uint32_t k = 0; k < 16 && M.table + 16 * k + 16 <= VK_C0_BYTES; k++) {   // the stage's storage slots
         uint64_t a = ex->ssbo[NVN_STAGE_CS][k].addr;
@@ -994,6 +995,11 @@ static void mesh_c0(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     memcpy(bank + SM86_MESH_C0_TASK, &a, 8), memcpy(bank + SM86_MESH_C0_TASK + 8, &sz, 4);
     memcpy(bank + SM86_MESH_C0_MASK, &mask, 4), memcpy(bank + SM86_MESH_C0_SHIFT, &shift, 4);
     memcpy(bank + SM86_MESH_C0_COUNT, &M.count, 4);
+    if (cnt_on()) {   // OOT_SM86_COUNT in a task or mesh program
+        uint64_t ca = 1ull << 32;
+        uint32_t cs = 4 * SM86_COUNT_MAX;
+        memcpy(bank + SM86_COUNT_C0, &ca, 8), memcpy(bank + SM86_COUNT_C0 + 8, &cs, 4);
+    }
 }
 
 static uint32_t ptr_count(int st);
@@ -1668,6 +1674,16 @@ static int cnt_on(void) {
     rt_log("count: OOT_SM86_COUNT on, %u points", n);
     return CNT.on = 1;
 }
+// On a device loss (vk_device.c): the counters as the GPU left them (host-coherent memory outlives the device), so
+// a hang shows where its threads were.
+void vk_exec_count_dump(void) {
+    if (CNT.on <= 0 || !CNT.map) return;
+    uint32_t n;
+    const char (*at)[16] = sm86_count_points(&n);
+    char line[64 * 40], *o = line;
+    for (uint32_t k = 0; k < n && o < line + sizeof line - 40; k++) o += sprintf(o, " @%s:%u", at[k], CNT.map[k] - CNT.last[k]);
+    rt_log("count: at the device loss, since f%llu: %s", (unsigned long long)CNT.frame, line);
+}
 static void cnt_log(void) {
     if (!cnt_on()) return;
     uint64_t fr = gfx_stats().frames;
@@ -1687,7 +1703,7 @@ static void cnt_log(void) {
 
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
-    if (st == NVN_STAGE_CS && r->cbuf_slot == 0 && (uint32_t)r->handle * 4 == SM86_COUNT_C0 && !M.on && cnt_on()) {
+    if (st == NVN_STAGE_CS && r->cbuf_slot == 0 && (uint32_t)r->handle * 4 == SM86_COUNT_C0 && cnt_on()) {
         CNT.binds++;
         return (VkDescriptorBufferInfo){CNT.buf, 0, 4 * SM86_COUNT_MAX};
     }
