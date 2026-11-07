@@ -977,6 +977,8 @@ static struct {
 
 static uint32_t ptr_count(int st);
 static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
+static struct { uint64_t addr, size; } GW[VK_GW_N];   // the global window (gw_select, below)
+static uint32_t gw_n;
 static int cnt_on(void);
 static void mesh_c0(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     for (uint32_t k = 0; k < 16 && M.table + 16 * k + 16 <= VK_C0_BYTES; k++) {   // the stage's storage slots
@@ -995,6 +997,10 @@ static void mesh_c0(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     memcpy(bank + SM86_MESH_C0_TASK, &a, 8), memcpy(bank + SM86_MESH_C0_TASK + 8, &sz, 4);
     memcpy(bank + SM86_MESH_C0_MASK, &mask, 4), memcpy(bank + SM86_MESH_C0_SHIFT, &shift, 4);
     memcpy(bank + SM86_MESH_C0_COUNT, &M.count, 4);
+    for (uint32_t k = 0; k < gw_n; k++) {   // gw_select_mesh (none when the stage has storage-held pointers)
+        uint32_t wsz = (uint32_t)GW[k].size;
+        memcpy(bank + VK_GW_C0 + 16 * k, &GW[k].addr, 8), memcpy(bank + VK_GW_C0 + 16 * k + 8, &wsz, 4);
+    }
     if (cnt_on()) {   // OOT_SM86_COUNT in a task or mesh program
         uint64_t ca = 1ull << 32;
         uint32_t cs = 4 * SM86_COUNT_MAX;
@@ -1012,8 +1018,6 @@ static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
 // culling kernel (e6d5432f) counts the visible objects with atomics through pointers it reads from its object table,
 // into the group counts of the culling dispatches that follow; all 49 of its such accesses were dropped, every count
 // stayed 0, nothing was culled in, and the indirect mesh draws (the ground's colour) drew nothing.
-static struct { uint64_t addr, size; } GW[VK_GW_N];
-static uint32_t gw_n;
 
 static int cnt_on(void);
 static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
@@ -1230,6 +1234,50 @@ static void gw_select(VkExec *ex, const VkPipeInfo *info) {
         acc = 0, calls = used = 0, last = fr, memset(gw_part, 0, sizeof gw_part);
     }
 }
+// The window for a task or mesh stage dispatch (mesh_dispatch; the stage's resources are in the compute slots then).
+// 2026-11-08: the indirect draws' task program c7f0444a reads its meshlet list through 8 loads no trace reaches; with
+// the window empty they read 0, its loop bound became 0x07ffffff and the GPU hung (run-135, found with OOT_SM86_COUNT).
+// Not when the stage has storage-held pointers: their table (SM86_PTR_C0_MESH, 0x480) overlaps the window.
+static void gw_select_mesh(VkExec *ex, const VkPipeInfo *info) {
+    gw_n = 0;
+    static int on = -1;
+    if (on < 0) on = rt_knob("GW", "0");
+    if (!on || ptr_count(NVN_STAGE_CS)) return;
+    int uses = 0;
+    for (uint32_t i = 0; i < info->n_bindings && !uses; i++) {
+        const GfxShaderRes *r = info->bindings[i].res;
+        uint32_t off = r ? (uint32_t)r->handle * 4 : 0;
+        uses = info->bindings[i].kind == GFX_RES_SSBO && r && r->cbuf_slot == 0 && off >= VK_GW_C0 && off < VK_GW_C0 + 16 * VK_GW_N;
+    }
+    if (!uses) return;
+    for (uint32_t k = 0; k < 16; k++) gwr_note(ex->ssbo[NVN_STAGE_CS][k].addr, ex->ssbo[NVN_STAGE_CS][k].size);
+    uint64_t hop[64];
+    int nhop = 0;
+    for (uint32_t k = 0; k < 16 + 18 && gw_n < VK_GW_N; k++) {
+        int ubo = k >= 16;
+        const p_bind_buf *b = ubo ? &ex->ubo[NVN_STAGE_CS][k - 16] : &ex->ssbo[NVN_STAGE_CS][k];
+        if (!b->addr || (b->addr & 7) || nvn_gpu_only(b->addr)) continue;
+        VkMemSpan sp;
+        if (!vk_mem_resolve(b->addr, 8, &sp)) continue;
+        uint64_t n = b->size ? b->size : sp.avail;
+        if (n > sp.avail) n = sp.avail;
+        if (n > (ubo ? GW_SCAN : GW_SCAN_SB)) n = ubo ? GW_SCAN : GW_SCAN_SB;
+        const GwScan *c = gw_scan(ex, b->addr, n & ~7ull, ubo);
+        for (int i = 0; i < c->nf && gw_n < VK_GW_N; i++) gw_add(c->f[i].b, c->f[i].s);
+        for (int i = 0; i < c->nraw && nhop < 64; i++) hop[nhop++] = c->raw[i];
+    }
+    for (int h = 0; h < nhop && gw_n < VK_GW_N; h++) {
+        VkMemSpan sp;
+        if ((hop[h] & 7) || !vk_mem_resolve(hop[h], 8, &sp)) continue;
+        const GwScan *c = gw_scan(ex, hop[h], (sp.avail < 256 ? sp.avail : 256) & ~7ull, 0);
+        for (int i = 0; i < c->nf && gw_n < VK_GW_N; i++) gw_add(c->f[i].b, c->f[i].s);
+    }
+    for (uint32_t k = 0; k < 16 && gw_n < VK_GW_N; k++)
+        if (ex->ssbo[NVN_STAGE_CS][k].addr)
+            gw_add(ex->ssbo[NVN_STAGE_CS][k].addr, ex->ssbo[NVN_STAGE_CS][k].size ? ex->ssbo[NVN_STAGE_CS][k].size : 4u << 20);
+    mwatch_gw(ex);
+}
+
 static void gw_select_inner(VkExec *ex, const VkPipeInfo *info) {
     double t0 = gw_now(), t1;
     int uses = 0;
@@ -1719,8 +1767,15 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         uint32_t off = (uint32_t)r->handle * 4;
         if (off == SM86_MESH_C0_TASK) return (VkDescriptorBufferInfo){M.buf, 0, M.task_size};
         if (off == SM86_MESH_C0_MESH) return (VkDescriptorBufferInfo){M.buf, M.task_size, M.mesh_size};
+        if (off >= VK_GW_C0 && off < VK_GW_C0 + 16 * VK_GW_N) {   // the window (gw_select_mesh), else zeros
+            uint32_t k = (off - VK_GW_C0) / 16;
+            if (k >= gw_n || (off - VK_GW_C0) % 16)
+                return written ? (VkDescriptorBufferInfo){Z.dbuf, 0, max < ZERO_BYTES ? max : ZERO_BYTES} : zero_info(max);
+            up.addr = GW[k].addr, up.size = GW[k].size, b = &up, gw = 1;
+        }
     }
-    if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
+    if (b) {   // a window entry of a task or mesh stage, chosen above
+    } else if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
     else if ((pi = ptr_res(ex, st, r)) >= 0) up.addr = ptr_value(ex, st, (uint32_t)pi), b = &up;   // the same
     else if (r->cbuf_slot == 0 && nvn2_cs(ex, st)) {                  // NVN2: the slot the bank-0 entry belongs to
@@ -1728,7 +1783,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         uint32_t off = (uint32_t)r->handle * 4, base, ns, nt, ni;
         if (s2 < 0 && off >= VK_GW_C0 && off < VK_GW_C0 + 16 * VK_GW_N) {   // the global window (gw_select)
             uint32_t k = (off - VK_GW_C0) / 16;
-            if (M.on || k >= gw_n || (off - VK_GW_C0) % 16)
+            if (k >= gw_n || (off - VK_GW_C0) % 16)
                 return written ? (VkDescriptorBufferInfo){Z.dbuf, 0, max < ZERO_BYTES ? max : ZERO_BYTES} : zero_info(max);
             up.addr = GW[k].addr, up.size = GW[k].size, b = &up, gw = 1;
         } else if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
@@ -3840,7 +3895,9 @@ static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
             bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
             c0_dim[0] = groups, c0_dim[1] = c0_dim[2] = 1;
             B.c0_valid[2] = 0;
+            gw_select_mesh(ex, info);
             bind_resources(ex, info);
+            gw_n = 0;
             if (m == 0 && M.ind.buffer && !B.c0_valid[2]) {   // no bank 0 to take the count: the bound must not run
                 warn_once(W_MESH, "an indirect mesh draw's task program binds no bank 0: skipped");
                 cs = NULL;

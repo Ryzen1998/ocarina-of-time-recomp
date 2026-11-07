@@ -566,6 +566,12 @@ chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a 
   programs ran on garbage. `SM86_TASK_STRIDE` is now 0x1000 (KEY_VERSION 22). run-133: still lost the device (fifth reset), so not the (only) cause.
   The count probe now works in task and mesh programs too and logs its counters at a device loss (`count: at the
   device loss`, from host-coherent memory), to show where a hanging program's threads are.
+- **Found (run-134, run-135):** task program 1ddd3643 alone ran clean (but every thread was culled before its loop);
+  c7f0444a alone hung, and the count probe's dump at the device loss showed why: its meshlet list words read 0
+  (R9 = R6 = 0), so its loop bound `(min(R9 - R6, 256) - 1) >> 5` became 0x07ffffff and one warp looped 361 million
+  times. Those reads are 8 loads the translator sends through the global window, which the host never filled for task
+  and mesh stages. Now `gw_select_mesh` fills it for them (`OOT_GW=1`; not when the stage has storage-held pointers,
+  whose table at 0x480 overlaps the window). Not yet run.
 - 12 task/mesh programs used only by the indirect draws do not lower (11 mesh, 1 task: register pressure at the
   start, "no general register dead over a uniform register's span" and similar, and two "uniform datapath opcode");
   the same with the lowering before the task prologue. Their draws are skipped, so even with the crash fixed, part
