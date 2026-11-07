@@ -205,6 +205,54 @@ program hashes and group count (`note after pass N: mesh draw (...)`). Offline h
 rewrite): an SPIR-V expression evaluator for `gl_Position` (pair programs by FNV-1a of their SPIR-V; the dump saves
 each as `sh_<hash>.spv`), draw pairing by index buffer + count + base vertex, and per-pass depth deltas.
 
+### Status (2026-11-09, late): the dark lighting and black silhouettes — not started beyond observation
+
+State: the white areas are fixed (commits 1e10bf6, 00189c1; `OOT_OQ_VISIBLE=2` default). The next visible problem is
+that scenes render very dark and characters are often black silhouettes. Work on it had just begun when the session
+was handed off; no code was changed for it, nothing is uncommitted. One dump run (run-199, `--dump 4900`) was
+interrupted by the user before the dump frame: `build/logs/dump-199` is empty, no driver reset (0 since boot).
+
+Observations so far (screenshots only, all scored as pictures):
+- `build/logs/oqvis2.png` (forest path): ground, rocks, lanterns, fairies drawn and textured but dark; the Kokiri
+  child is a black silhouette while the fairies and lanterns (emissive) are bright.
+- `build/logs/oq-default.png`, `oq-default2.png` (Link's house): Link's skin and clothes are lit but very dark; only
+  Navi (emissive) is bright.
+- Earlier dumps: the HDR scene target is r11g11b10f; the sky fill is 24..34; the colour passes test depth EQUAL over
+  the copied pre-pass depth; dump-176/179 colour passes produced very dark values for characters (mean ~10-30 of 255
+  after `_tm` tone mapping), the ground over-bright/yellow-speckled in some shots (item 2 of "What is still wrong").
+- Emissive surfaces are fine, so the base colour textures and the tone map are not wholly broken; what is missing is
+  most likely light: direct light (sun / shadow map), indirect light (the light probes / irradiance volume, the 3D
+  rgb10a2 512x512x64 texture and the 128x128 r11g11b10f cube bound to the colour programs), or exposure.
+
+Hypotheses, most likely first, and how to test each offline or with one dump:
+1. **Shadows say "all in shadow".** The colour programs sample a d16 1600x1600x3 shadow array with a compare sampler
+   (`samp ... compare`, `2DArrayShadow`). A wrong compare op, depth range (minus_w / [-1,1]) or a reversed result
+   darkens everything the sun lights. Test: dump the shadow pass depth (passes ~0169-0188 at 1600x1600, d16) and
+   check it has geometry; then force the compare to pass (a diagnostic switch in `vk_texture.c` sampler creation,
+   `si.compareOp`) and compare a scored screenshot of the same shot (use `OOT_DEPTH_EQ_LE=3`'s left/right trick:
+   one frame, half with the switch).
+2. **Indirect light volume is black.** The 3D texture (512x512x64 rgb10a2, `lut852` in dumps) and the cube map come
+   from compute kernels; a skipped or failing kernel leaves them 0. Test: the dump's `images.txt` min/max of those
+   textures and of the kernels' outputs; `OOT_CS_TIME=1` lists the kernels that ran.
+3. **Exposure / tone map.** The auto-exposure kernels read the HDR target's luminance (small 1x1 .. 8x8 passes,
+   pass_0119-0131 chain); a NaN or a huge value (the skipped fog kernel 1a62084a writes ~60% NaN when run) can drive
+   exposure down. Test: the 1x1 luminance values in `images.txt` across the chain.
+4. **Characters only**: skinned programs' normals (attribute decode of fmt 0x27/0x12, packed normals) wrong, so N.L
+   is 0 or negative. Test: dump the G-buffer-like rgba8 target (pass_0193 in dump-165 looked like encoded normals)
+   for a character and check the normal colours vary.
+
+Commands (one GPU run at a time, count nvlddmkm events after each):
+- Dump the frame that is on screen at a fixed present: `.venv-win\Scripts\python.exe tools\run.py --seconds 160
+  --retry 0 --replay build/logs/a-spam.txt --skip-movies --env OOT_SKIP_CS=1a62084a --env OOT_DUMP_SKIP_RUNS=1
+  --dump 4900` (frame 4900 lands on varying cutscene shots; never compare pictures across runs).
+- Per-draw colour after each draw of the colour passes: add `--env OOT_DUMP_DRAWS=eq` (first 160 draws of each
+  full-size depth-EQUAL pass).
+- Uniform values of each draw: `--env OOT_DUMP_UBO=48`; kernels' GPU time and which ran: `--env OOT_CS_TIME=1`.
+- Scoring: `.venv-win\Scripts\python.exe tools\shot_diff.py <png> [<png>]` (noise above 1.2 is not a picture).
+
+Then the fog kernel 1a62084a (`OOT_SKIP_CS=1a62084a` in every test run): ~60% NaN volume when it runs (Status
+2026-11-07); start from `OOT_SM86_PROBE` / `OOT_SM86_COUNT` on it with a warm cache, as described there.
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count
