@@ -197,6 +197,8 @@ int vk_usnap_find(uint64_t addr, uint64_t n, uint64_t align, VkDescriptorBufferI
 const void *vk_usnap_peek(uint64_t addr, uint64_t n);   // the snapshot's bytes of a range, or NULL
 void vk_usnap_drop(uint64_t addr, uint64_t n);   // the replay makes the GPU write [addr, addr+n) of guest memory
 uint64_t vk_usnap_gen(void);                      // changes whenever a binding may resolve differently
+extern int vk_depth_eq_now;     // vk_pipeline.c: the current draw tests depth EQUAL
+extern int vk_depth_eq_split;   // vk_pipeline.c: OOT_DEPTH_EQ_LE=3, the current draw tests depth EQUAL
 void vk_usnap_shutdown(void);                     // vk_exec_draw_shutdown: frees the arenas
 void vk_mem_mirror_begin(void);
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence);

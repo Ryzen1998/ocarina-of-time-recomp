@@ -3294,6 +3294,9 @@ int vk_pipeline_warm_shaders(void) {
 
 // ---- dynamic state
 
+int vk_depth_eq_now;     // the state set last tests depth EQUAL (vk_dump.c OOT_DUMP_DRAWS=eq)
+int vk_depth_eq_split;   // OOT_DEPTH_EQ_LE=3 and the state set last tests depth EQUAL (vk_exec_draw.c eq_split)
+
 void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     if (!ensure_init()) return;
     const poly_st *pl = &s->poly;
@@ -3311,7 +3314,23 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
     vkCmdSetDepthTestEnable(cb, d->dt);
     vkCmdSetDepthWriteEnable(cb, d->dw);
-    vkCmdSetDepthCompareOp(cb, compare_op(d->df));
+    // OOT_DEPTH_EQ_LE (diagnostic): depth EQUAL tests as LESS_OR_EQUAL (=1) or GREATER_OR_EQUAL (=2); =3 draws each
+    // EQUAL draw twice, the left half of the target with LESS_OR_EQUAL and the right half with EQUAL (vk_exec_draw.c
+    // eq_split), so one frame shows both. The level's colour passes draw with EQUAL and no depth writes over the depth
+    // pre-pass, so a position that differs by one bit between the two passes drops the pixel; this tells such a
+    // mismatch from a draw that is missing.
+    static int eq_le = -1;
+    if (eq_le < 0) {
+        const char *e = cfg_get("OOT_DEPTH_EQ_LE");
+        eq_le = e && *e ? atoi(e) : 0;
+        if (eq_le)
+            fprintf(stderr, "[host] vk: OOT_DEPTH_EQ_LE: depth EQUAL tests as %s\n",
+                    eq_le == 2 ? "GREATER_OR_EQUAL" : eq_le == 3 ? "LESS_OR_EQUAL left, EQUAL right" : "LESS_OR_EQUAL");
+    }
+    vk_depth_eq_split = eq_le == 3 && d->dt && d->df == 3;
+    vk_depth_eq_now = d->dt && d->df == 3;
+    VkCompareOp eq_op = eq_le == 2 ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL;   // =2: the other side
+    vkCmdSetDepthCompareOp(cb, (eq_le == 1 || eq_le == 2) && d->df == 3 ? eq_op : compare_op(d->df));
     vkCmdSetStencilTestEnable(cb, d->st);
     vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, stencil_op(d->fail_f), stencil_op(d->zpass_f), stencil_op(d->zfail_f),
                       compare_op(d->sf_f));

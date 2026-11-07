@@ -41,7 +41,7 @@ static const char *const known[] = {
     "BIND_SKIP", "BIND_STATS", "BIND_UP", "BIND_X", "BIND_Y",
     "BIND_ZL", "BIND_ZR", "AUDIO_AUX", "BLOCK_VIEWS_3D", "BREAK_AT", "BREAK_BRIEF", "BREAK_COUNT", "BREAK_FOLLOW", "BREAK_WATCH", "CLOTH_REALTIME", "CORE_DIAG", "CRIT", "CRIT_OUT", "DEPTH_CLAMP", "DESC_TEMPLATE", "DUMP", "DUMP_BUF", "DUMP_DIR", "DUMP_DRAWS", "DUMP_LOG", "DUMP_VB", "DUMP_WHEN", "DUMP_XFB_PROBE",
     "EXEFS", "FEEDBACK", "FIX_C0", "FIX_ZERO", "FLIGHT", "FLIGHT_AT", "FLIGHT_DIR", "FLIGHT_FRAMES", "FLIGHT_SPIKE_MS",
-    "FIBER_LOG", "FLIGHT_THUMBS", "FPS60", "FPS_LIMIT", "FREEZE_IDLE", "FREE_CORES", "FULLSCREEN", "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_AHEAD", "GPU_DELAY", "LOD_MAX", "SPARSE_TILES", "DUMP_VPOOL", "FRONT_FLIP", "XFB_LOG",
+    "FIBER_LOG", "FLIGHT_THUMBS", "FPS60", "FPS_LIMIT", "FREEZE_IDLE", "FREE_CORES", "FULLSCREEN", "GPL", "GPL_DRAW_BUILD", "GPU", "GPU_AHEAD", "GPU_DELAY", "LOD_MAX", "SPARSE_TILES", "DUMP_VPOOL", "FRONT_FLIP", "DEPTH_EQ_LE", "XFB_LOG",
     "GOB_SWITCH2_MIN", "GPU_INDEX", "GPU_NAME", "HIGHFPS_FIX", "INPUT", "INPUT_RECORD", "INPUT_SCRIPT", "LANG", "LIB_PREBUILD",
     "LIB_PREBUILD_KEEP", "LIB_PREBUILD_THREADS", "LOCALE", "LOD_GUARD", "MEMORY", "MENU_LANG", "MENU_TEST",
     "MENU_TEST_DIR", "MENU_TEST_SET", "MINIMAL_LAYOUT", "MIRROR_GAP", "MOTION", "MOUSE_SENS", "MOVIE_AUDIO", "MOVIE_EOS_BT", "MOVIE_HOST", "MOVIE_PACE", "MOVIE_SKIP",
@@ -82,7 +82,7 @@ static const struct { const char *key, *section; } sections[] = {
     {"BIND_SKIP", "performance"}, {"SHADER_MEMO", "performance"}, {"PIPE_MEMO", "performance"}, {"TEX_MEMO", "performance"}, {"DESC_TEMPLATE", "performance"},
     {"PUSH_SKIP", "performance"}, {"SPLIT_DRAWS", "performance"}, {"SPLIT_US", "performance"}, {"VK_VALIDATION", "performance"},
     {"VK_DYN_VERTEX", "performance"}, {"VK_SUBGROUP_PIN", "performance"},
-    {"TRACE", "diagnostics"}, {"AUDIO_AUX", "diagnostics"}, {"BREAK_AT", "diagnostics"}, {"BREAK_BRIEF", "diagnostics"}, {"BREAK_FOLLOW", "diagnostics"}, {"BREAK_WATCH", "diagnostics"}, {"MOVIE_AUDIO", "diagnostics"}, {"FRONT_FLIP", "diagnostics"}, {"XFB_LOG", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
+    {"TRACE", "diagnostics"}, {"AUDIO_AUX", "diagnostics"}, {"BREAK_AT", "diagnostics"}, {"BREAK_BRIEF", "diagnostics"}, {"BREAK_FOLLOW", "diagnostics"}, {"BREAK_WATCH", "diagnostics"}, {"MOVIE_AUDIO", "diagnostics"}, {"FRONT_FLIP", "diagnostics"}, {"DEPTH_EQ_LE", "diagnostics"}, {"XFB_LOG", "diagnostics"}, {"FLIGHT", "diagnostics"}, {"FLIGHT_SPIKE_MS", "diagnostics"},
     {"WB_FENCE_LIMIT", "diagnostics"},
 };
 
@@ -132,7 +132,7 @@ static const CfgMeta metas[] = {
     {"VK_VALIDATION", "0", "0|1", RESTART}, {"VK_DYN_VERTEX", "", "0|1", RESTART},
     {"VK_SUBGROUP_PIN", "1", "0|1", RESTART},
     // diagnostics
-    {"TRACE", "", NULL, RESTART}, {"AUDIO_AUX", "1", "0|1", RESTART}, {"BREAK_AT", "", NULL, RESTART}, {"BREAK_BRIEF", "0", "0|1", RESTART}, {"BREAK_FOLLOW", "", NULL, RESTART}, {"MOVIE_AUDIO", "", NULL, RESTART}, {"FRONT_FLIP", "0", "0|1", RESTART}, {"XFB_LOG", "0", "0|1", RESTART}, {"BREAK_WATCH", "", NULL, RESTART}, {"FLIGHT", "0", "0|1", RESTART}, {"FLIGHT_SPIKE_MS", "100", "0..60000", RESTART},
+    {"TRACE", "", NULL, RESTART}, {"AUDIO_AUX", "1", "0|1", RESTART}, {"BREAK_AT", "", NULL, RESTART}, {"BREAK_BRIEF", "0", "0|1", RESTART}, {"BREAK_FOLLOW", "", NULL, RESTART}, {"MOVIE_AUDIO", "", NULL, RESTART}, {"FRONT_FLIP", "0", "0|1", RESTART}, {"DEPTH_EQ_LE", "0", "0|1|2|3", RESTART}, {"XFB_LOG", "0", "0|1", RESTART}, {"BREAK_WATCH", "", NULL, RESTART}, {"FLIGHT", "0", "0|1", RESTART}, {"FLIGHT_SPIKE_MS", "100", "0..60000", RESTART},
     {"WB_FENCE_LIMIT", "65536", "0..1073741824", RESTART},
     {"INPUT_RECORD", "", NULL, RESTART},
 };

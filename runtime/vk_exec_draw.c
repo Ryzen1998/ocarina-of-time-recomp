@@ -3438,6 +3438,29 @@ static void bind_index(VkExec *ex, const void *data, uint64_t bytes, VkIndexType
     ex->recorded++;
 }
 
+// OOT_DEPTH_EQ_LE=3 (diagnostic, vk_pipeline.c): a draw that tests depth EQUAL is recorded twice, the left half of
+// its scissor with LESS_OR_EQUAL, the right half with EQUAL, so one frame compares both. Returns 1 when it drew.
+#define EQ_SPLIT(ex, DRAW)                                                                                          \
+    do {                                                                                                            \
+        if (vk_depth_eq_split) {                                                                                    \
+            VkRect2D r0 = vk_exec_scissor(ex), h = r0;                                                              \
+            uint32_t mid = (uint32_t)(ex->has_vp ? ex->vp[0][0] + ex->vp[0][2] / 2 : (float)(r0.offset.x + r0.extent.width / 2)); \
+            int32_t m = (int32_t)mid < r0.offset.x ? r0.offset.x : (int32_t)mid > r0.offset.x + (int32_t)r0.extent.width ? r0.offset.x + (int32_t)r0.extent.width : (int32_t)mid; \
+            h.extent.width = (uint32_t)(m - r0.offset.x);                                                           \
+            vkCmdSetScissorWithCount(ex->cb, 1, &h);                                                                \
+            vkCmdSetDepthCompareOp(ex->cb, VK_COMPARE_OP_LESS_OR_EQUAL);                                            \
+            if (h.extent.width) DRAW;                                                                               \
+            h.offset.x = m, h.extent.width = r0.extent.width - (uint32_t)(m - r0.offset.x);                         \
+            vkCmdSetScissorWithCount(ex->cb, 1, &h);                                                                \
+            vkCmdSetDepthCompareOp(ex->cb, VK_COMPARE_OP_EQUAL);                                                    \
+            if (h.extent.width) DRAW;                                                                               \
+            vkCmdSetScissorWithCount(ex->cb, 1, &r0);                                                               \
+            ex->recorded += 6;                                                                                      \
+        } else {                                                                                                    \
+            DRAW;                                                                                                   \
+        }                                                                                                           \
+    } while (0)
+
 static void op_draw(VkExec *ex, const p_draw *d) {
     c0_binst = (uint32_t)d->base_instance;
     if (d->count <= 0 || !prepare_draw(ex, d->prim, d->count, 0)) return;
@@ -3465,7 +3488,7 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         free(ix);
         vkCmdDrawIndexed(ex->cb, n + 1, inst, 0, 0, (uint32_t)d->base_instance);
     } else {
-        vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance);
+        EQ_SPLIT(ex, vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance));
     }
     ex->recorded++;
     if (vk_dump_armed) vk_dump_after_draw(ex);
@@ -3528,8 +3551,8 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     }
     if (vk_dump_armed) vk_dump_draw_params(ex, 1 + d->itype, d->prim, 0, d->count, d->instances, d->base_instance, d->base_vertex), vk_dump_indices(d->ibuf, d->itype, d->count);
     ProbeJob *pj = probe >= 0 ? probe_begin(ex, probe) : NULL;
-    vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0, d->base_vertex,
-                     (uint32_t)d->base_instance);
+    EQ_SPLIT(ex, vkCmdDrawIndexed(ex->cb, (uint32_t)d->count, d->instances > 0 ? (uint32_t)d->instances : 1, 0,
+                                  d->base_vertex, (uint32_t)d->base_instance));
     ex->recorded++;
     probe_end(ex, pj);
     if (vk_dump_armed) vk_dump_after_draw(ex);
@@ -4152,7 +4175,11 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     } else if (d->first != 0 || d->count <= 0 || (uint32_t)d->count > MESH_MAX_TASKS)
         return warn_once(W_MESH, "a mesh draw from %d of %d task groups is skipped", d->first, d->count);
     static int ind_max = -1;
-    if (ind_max < 0) ind_max = rt_knob("MESH_IND_MAX", "64");
+    if (ind_max < 0) {   // a number: rt_knob reads switches (0/1/ab) and made this bound 1 (2026-11-09)
+        const char *e = getenv("OOT_MESH_IND_MAX");
+        ind_max = e && *e ? atoi(e) : 64;
+        rt_log("vk_exec: indirect mesh draws dispatch a bound of %d task (or mesh) groups (OOT_MESH_IND_MAX)", ind_max);
+    }
     if (ind_max < 1) ind_max = 1;
     if (ind_max > (int)MESH_MAX_TASKS) ind_max = (int)MESH_MAX_TASKS;
     uint32_t n = indirect ? (uint32_t)ind_max : (uint32_t)d->count;
@@ -4205,6 +4232,20 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     }
     M.on = 0, M.ind = (VkMemSpan){0};
     vk_exec_barrier(ex);
+    if (vk_dump_armed) {   // frame dumps: which task and mesh programs the next pass-through draw stands for
+        uint64_t hq[2] = {0, 0};
+        for (int m = 0; m < 2; m++) {
+            const NVNshaderData *e = stage_entry(ex->mesh_prog[m], 6 + m);
+            if (!e) continue;
+            uint32_t len;
+            memcpy(&len, (const uint8_t *)e->control + 0x44, 4);
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (uint32_t i = 0; i < len; i++) h = (h ^ ((const uint8_t *)(uintptr_t)e->data)[i]) * 0x100000001b3ull;
+            hq[m] = h;
+        }
+        vk_dump_note("mesh draw (%s, %d): task %016llx mesh %016llx, %u groups, stages ran %d", indirect ? "indirect" : "direct",
+                     d->count, (unsigned long long)hq[0], (unsigned long long)hq[1], groups, ok);
+    }
     if (ok && !getenv("OOT_MESH_NODRAW")) mesh_draw(ex, mesh, groups);
     int slot = ok ? mesh_rb_slot() : -1;
     if (slot >= 0) {

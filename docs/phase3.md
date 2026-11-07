@@ -86,7 +86,8 @@ the loop and its zero inputs; the white with frame dumps at a fixed frame (`run.
 
 ### What to do next, in order
 
-1. **Find the remaining missing geometry.** A frame dump at a fixed frame (7000) with the defaults: list the draws
+1. **Find the remaining missing geometry.** Narrowed on 2026-11-09 (Status section below): the depth-pass mesh
+   draws write spiky terrain the colour pass does not colour; start there. Originally: a frame dump at a fixed frame (7000) with the defaults: list the draws
    of the main colour pass, find what is missing where the sky shows (skipped draws in the log: `translation
    failed`, `meshind:` pairs, `OOT_MESH_IND_SKIP`), and which of them matter most.
 2. **Mesh program 072eb70d (code hash a11f465b)**: lowers since UP2R but draws garbage. Run it alone
@@ -104,6 +105,54 @@ the loop and its zero inputs; the white with frame dumps at a fixed frame (`run.
 6. **Correctness left**: the fog kernel's NaN; fix the wrong traces of 374126bf / 358beb27 rather than skip them;
    counts above `OOT_MESH_IND_MAX` (64; seen up to 29) would lose meshes silently.
 7. **A controller play session** with the user, to see what blocks real play (movement, other areas, saving).
+
+### Status (2026-11-09): what the white is not, and the mesh-draw bound that was 1
+
+Item 1 above, worked through with frame dumps (run-163..183, all with zero driver resets). Not fixed; narrowed down.
+
+- **Dumps at 7000 never fire**: the level runs at ~40 fps here (with another GPU program open), so a 150 s replay
+  presents ~5,000-5,800 frames. Dump at 4900. The replay is not deterministic: frame 4900 lands on different shots of
+  the opening cutscene (forest/treehouse, forest path, Saria close-up, Navi, Mido), so **never compare two runs'
+  pictures**; compare within one frame (`OOT_DEPTH_EQ_LE=3`, `OOT_DUMP_DRAWS=eq`, below).
+- How the level draws: a depth pre-pass (cull back, depth write), then the game copies the depth image
+  (`CopyTextureToTexture`, a bit-exact `vkCmdCopyImage`) and the colour pass draws over the copy with depth test
+  **EQUAL, no writes**. Every colour-pass draw has a depth-pass draw with the same triangles (same index buffer, count,
+  base vertex). The white pixels are ones where the depth image has geometry and no colour-pass draw writes.
+- **Ruled out**, each checked: the shaders' position math (the depth-only and colour vertex programs compute
+  `gl_Position` with identical SPIR-V expressions, skinning and dynamic bone indices included, all `NoContraction`,
+  position `Invariant`); fragment discards (no colour-pass fragment program has `OpKill`/demote); a written
+  `FragDepth`; depth bias (none in either pass, now printed by the dump); culling (both passes cull back); the depth
+  copy; GPL (0 library links: all pipelines monolithic); the clip-space depth mode; the uniform snapshot (one frame is
+  one submission, so both passes read the same snapshot; per-draw transforms c3/c4 and all common uniform blocks of
+  paired draws are bit-identical in dump-179); global-window writes into uniform ranges (0 overlaps measured). An
+  apparent "less-or-equal fixes it" was two different cutscene shots; on one frame (`OOT_DEPTH_EQ_LE=3`) left and right
+  halves are equally white.
+- **What the dumps do show** (dump-179/180/182, forest path): after the ordinary depth pass the depth image is right
+  (fence, the rock Link stands on); after the indirect, mesh-only **depth-pass mesh draws** (programs 475e71d2,
+  13c12eb4, 12b6f03f, 31b627ac, 4eea96ed, b4c61e5e, 0704b9fe, 3df0445d, 6cb6f80d) a jagged, spiky terrain covers them.
+  The colour pass uses other mesh programs for the same meshes (3dfea3de, 23eaf836, 2f4435de, c5bdb428, d022e166,
+  69066810); where their colour is missing the EQUAL test fails and the sky shows. In the Saria shot the colour pass
+  also draws her bracelets and necklace in another place than the depth image has them. Checked and fine: the vertex
+  layout the pass-through assumes (`(v >> 5) * lines * 0x80 + (v & 31) * 4`) matches 475e71d2's own addressing (8
+  lines, 96 vertices, 64 primitives, header output map 8 bits).
+- **Bug fixed**: `OOT_MESH_IND_MAX` was read with `rt_knob`, which returns 0/1 for switches, so every indirect mesh draw
+  dispatched **one** task group (16 mesh groups) or one mesh group instead of the documented 64: most meshlets of the
+  culled scenery were never drawn. Now parsed as a number (default 64, logged). Runs at 8 and 64: no driver reset,
+  pictures score (noise 0.34 / 0.37); more mesh geometry is drawn (the vines around the tree trunks appear), the white
+  remains.
+- Next, in order: (1) find which depth-pass mesh program draws the spikes: dump without `OOT_DUMP_SKIP_RUNS` gives a
+  depth image after each mesh pass, the `mesh draw` notes name the programs; then compare its records (positions) with
+  the colour variant of the same meshlet (`OOT_MESH_LOG`, a record read-back) and its lowering; (2) the 7 mesh programs
+  that do not lower (the log fails them on every draw: 6194772d, 4478d9b1, 392f0c37, 2b82fd56, 19f6e020; 3406d516 is
+  "no general register free for the uniform predicates"); (3) the Saria pose difference (skinned depth vs colour).
+
+Diagnostics added: `OOT_DEPTH_EQ_LE=1|2|3` (EQUAL tested as LESS_OR_EQUAL / GREATER_OR_EQUAL / left half LE and
+right half EQUAL in one frame); `OOT_DUMP_DRAWS=eq` (the colour target after each of the first 160 draws of the
+frame's first full-size depth-EQUAL pass); the dump prints polygon offset state, uniform floats with `%.9g`, keeps
+draws with different uniform blocks apart under `OOT_DUMP_UBO` (MAX_ENTS 2048), and notes every mesh draw's task/mesh
+program hashes and group count (`note after pass N: mesh draw (...)`). Offline helpers used (scratch, easy to
+rewrite): an SPIR-V expression evaluator for `gl_Position` (pair programs by FNV-1a of their SPIR-V; the dump saves
+each as `sh_<hash>.spv`), draw pairing by index buffer + count + base vertex, and per-pass depth deltas.
 
 ### Safety (learned the hard way)
 

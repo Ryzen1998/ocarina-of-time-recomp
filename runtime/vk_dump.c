@@ -42,7 +42,7 @@
 #define MAX_PASSES 1200
 #define PNG_CAP (2ull << 30)
 #define INFLIGHT_CAP (3ull << 30)   // host buffers waiting for their submission
-#define MAX_ENTS 512                // distinct pipeline + texture sets listed per pass
+#define MAX_ENTS 2048               // distinct pipeline + texture sets listed per pass (OOT_DUMP_UBO: per uniform blocks too)
 #define MAX_LUTS 256                // 3D textures and small sampled 8-bit 2D textures dumped per frame
 #define TEX2D_CAP (1u << 20)        // texels of a sampled 2D texture that is dumped
 
@@ -625,9 +625,9 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             if (u->addr && vk_mem_resolve(u->addr, 1, &ms)) {
                 uint64_t n = u->size && u->size < ms.avail ? u->size : ms.avail;
                 const float *f = (const float *)(uintptr_t)u->addr;
-                for (uint64_t k = 0; k < (uint64_t)dump_ubo && (k + 1) * 16 <= n; k++)
-                    sp(b, "%s[%llu] %g %g %g %g", k % 4 ? " " : "\n      ", (unsigned long long)k, f[4 * k], f[4 * k + 1],
-                       f[4 * k + 2], f[4 * k + 3]);
+                for (uint64_t k = 0; k < (uint64_t)dump_ubo && (k + 1) * 16 <= n; k++)   // %.9g: bit-exact floats
+                    sp(b, "%s[%llu] %.9g %.9g %.9g %.9g", k % 4 ? " " : "\n      ", (unsigned long long)k, f[4 * k],
+                       f[4 * k + 1], f[4 * k + 2], f[4 * k + 3]);
                 // the copy the GPU reads (vk_usnap.c), where it differs from guest memory now
                 uint64_t sn = n < (uint64_t)dump_ubo * 16 ? n : (uint64_t)dump_ubo * 16;
                 const float *g = vk_usnap_peek(u->addr, sn);
@@ -635,7 +635,8 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
                     sp(b, "\n      snapshot differs:");
                     for (uint64_t k = 0; (k + 1) * 16 <= sn; k++)
                         if (memcmp(g + 4 * k, f + 4 * k, 16))
-                            sp(b, " [%llu] %g %g %g %g", (unsigned long long)k, g[4 * k], g[4 * k + 1], g[4 * k + 2], g[4 * k + 3]);
+                            sp(b, " [%llu] %.9g %.9g %.9g %.9g", (unsigned long long)k, g[4 * k], g[4 * k + 1], g[4 * k + 2],
+                               g[4 * k + 3]);
                 } else if (!g) {
                     sp(b, "\n      (no snapshot: live memory)");
                 }
@@ -720,6 +721,11 @@ static uint64_t bindings_hash(const VkExec *ex, const VkPipeInfo *info) {
             if (slot >= 0 && slot < 16) h = (h ^ ex->ssbo[st][slot].addr) * 0x100000001b3ull;
             continue;
         }
+        if (dump_ubo && bd->res && bd->kind == GFX_RES_UBO && bd->res->slot >= 3 && bd->res->slot - 3 < 18) {
+            // OOT_DUMP_UBO: each draw's own uniform blocks (per-object transforms) get an entry of their own
+            h = (h ^ ex->ubo[nvn_stage(bd->stage)][bd->res->slot - 3].addr) * 0x100000001b3ull;
+            continue;
+        }
         if (!bd->res || (bd->kind != GFX_RES_TEX && bd->kind != GFX_RES_IMG)) continue;
         for (uint32_t k = 0; k < (bd->count ? bd->count : 1u); k++)
             h = (h ^ handle_of(ex, nvn_stage(bd->stage), bd->res->slot + (int)k, bd->kind == GFX_RES_IMG)) * 0x100000001b3ull;
@@ -734,6 +740,9 @@ static void state_line(Str *b, const VkExec *ex, const VkPipeState *s) {
        (unsigned)s->ds.dt, (unsigned)s->ds.dw, (unsigned)s->ds.df, (unsigned)s->ds.st, (unsigned)s->poly.cull,
        s->poly.front ? "ccw" : "cw", (unsigned)s->poly.mode, (unsigned)s->color.blend_en, (unsigned)s->chmask.mask,
        (unsigned)s->ms.enable, (unsigned)s->ms.a2c, s->depth_clamp, s->raster_discard, s->depth_minus_w);
+    if (s->poly.offset_en)   // NVN_POLYGON_OFFSET_ENABLE_* bits (point 1, line 2, fill 4) and the bias the pass sets
+        sp(b, "; polygon offset en %#x units %g factor %g clamp %g", (unsigned)s->poly.offset_en, ex->poly_offset.units,
+           ex->poly_offset.factor, ex->poly_offset.clamp);
     if (ex->has_vp)
         sp(b, "; viewport %g,%g %gx%g z %g..%g", ex->vp[0][0], ex->vp[0][1], ex->vp[0][2], ex->vp[0][3], ex->vp[0][4],
            ex->vp[0][5]);
@@ -951,16 +960,21 @@ static void vb_gpu_snap(VkExec *ex, int draw, int st) {
 // The number the next draw will get when OOT_DUMP_XFB_PROBE asks for its vertex outputs, else -1 (vk_exec_draw.c
 // op_draw_idx captures them with transform feedback into xfb_p<pass>_d<draw>.bin under vk_dump_dir()).
 int vk_dump_probe_draw(void) {
-    if (!xfb_probe || in_draw_copy || draws_pass < 0) return -1;
+    if (!xfb_probe || in_draw_copy || draws_pass < 0) return -1;   // =eq: only once its pass is known
     return active() && frame_now() == dump_frame && seq == draws_pass ? pass_draws : -1;
 }
 const char *vk_dump_dir(void) { return dir; }
 int vk_dump_pass_seq(void) { return seq; }
 
+#define DRAWS_EQ_MAX 160
 void vk_dump_after_draw(VkExec *ex) {
-    if (in_draw_copy || draws_pass < 0) return;
+    if (in_draw_copy || draws_pass == -1) return;
     AcquireSRWLockExclusive(&rec_lock);
-    int go = active() && frame_now() == dump_frame && seq == draws_pass && ex->color[0].image;
+    if (draws_pass == -2 && active() && frame_now() == dump_frame && pass_draws == 1 && vk_depth_eq_now &&
+        ex->color[0].image && ex->color[0].width >= 1280)
+        draws_pass = seq, fprintf(passes_f, "OOT_DUMP_DRAWS=eq: pass %d\n", seq);
+    int go = active() && frame_now() == dump_frame && seq == draws_pass && ex->color[0].image &&
+             pass_draws <= DRAWS_EQ_MAX;
     ReleaseSRWLockExclusive(&rec_lock);
     if (!go) return;
     in_draw_copy = 1;
@@ -1182,7 +1196,9 @@ void vk_dump_init(void) {
     const char *du = cfg_get("OOT_DUMP_UBO");
     dump_ubo = du && *du && *du != '0' ? (atoi(du) > 1 ? atoi(du) : 40) : 0;   // a number above 1: that many vec4
     const char *dd = cfg_get("OOT_DUMP_DRAWS");
-    draws_pass = dd && *dd ? atoi(dd) : -1;
+    // =eq: the first pass of the dump frame whose first draw tests depth EQUAL on a target at least 1280 wide (the
+    // level's colour pass; its number changes from run to run), its first DRAWS_EQ_MAX draws
+    draws_pass = dd && *dd ? (!strcmp(dd, "eq") ? -2 : atoi(dd)) : -1;
     const char *xp = cfg_get("OOT_DUMP_XFB_PROBE");
     xfb_probe = xp && *xp == '1';
     const char *dv = cfg_get("OOT_DUMP_VB");
