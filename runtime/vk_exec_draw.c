@@ -25,6 +25,7 @@
 #include <string.h>
 
 #include "cfg.h"
+#include "gfx.h"
 #include "host.h"
 #include "nvn_api.h"
 #include "tex.h"
@@ -995,6 +996,16 @@ static void mesh_c0(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
 static uint32_t ptr_count(int st);
 static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
 
+// The global window (tools/xlate/patches/0019): a compute program's memory access whose address the translator
+// cannot trace to a constant-buffer word (a pointer it loaded from memory at a run-time index) is checked on the GPU
+// against VK_GW_N {u64 address, u32 size} entries at bank 0 + VK_GW_C0, each bound as a storage buffer; gw_select
+// fills them before the dispatch with the buffers the program's pointers can reach. 2026-11-07: the frame's first
+// culling kernel (e6d5432f) counts the visible objects with atomics through pointers it reads from its object table,
+// into the group counts of the culling dispatches that follow; all 49 of its such accesses were dropped, every count
+// stayed 0, nothing was culled in, and the indirect mesh draws (the ground's colour) drew nothing.
+static struct { uint64_t addr, size; } GW[VK_GW_N];
+static uint32_t gw_n;
+
 static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     memset(bank, 0, VK_C0_BYTES);
     memcpy(bank, c0_dim, 12);
@@ -1016,6 +1027,11 @@ static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     }
     for (uint32_t t = 0; t < nt && t < 128 && o + 8 <= VK_C0_BYTES; t++, o += 8) memcpy(bank + o, &ex->tex[NVN_STAGE_CS][t], 8);
     for (uint32_t i = 0; i < ni && i < 32 && o + 8 <= VK_C0_BYTES; i++, o += 8) memcpy(bank + o, &ex->img[NVN_STAGE_CS][i], 8);
+    if (!M.on && o <= VK_GW_C0)   // gw_select: none when the tables reach the window
+        for (uint32_t k = 0; k < gw_n; k++) {
+            uint32_t sz = (uint32_t)GW[k].size;
+            memcpy(bank + VK_GW_C0 + 16 * k, &GW[k].addr, 8), memcpy(bank + VK_GW_C0 + 16 * k + 8, &sz, 4);
+        }
     // Maxwell's tables as well, past the NVN2 layout: the translator's GlobalToStorage fallback searches the storage
     // table at 0x310 for the base of a global pointer it could not trace to a constant (the kernels' stores through
     // the address at bank 0 + 0x10), and the uniform table at 0x210 for the blocks read as storage.
@@ -1040,6 +1056,253 @@ static int nvn2_cs(const VkExec *ex, int st) {   // an SM86 compute program is b
     const uint8_t *ctl, *code;
     uint32_t len;
     return st == NVN_STAGE_CS && ex->prog && vk_exec_find_stage(ex->prog, NVN_STAGE_CS, &ctl, &code, &len) && ctl[0x56] == 5;
+}
+
+// The buffers bound as storage (or read as indirect arguments) so far, by the ranges the game bound (overlapping ones
+// merged), sorted: the places a pointer in memory can name. Not the backing's extent: one backing is 2.4 GiB, and a
+// window entry is bound as written, so a mirrored pool copies the whole range back after every submission (the first
+// run with whole backings fell to 1 fps). A stale entry costs nothing: gw_add resolves the address again.
+#define GWR_N 1024
+#define GW_MAX_ENTRY (64ull << 20)
+#define GW_SCAN (16u << 10)   // bytes of each uniform block gw_select reads for pointers (CPU time per dispatch)
+#define GW_SCAN_SB (4u << 10) // of each storage buffer: often write-combined memory, slow for the CPU to read
+#define GW_SCAN_FRAMES 32     // a scan's result is kept this many frames (pointer tables rarely change)
+static struct { uint64_t base, end; } GWR[GWR_N];
+static uint32_t gwr_n;
+static int gwr_find(uint64_t v) {   // index of the entry holding v, or -1
+    uint32_t lo = 0, hi = gwr_n;
+    while (lo < hi) {
+        uint32_t mid = (lo + hi) / 2;
+        if (GWR[mid].end <= v) lo = mid + 1;
+        else if (GWR[mid].base > v) hi = mid;
+        else return (int)mid;
+    }
+    return -1;
+}
+static void gwr_note(uint64_t addr, uint64_t size) {   // size 0: unknown (up to 4 MiB of the backing)
+    if (!addr || nvn_gpu_only(addr) || gwr_n == GWR_N) return;   // full: no churn on every binding
+    int f = gwr_find(addr);
+    if (f >= 0 && (size == 0 || addr + size <= GWR[f].end)) return;   // known
+    VkMemSpan sp;
+    if (!vk_mem_resolve(addr, 1, &sp) || !sp.pool) return;
+    if (size == 0) size = 4u << 20;
+    if (size > sp.avail) size = sp.avail;
+    if (size > GW_MAX_ENTRY) size = GW_MAX_ENTRY;
+    uint64_t b = addr, e = addr + size;
+    uint32_t w = 0;   // drop the entries the new range overlaps, merged into it
+    for (uint32_t i = 0; i < gwr_n; i++) {
+        if (GWR[i].end > b && GWR[i].base < e) {
+            if (GWR[i].base < b) b = GWR[i].base;
+            if (GWR[i].end > e) e = GWR[i].end;
+            continue;
+        }
+        GWR[w++] = GWR[i];
+    }
+    gwr_n = w;
+    if (gwr_n == GWR_N || e - b > GW_MAX_ENTRY) return;
+    uint32_t i = gwr_n;
+    while (i > 0 && GWR[i - 1].base > b) GWR[i] = GWR[i - 1], i--;
+    GWR[i].base = b, GWR[i].end = e, gwr_n++;
+}
+static void gw_add(uint64_t addr, uint64_t size) {
+    VkMemSpan sp;
+    if (gw_n >= VK_GW_N || !addr || nvn_gpu_only(addr) || !size || !vk_mem_resolve(addr, 1, &sp)) return;
+    if (size > sp.avail) size = sp.avail;
+    if (size > GW_MAX_ENTRY) size = GW_MAX_ENTRY;
+    for (uint32_t k = 0; k < gw_n; k++)
+        if (addr <= GW[k].addr + GW[k].size && GW[k].addr <= addr + size) {   // overlapping or adjacent: one entry
+            uint64_t b = addr < GW[k].addr ? addr : GW[k].addr, e = addr + size > GW[k].addr + GW[k].size ? addr + size : GW[k].addr + GW[k].size;
+            VkMemSpan bs;   // the union must stay in one backing: bank 0 must not claim more than the descriptor binds
+            if (e - b <= GW_MAX_ENTRY && vk_mem_resolve(b, 1, &bs) && bs.avail >= e - b) {
+                GW[k].addr = b, GW[k].size = e - b;
+                return;
+            }
+            if (addr >= GW[k].addr && addr + size <= GW[k].addr + GW[k].size) return;   // covered
+            continue;
+        }
+    GW[gw_n].addr = addr, GW[gw_n].size = size, gw_n++;
+}
+
+static void mwatch_gw(const VkExec *ex);
+
+// What a scan of one buffer found: the registry ranges its 64-bit values point into. Kept per buffer for GW_SCAN_FRAMES
+// frames: scanning per dispatch cost 28 ms a frame (the frame fell to 30 fps), most of it reading write-combined guest
+// memory. A uniform block also takes the inline updates of the submission made since its last scan (gw_scan).
+typedef struct {
+    uint64_t addr, n, frame, fence;
+    uint32_t upd_done;
+    uint8_t nf, nraw;
+    struct { uint64_t b, s; } f[VK_GW_N];   // the registry ranges found
+    uint64_t raw[VK_GW_N];                  // the pointer values themselves (gw_select follows them one hop)
+} GwScan;
+static GwScan GWS[512];
+static uint64_t gw_miss;   // OOT_TRACE=perf
+static double gw_upd;
+static inline double gw_now(void);
+static int mwatch_on(void);
+static void shader_hex(const GfxShader *s, char hex[17]);
+static void gws_found(GwScan *c, uint64_t v) {
+    if (v < 0x100000000ull || v >= RT_GPU_VA_BASE || c->nf >= VK_GW_N) return;
+    int e = gwr_find(v);
+    VkMemSpan sp;
+    // Not bound as compute storage yet: e6d5432f's pointer table names buffers only pointers reach (and the indirect
+    // mesh draws' arguments). Taken when the value is 16-byte aligned and its backing is at most 256 MiB, which keeps
+    // out integer pairs such as 0x200000000 that land in the 1.4 GiB heap.
+    if (e < 0 && !(v & 15) && vk_mem_resolve(v, 1, &sp) && sp.pool && sp.offset + sp.avail <= (256ull << 20)) {
+        gwr_note(v, sp.avail);
+        e = gwr_find(v);
+    }
+    if (e < 0) return;
+    int known = 0;
+    for (int i = 0; i < c->nraw && !known; i++) known = c->raw[i] == v;
+    if (!known && c->nraw < VK_GW_N) c->raw[c->nraw++] = v;
+    for (int i = 0; i < c->nf; i++)
+        if (c->f[i].b == GWR[e].base) return;
+    c->f[c->nf].b = GWR[e].base, c->f[c->nf].s = GWR[e].end - GWR[e].base, c->nf++;
+}
+static void gw_scan_updates(const VkExec *ex, GwScan *c);   // below UPD
+static const GwScan *gw_scan(const VkExec *ex, uint64_t addr, uint64_t n, int ubo) {
+    uint64_t frame = gfx_stats().frames, h = (addr ^ n << 48) * 0x9E3779B97F4A7C15ull;   // page-aligned addresses: mix, take the top bits
+    h = ((h ^ h >> 29) * 0xBF58476D1CE4E5B9ull) >> 55;
+    GwScan *c = &GWS[h];
+    if (c->addr != addr || c->n != n || frame - c->frame >= GW_SCAN_FRAMES) {
+        gw_miss++;
+        memset(c, 0, sizeof *c);
+        c->addr = addr, c->n = n, c->frame = frame;
+        const uint64_t *q = ubo ? vk_usnap_peek(addr, n) : NULL;   // a uniform block as of the submit, else memory
+        VkMemSpan sp;
+        if (!q && vk_mem_resolve(addr, n, &sp)) q = (const uint64_t *)(uintptr_t)addr;
+        for (uint64_t i = 0; q && i < n / 8 && c->nf < VK_GW_N; i++) gws_found(c, q[i]);
+    }
+    double t = gw_now();
+    if (ubo) gw_scan_updates(ex, c);
+    gw_upd += gw_now() - t;
+    return c;
+}
+
+// The window's entries for the dispatch about to be bound, when its program has them: the buffers named by the 64-bit
+// values in the storage buffers it reads, its uniform blocks and its pushed constants (each value is looked up among
+// the buffers bound as storage so far), then its own storage buffers.
+static void gw_select_inner(VkExec *ex, const VkPipeInfo *info);
+static double gw_part[4];   // OOT_TRACE=perf: seconds in the parts of gw_select_inner
+static inline double gw_now(void) {
+    LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f); return (double)c.QuadPart / (double)f.QuadPart; }
+static void gw_select(VkExec *ex, const VkPipeInfo *info) {
+    gw_n = 0;
+    // OOT_GW=1 (default off until the culling it feeds is seen to work, docs/phase3.md 2026-11-07): off, every access
+    // through the window reads 0 and its stores are dropped, as before the window.
+    static int on = -1;
+    if (on < 0) on = rt_knob("GW", "0");
+    if (!on) return;
+    if (!(rt_trace & RT_TRACE_PERF)) return gw_select_inner(ex, info);
+    static LARGE_INTEGER f;   // OOT_TRACE=perf: its CPU time, logged every 600 frames
+    static double acc;
+    static uint64_t calls, used, last;
+    LARGE_INTEGER a, b;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&a);
+    gw_select_inner(ex, info);
+    QueryPerformanceCounter(&b);
+    acc += (double)(b.QuadPart - a.QuadPart) / (double)f.QuadPart, calls++, used += gw_n != 0;
+    uint64_t fr = gfx_stats().frames;
+    if (fr >= last + 600) {
+        double d = (double)(fr - last) / 1000.0;
+        rt_log("perf: gw_select: %.3f ms a frame over %llu dispatches a frame, %llu with entries a frame (registry %u); parts %.3f %.3f %.3f %.3f ms",
+               1000.0 * acc / (double)(fr - last), (unsigned long long)(calls / (fr - last)),
+               (unsigned long long)(used / (fr - last)), gwr_n, gw_part[0] / d, gw_part[1] / d, gw_part[2] / d, gw_part[3] / d);
+        rt_log("perf: gw_select: scan misses %llu a frame, inline-update scans %.3f ms a frame", (unsigned long long)(gw_miss / (fr - last)), gw_upd / d);
+        gw_miss = 0, gw_upd = 0;
+        acc = 0, calls = used = 0, last = fr, memset(gw_part, 0, sizeof gw_part);
+    }
+}
+static void gw_select_inner(VkExec *ex, const VkPipeInfo *info) {
+    double t0 = gw_now(), t1;
+    int uses = 0;
+    uint32_t written = 0, base, ns, nt, ni;
+    if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni)) return;
+    for (uint32_t i = 0; i < info->n_bindings; i++) {
+        const GfxShaderRes *r = info->bindings[i].res;
+        if (info->bindings[i].kind != GFX_RES_SSBO || !r || r->cbuf_slot != 0) continue;
+        uint32_t off = (uint32_t)r->handle * 4;
+        int kind, s;
+        if (off >= VK_GW_C0 && off < VK_GW_C0 + 16 * VK_GW_N) uses = 1;
+        else if ((s = nvn2_c0_slot(ex, off, &kind)) >= 0 && kind == 0 && s < 32 && (r->flags & 1)) written |= 1u << s;
+    }
+    t1 = gw_now(), gw_part[0] += t1 - t0, t0 = t1;
+    if (!uses || base + 16 * ns + 8 * nt + 8 * ni > VK_GW_C0) return;
+    for (uint32_t k = 0; k < 16 && k < ns; k++) gwr_note(ex->ssbo[NVN_STAGE_CS][k].addr, ex->ssbo[NVN_STAGE_CS][k].size);
+    for (uint32_t i = 0; i < ex->push_cc_len / 8 && gw_n < VK_GW_N; i++) {   // the push
+        uint64_t v;
+        memcpy(&v, ex->push_cc + 8 * i, 8);
+        int e = v >= 0x100000000ull && v < RT_GPU_VA_BASE ? gwr_find(v) : -1;
+        if (e >= 0) gw_add(GWR[e].base, GWR[e].end - GWR[e].base);
+    }
+    t1 = gw_now(), gw_part[1] += t1 - t0, t0 = t1;
+    uint64_t hop[64];
+    int nhop = 0;
+    // Its storage buffers that it only reads (the tables at their heads), then its uniform blocks: e6d5432f loads its
+    // counters' pointers from an array in uniform block 1 at a run-time index (LDC.64 c[4][R]), which no
+    // constant-offset trace reaches.
+    for (uint32_t k = 0; k < 16 + 18 && gw_n < VK_GW_N; k++) {
+        int ubo = k >= 16;
+        const p_bind_buf *b = ubo ? &ex->ubo[NVN_STAGE_CS][k - 16] : &ex->ssbo[NVN_STAGE_CS][k];
+        if ((!ubo && (k >= ns || (written >> k & 1))) || !b->addr || (b->addr & 7) || nvn_gpu_only(b->addr)) continue;
+        VkMemSpan sp;
+        if (!vk_mem_resolve(b->addr, 8, &sp)) continue;
+        uint64_t n = b->size ? b->size : sp.avail;
+        if (n > sp.avail) n = sp.avail;
+        if (n > (ubo ? GW_SCAN : GW_SCAN_SB)) n = ubo ? GW_SCAN : GW_SCAN_SB;
+        const GwScan *c = gw_scan(ex, b->addr, n & ~7ull, ubo);
+        for (int i = 0; i < c->nf && gw_n < VK_GW_N; i++) gw_add(c->f[i].b, c->f[i].s);
+        for (int i = 0; i < c->nraw && nhop < 64; i++) hop[nhop++] = c->raw[i];
+    }
+    // One more hop: small entries found so far are pointer records themselves. e6d5432f reads a record's address from
+    // its uniform block, a pointer from the record, and its object count at that pointer + 4 (threads past it exit).
+    for (int h = 0; h < nhop && gw_n < VK_GW_N; h++) {   // 256 bytes at each pointer found above
+        VkMemSpan sp;
+        if ((hop[h] & 7) || !vk_mem_resolve(hop[h], 8, &sp)) continue;
+        const GwScan *c = gw_scan(ex, hop[h], (sp.avail < 256 ? sp.avail : 256) & ~7ull, 0);
+        for (int i = 0; i < c->nf && gw_n < VK_GW_N; i++) gw_add(c->f[i].b, c->f[i].s);
+    }
+    t1 = gw_now(), gw_part[2] += t1 - t0, t0 = t1;
+    for (uint32_t k = 0; k < 16 && k < ns && gw_n < VK_GW_N; k++)
+        gw_add(ex->ssbo[NVN_STAGE_CS][k].addr, ex->ssbo[NVN_STAGE_CS][k].size ? ex->ssbo[NVN_STAGE_CS][k].size : 4u << 20);
+    mwatch_gw(ex);
+    gw_part[3] += gw_now() - t0;
+    // OOT_GW_TRACE=<input id prefix> (diagnostic): for that kernel, every 300 frames, what its first checks read on the
+    // CPU side: uniform block 0 at 0x650..0x6f0 (e6d5432f: per-type thresholds and the count its threads stop at) and
+    // each pointer in uniform block 1 followed twice, with the word at + 4 (the per-type object count).
+    const char *tr = getenv("OOT_GW_TRACE");
+    char hex[17];
+    shader_hex(C1CUR[NVN_STAGE_CS], hex);
+    static uint64_t last_tr;
+    uint64_t fr = gfx_stats().frames;
+    if (tr && *tr && !strncmp(hex, tr, strlen(tr)) && fr >= last_tr + 300) {
+        last_tr = fr;
+        const p_bind_buf *u0 = &ex->ubo[NVN_STAGE_CS][0], *u1 = &ex->ubo[NVN_STAGE_CS][1];
+        uint32_t w[17] = {0};
+        const uint8_t *s0 = u0->addr && u0->size >= 0x6f4 ? vk_usnap_peek(u0->addr, 0x6f4) : NULL;
+        if (s0) memcpy(w, s0 + 0x650, sizeof w);
+        rt_log("gwtrace: f%llu %s ubo0 %#llx+%#llx (%s) 0x650..0x6f0: %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u",
+               (unsigned long long)fr, hex, (unsigned long long)u0->addr, (unsigned long long)u0->size, s0 ? "snapshot" : "none",
+               w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15], w[16]);
+        const uint8_t *s1 = u1->addr && u1->size ? vk_usnap_peek(u1->addr, u1->size < 0x200 ? u1->size : 0x200) : NULL;
+        for (uint32_t i = 0; s1 && i < (u1->size < 0x200 ? u1->size : 0x200) / 8; i++) {
+            uint64_t p1, p2 = 0, v2 = 0;
+            memcpy(&p1, s1 + 8 * i, 8);
+            VkMemSpan sp;
+            if (p1 < 0x100000000ull || p1 >= RT_GPU_VA_BASE || !vk_mem_resolve(p1, 8, &sp)) continue;
+            memcpy(&p2, (const void *)(uintptr_t)p1, 8);
+            if (p2 >= 0x100000000ull && p2 < RT_GPU_VA_BASE && vk_mem_resolve(p2, 8, &sp)) memcpy(&v2, (const void *)(uintptr_t)p2, 8);
+            int in1 = 0, in2 = 0;
+            for (uint32_t k = 0; k < gw_n; k++) {
+                in1 |= p1 >= GW[k].addr && p1 < GW[k].addr + GW[k].size;
+                in2 |= p2 >= GW[k].addr && p2 < GW[k].addr + GW[k].size;
+            }
+            rt_log("gwtrace:   ubo1[%#x] %#llx%s -> %#llx%s -> words %u %u", 8 * i, (unsigned long long)p1, in1 ? " (window)" : "",
+                   (unsigned long long)p2, in2 ? " (window)" : "", (uint32_t)v2, (uint32_t)(v2 >> 32));
+        }
+    }
 }
 
 // c0 from replay scratch; a bank equal to the stage's previous one reuses its range, so it costs no copy.
@@ -1168,6 +1431,24 @@ static int upd_read(const VkExec *ex, uint64_t a, void *out, size_t n) {
     return 0;
 }
 
+// gw_scan: the 64-bit values the inline updates of this submission made since the block's last scan wrote into it.
+static void gw_scan_updates(const VkExec *ex, GwScan *c) {
+    if (UPD.fence != ex->fence) return;
+    if (c->fence != ex->fence) c->fence = ex->fence, c->upd_done = 0;
+    uint32_t from = c->upd_done, end = UPD.n;
+    if (end - from > UPD_N) from = end - UPD_N;
+    for (uint32_t i = from; i < end && c->nf < VK_GW_N; i++) {
+        const typeof(UPD.u[0]) *e = &UPD.u[i % UPD_N];
+        uint64_t lo = e->lo > c->addr ? e->lo : c->addr, hi = e->hi < c->addr + c->n ? e->hi : c->addr + c->n;
+        for (uint64_t p = (lo + 7) & ~7ull; p + 8 <= hi && c->nf < VK_GW_N; p += 8) {
+            uint64_t v;
+            memcpy(&v, e->data + (p - e->lo), 8);
+            gws_found(c, v);
+        }
+    }
+    c->upd_done = end;
+}
+
 // That address as the bound block holds it at this point of the replay; 0 when the block is unbound or too short. The
 // block has no size field.
 static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
@@ -1241,6 +1522,122 @@ static int ptr_res(const VkExec *ex, int st, const GfxShaderRes *r) {
     return (int)((off - pb) / 8) < (int)ptr_count(st) && (M.on || nvn2_cs(ex, st)) ? (int)((off - pb) / 8) : -1;
 }
 
+// OOT_MESH_WATCH=1 (diagnostic): who writes the indirect mesh draws' arguments. op_draw_mesh adds each argument
+// address to the watch list; a written storage binding that covers one, and a buffer fill over one, is logged with
+// the kernel, as is each written binding that has no backing (the discard buffer), once per kernel and bank offset.
+static uint64_t mwatch[64];
+static volatile LONG nmwatch;
+static int mwatch_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("OOT_MESH_WATCH") != NULL;
+    return on;
+}
+static void mwatch_add(uint64_t a) {
+    if (!mwatch_on()) return;
+    LONG n = nmwatch;
+    for (LONG i = 0; i < n; i++) if (mwatch[i] == a) return;
+    if (n < 64) mwatch[n] = a, nmwatch = n + 1;
+}
+static void shader_hex(const GfxShader *s, char hex[17]) {
+    strcpy(hex, "?");
+    if (!s) return;
+    const uint8_t *id = gfx_shader_input_id(s);
+    for (int i = 0; i < 8; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
+}
+void vk_exec_mesh_watch(const char *what, int st, uint32_t off, uint64_t addr, uint64_t size) {   // also vk_exec_xfer.c clear_buf
+    if (!mwatch_on()) return;
+    static uint64_t seen[256];
+    static int nseen;
+    static volatile LONG lines;
+    char hex[17];
+    shader_hex(st >= 0 && st < 6 ? C1CUR[st] : NULL, hex);
+    for (LONG i = 0; i < nmwatch; i++) {
+        uint64_t w = mwatch[i];
+        if (addr && w >= addr && (size == 0 || w < addr + size)) {
+            uint64_t key = (w * 0x9E3779B97F4A7C15ull) ^ (st >= 0 && st < 6 ? (uintptr_t)C1CUR[st] : 0) ^ off;
+            int known = 0;
+            for (int k = 0; k < nseen && !known; k++) known = seen[k] == key;
+            if (known) continue;
+            if (nseen < 256) seen[nseen++] = key;
+            if (InterlockedIncrement(&lines) <= 200)
+                rt_log("meshwatch: f%llu %s by %s (stage %d, c0+%#x) at %#llx+%#llx covers indirect args %#llx",
+                       (unsigned long long)gfx_stats().frames, what, hex, st, off, (unsigned long long)addr,
+                       (unsigned long long)size, (unsigned long long)w);
+        }
+    }
+}
+// OOT_MESH_WATCH=<frame> (above 1): every dispatch of that frame is logged in order with its storage slots.
+static void mwatch_seq(const VkExec *ex, const GfxShader *cs, const char *dims) {
+    static long long at = -1;
+    if (at < 0) { const char *e = getenv("OOT_MESH_WATCH"); at = e ? atoll(e) : 0; }
+    if (at <= 1 || (long long)gfx_stats().frames != at) return;
+    char hex[17], s[1200];
+    size_t o = 0;
+    shader_hex(cs, hex);
+    for (int k = 0; k < 16 && o < sizeof s - 60; k++) {
+        const p_bind_buf *b = &ex->ssbo[NVN_STAGE_CS][k];
+        if (!b->addr) continue;
+        VkMemSpan sp;
+        uint64_t pb = 0, pe = 0;
+        if (vk_mem_resolve(b->addr, 1, &sp)) pb = b->addr - sp.offset, pe = b->addr + sp.avail;
+        o += (size_t)snprintf(s + o, sizeof s - o, " %d=%#llx+%#llx[pool %#llx-%#llx%s]", k, (unsigned long long)b->addr,
+                              (unsigned long long)b->size, (unsigned long long)pb, (unsigned long long)pe, sp.pool ? "" : " dev");
+    }
+    s[o] = 0;
+    rt_log("meshseq: %s %s:%s", hex, dims, s);
+}
+
+// OOT_MESH_WATCH: the global window's entries (gw_select), per kernel at its first dispatch with any and when their
+// count changes; and every dispatch of the OOT_MESH_WATCH frame.
+static void mwatch_gw(const VkExec *ex) {
+    (void)ex;
+    if (!mwatch_on()) return;
+    static struct { const void *cs; uint32_t n; } seen[256];
+    static int nseen;
+    const void *cs = C1CUR[NVN_STAGE_CS];
+    static long long at = -1;
+    if (at < 0) { const char *e = getenv("OOT_MESH_WATCH"); at = e ? atoll(e) : 0; }
+    int i = 0;
+    while (i < nseen && seen[i].cs != cs) i++;
+    if (i < nseen && seen[i].n == gw_n && (long long)gfx_stats().frames != at) return;
+    if (i == nseen && nseen < 256) nseen++;
+    if (i < 256) seen[i].cs = cs, seen[i].n = gw_n;
+    char hex[17], s[900];
+    size_t o = 0;
+    shader_hex(cs, hex);
+    for (uint32_t k = 0; k < gw_n && o < sizeof s - 40; k++)
+        o += (size_t)snprintf(s + o, sizeof s - o, " %#llx+%#llx", (unsigned long long)GW[k].addr, (unsigned long long)GW[k].size);
+    s[o] = 0;
+    rt_log("meshwatch: f%llu global window of %s: %u entries:%s (registry %u)", (unsigned long long)gfx_stats().frames, hex, gw_n, s, gwr_n);
+}
+
+static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r);
+static void mwatch_discard(const VkExec *ex, int st, const GfxShaderRes *r) {
+    if (!mwatch_on()) return;
+    static uint64_t seen[256];
+    static int nseen;
+    uint64_t key = (st >= 0 && st < 6 ? (uintptr_t)C1CUR[st] : 0) ^ ((uint64_t)r->cbuf_slot << 40) ^ (uint64_t)r->handle * 4;
+    for (int k = 0; k < nseen; k++) if (seen[k] == key) return;
+    if (nseen >= 256) return;
+    seen[nseen++] = key;
+    char hex[17];
+    shader_hex(st >= 0 && st < 6 ? C1CUR[st] : NULL, hex);
+    char why[200] = "";
+    uint32_t off = (uint32_t)r->handle * 4, base = 0, ns = 0, nt = 0, ni = 0;
+    if (r->cbuf_slot >= 3 && r->cbuf_slot - 3 < 18) {
+        const p_bind_buf *u = &ex->ubo[st][r->cbuf_slot - 3];
+        snprintf(why, sizeof why, "uniform slot %d = %#llx+%#llx, pointer %#llx", r->cbuf_slot - 3, (unsigned long long)u->addr,
+                 (unsigned long long)u->size, (unsigned long long)ubo_ptr(ex, st, r));
+    } else if (r->cbuf_slot == 0 && st == NVN_STAGE_CS && nvn2_cs_layout(ex, &base, &ns, &nt, &ni)) {
+        uint64_t v = 0;
+        if (off >= 0x10 && off + 8 <= 0x10 + ex->push_cc_len) memcpy(&v, ex->push_cc + off - 0x10, 8);
+        snprintf(why, sizeof why, "tables at %#x (%u storage, %u textures, %u images), push %#x bytes, pushed value %#llx", base,
+                 ns, nt, ni, ex->push_cc_len, (unsigned long long)v);
+    }
+    rt_log("meshwatch: f%llu written storage of %s (stage %d%s) at c%d+%#x has no backing: discarded; %s",
+           (unsigned long long)gfx_stats().frames, hex, st, M.on ? ", mesh draw" : "", r->cbuf_slot, off, why);
+}
+
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
@@ -1248,7 +1645,7 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     int ubo, slot = ssbo_slot(r, st, &ubo);
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
-    int pi;
+    int pi, gw = 0;
     if (M.drawing && st == NVN_STAGE_VS && r->cbuf_slot == 0 && (uint32_t)r->handle * 4 == SM86_MESH_VS_TABLE)
         return (VkDescriptorBufferInfo){M.buf, M.task_size, M.mesh_size};   // mesh_draw: the mesh records
     if (M.on && st == NVN_STAGE_CS && r->cbuf_slot == 0) {   // op_draw_mesh: the records
@@ -1262,7 +1659,12 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     else if (r->cbuf_slot == 0 && nvn2_cs(ex, st)) {                  // NVN2: the slot the bank-0 entry belongs to
         int kind, s2 = nvn2_c0_slot(ex, (uint32_t)r->handle * 4, &kind);
         uint32_t off = (uint32_t)r->handle * 4, base, ns, nt, ni;
-        if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
+        if (s2 < 0 && off >= VK_GW_C0 && off < VK_GW_C0 + 16 * VK_GW_N) {   // the global window (gw_select)
+            uint32_t k = (off - VK_GW_C0) / 16;
+            if (M.on || k >= gw_n || (off - VK_GW_C0) % 16)
+                return written ? (VkDescriptorBufferInfo){Z.dbuf, 0, max < ZERO_BYTES ? max : ZERO_BYTES} : zero_info(max);
+            up.addr = GW[k].addr, up.size = GW[k].size, b = &up, gw = 1;
+        } else if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
         else if (off >= 0x10 && off + 8 <= 0x10 + ex->push_cc_len && nvn2_cs_layout(ex, &base, &ns, &nt, &ni) && off + 8 <= base) {
             // a pointer the game pushed with the constants (PushComputeConstants), before the tables: the buffer at it,
             // to the end of its backing (2026-11-07: ace1cec0 loops over a list at the pointer in its push at 0x60;
@@ -1274,9 +1676,29 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
         uint64_t lead = vk_caps.sbuf_align ? b->addr & (vk_caps.sbuf_align - 1) : 0;
+        // A window entry is bound as written for every store the program might make through it, so its whole range
+        // would go back to guest memory after the submission (a mirrored pool) and come back up as dirty pages: 70 MiB
+        // each way per frame, the frame CPU-bound at 28 fps. The GPU's copy stays the one in use; the CPU does not read
+        // these (counters and lists the GPU builds), and what it writes there still goes up.
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
-                       written, &bi)) {
-            if (written && bi.buffer != VK_NULL_HANDLE) note_written(ex, b->addr - lead, bi.range);
+                       written && !gw, &bi)) {
+            if (st == NVN_STAGE_CS && !gw) gwr_note(b->addr, b->size);   // a place pointers in memory can name (gw_select)
+            if (gw && getenv("OOT_GW_TRACE")) {   // the window binding as made (diagnostic)
+                static uint64_t lastf;
+                static int nthis;
+                uint64_t fr = gfx_stats().frames;
+                char hx[17];
+                shader_hex(C1CUR[st], hx);
+                if (fr != lastf) lastf = fr, nthis = 0;
+                if (!strncmp(hx, getenv("OOT_GW_TRACE"), strlen(getenv("OOT_GW_TRACE"))) && fr % 300 < 2 && nthis++ < 24)
+                    rt_log("gwtrace: f%llu %s window c0+%#x -> %#llx+%#llx bound at buffer offset %#llx range %#llx (lead %#llx, written %d)",
+                           (unsigned long long)fr, hx, (uint32_t)r->handle * 4, (unsigned long long)b->addr, (unsigned long long)b->size,
+                           (unsigned long long)bi.offset, (unsigned long long)bi.range, (unsigned long long)lead, written);
+            }
+            if (written && !gw && bi.buffer != VK_NULL_HANDLE) {
+                note_written(ex, b->addr - lead, bi.range);
+                vk_exec_mesh_watch("storage write", st, (uint32_t)r->handle * 4, b->addr - lead, bi.range);
+            }
             return bi;
         }
         if (b->addr) warn_once(W_SSBO_ALIGN, "storage buffer %#llx is not backed or not aligned: a zero buffer is bound",
@@ -1287,7 +1709,10 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     }
     // A written binding with no backing stores into the discard buffer: the zero buffer every unresolved read shares
     // must stay zero (a store into it made counts and list lengths garbage for every other unresolved reader).
-    if (written) return (VkDescriptorBufferInfo){Z.dbuf, 0, max < ZERO_BYTES ? max : ZERO_BYTES};
+    if (written) {
+        mwatch_discard(ex, st, r);
+        return (VkDescriptorBufferInfo){Z.dbuf, 0, max < ZERO_BYTES ? max : ZERO_BYTES};
+    }
     return zero_info(max);
 }
 
@@ -3080,15 +3505,22 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         return;
     }
     if (skip_cs(cs)) return;
+    if (mwatch_on()) {
+        char dims[48];
+        snprintf(dims, sizeof dims, "%dx%dx%d", d->x, d->y, d->z);
+        mwatch_seq(ex, cs, dims);
+    }
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
     vk_exec_barrier(ex);   // ends the pass; earlier writes are visible to the shader
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     c0_dim[0] = (uint32_t)d->x, c0_dim[1] = (uint32_t)d->y, c0_dim[2] = (uint32_t)d->z;
+    gw_select(ex, info);
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    gw_n = 0;
     int tp = cst_begin(ex);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     cst_end(ex, tp, cs, (const uint32_t[3]){(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z});
@@ -3103,22 +3535,26 @@ enum { IND_SLOTS = 256 };
 static VkBuffer ind_buf;
 static VmaAllocation ind_mem;
 static uint32_t *ind_map, ind_next;
-typedef struct { uint32_t slot; char hex[17]; } IndRead;
+typedef struct { uint32_t slot; char hex[17]; uint64_t addr, frame; uint32_t cpu[3]; } IndRead;
 static void ind_read(void *arg) {
     IndRead *r = arg;
     static volatile LONG n;
     if (InterlockedIncrement(&n) <= 200) {
         const uint32_t *v = ind_map + 4 * r->slot;
         const uint32_t *lim = vk_ctx()->props.limits.maxComputeWorkGroupCount;
-        rt_log("vk_exec: OOT_IND_LOG: indirect dispatch of %s: %u x %u x %u groups%s", r->hex, v[0], v[1], v[2],
+        rt_log("vk_exec: OOT_IND_LOG: f%llu indirect dispatch of %s from %#llx (%s): %u x %u x %u groups (next word %u), CPU %u %u %u%s",
+               (unsigned long long)r->frame, r->hex, (unsigned long long)r->addr, nvn_gpu_only(r->addr) ? "GPU-only pool" : "CPU-visible",
+               v[0], v[1], v[2], v[3], r->cpu[0], r->cpu[1], r->cpu[2],
                v[0] > lim[0] || v[1] > lim[1] || v[2] > lim[2] ? " (over the device's limit)" : "");
     }
     free(r);
 }
-static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
+static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs, uint64_t addr) {
     static int on = -1;
+    static long long from;   // OOT_IND_LOG=<frame> (above 1): from that frame on
     if (on < 0) {
-        on = getenv("OOT_IND_LOG") != NULL;
+        const char *e = getenv("OOT_IND_LOG");
+        on = e != NULL, from = e ? atoll(e) : 0;
         if (on) {
             VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = IND_SLOTS * 16,
                                      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
@@ -3130,15 +3566,19 @@ static void ind_log(VkExec *ex, const VkMemSpan *ip, const GfxShader *cs) {
             else on = 0;
         }
     }
-    if (!on) return;
+    if (!on || (from > 1 && (long long)gfx_stats().frames < from)) return;
     uint32_t slot = ind_next++ % IND_SLOTS;
-    VkBufferCopy cp = {ip->offset, (VkDeviceSize)slot * 16, 12};
+    VkMemSpan ip16;   // the word after the group counts too (the culling's counter, 2026-11-07)
+    int w = vk_mem_resolve(addr, 16, &ip16);
+    VkBufferCopy cp = {ip->offset, (VkDeviceSize)slot * 16, w ? 16 : 12};
     vkCmdCopyBuffer(ex->cb, ip->buffer, ind_buf, 1, &cp);
     ex->recorded++;
     vk_exec_barrier(ex);
     IndRead *r = malloc(sizeof *r);
     if (!r) return;
-    r->slot = slot;
+    r->slot = slot, r->addr = addr, r->frame = gfx_stats().frames;
+    memset(r->cpu, 0, sizeof r->cpu);
+    if (!nvn_gpu_only(addr)) memcpy(r->cpu, (const void *)(uintptr_t)addr, 12);   // guest memory as the CPU sees it now
     const uint8_t *id = gfx_shader_input_id(cs);
     for (int i = 0; i < 8; i++) snprintf(r->hex + 2 * i, 3, "%02x", id[i]);
     vk_completion_add(ex->fence, ind_read, r);
@@ -3157,6 +3597,11 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);
     if (!cs) return;
     if (skip_cs(cs)) return;
+    if (mwatch_on()) {
+        char dims[48];
+        snprintf(dims, sizeof dims, "indirect@%#llx", (unsigned long long)d->ind);
+        mwatch_seq(ex, cs, dims);
+    }
     const VkPipeInfo *info = NULL;
     VkPipeline p = vk_pipeline_compute(cs, &info);
     if (!p || !info) return warn_once(W_PIPELINE, "a compute pipeline could not be created: dispatches with it are skipped");
@@ -3165,9 +3610,12 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     c0_dim[0] = c0_dim[1] = c0_dim[2] = 0;
     B.c0_valid[2] = 0;   // a fresh c0 range: the copy below must not change one an earlier dispatch reads
+    gwr_note(d->ind, 16);
+    gw_select(ex, info);
     twin_dispatch = 1;
     bind_resources(ex, info);
     twin_dispatch = 0;
+    gw_n = 0;
     if (B.c0_valid[2]) {   // the shader binds c0
         VkBufferCopy cp = {ip.offset, B.c0_off[2] + 0x200, sizeof(VkDispatchIndirectCommand)};
         vkCmdCopyBuffer(ex->cb, ip.buffer, B.c0_buf[2], 1, &cp);
@@ -3175,7 +3623,8 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
         vk_exec_barrier(ex);
         B.c0_valid[2] = 0;   // the range no longer holds B.c0[2]
     }
-    ind_log(ex, &ip, cs);
+    ind_log(ex, &ip, cs, d->ind);
+    mwatch_add(d->ind);   // OOT_MESH_WATCH: who writes the indirect dispatch's group counts too
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
     ex->recorded++;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
@@ -3195,12 +3644,14 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
 static const NVNshaderData *stage_entry(const prog_t *p, int st);
 
 static struct { VkBuffer buf; VmaAllocation mem; uint32_t *map; uint32_t next; } MRB;   // OOT_MESH_LOG read-back
-typedef struct { uint32_t slot, kind, a, b; } MeshRead;
+typedef struct { uint32_t slot, kind, a, b; uint64_t ind, frame; uint32_t cpu[4]; } MeshRead;
 static void mesh_read(void *arg) {
     MeshRead *r = arg;
     const uint32_t *v = MRB.map + 16 * r->slot;
     if (r->kind)
-        rt_log("meshlog: indirect mesh draw (%u, task %u): args %#x %#x %#x %#x", r->a & 0xff, r->a >> 8, v[0], v[1], v[2], v[3]);
+        rt_log("meshlog: f%llu indirect mesh draw (%u, task %u) at %#llx: GPU %#x %#x %#x %#x, CPU at record %#x %#x %#x %#x",
+               (unsigned long long)r->frame, r->a & 0xff, r->a >> 8 & 1, (unsigned long long)r->ind, v[0], v[1], v[2], v[3],
+               r->cpu[0], r->cpu[1], r->cpu[2], r->cpu[3]);
     else
         rt_log("meshlog: mesh draw of %u tasks, %u mesh groups: task 0 words %#x %#x %#x %#x; primitive counts of groups "
                "0-7: %u %u %u %u %u %u %u %u; group 0 vertex 0: %g %g %g %g", r->a, r->b, v[0], v[1], v[2], v[3], v[4],
@@ -3225,7 +3676,9 @@ static int mesh_rb_slot(void) {
             else on = 0;
         }
     }
-    if (!on || InterlockedIncrement(&n) > 80) return -1;
+    static long long from = -1;   // OOT_MESH_LOG_FROM=<frame>: read back from that frame on (the level, not the title)
+    if (from < 0) { const char *e = getenv("OOT_MESH_LOG_FROM"); from = e ? atoll(e) : 0; }
+    if (!on || (long long)gfx_stats().frames < from || InterlockedIncrement(&n) > 80) return -1;
     return (int)(MRB.next++ % 64);
 }
 // OOT_MESH_SYNC (--probe-cs): the entries wait for vk_exec_mesh_flush, called after the harness's fence wait (its
@@ -3236,10 +3689,12 @@ void vk_exec_mesh_flush(void) {
     for (int i = 0; i < mesh_nheld; i++) mesh_read(mesh_held[i]);
     mesh_nheld = 0;
 }
-static void mesh_rb_done(VkExec *ex, int slot, uint32_t kind, uint32_t a, uint32_t b) {
+static void mesh_rb_done(VkExec *ex, int slot, uint32_t kind, uint32_t a, uint32_t b, uint64_t ind) {
     MeshRead *r = malloc(sizeof *r);
     if (!r) return;
-    *r = (MeshRead){(uint32_t)slot, kind, a, b};
+    *r = (MeshRead){(uint32_t)slot, kind, a, b, ind, gfx_stats().frames, {0}};
+    VkMemSpan sp;
+    if (ind && vk_mem_resolve(ind, 16, &sp)) memcpy(r->cpu, (const void *)(uintptr_t)ind, 16);
     (void)ex;
     if (getenv("OOT_MESH_SYNC")) {
         if (mesh_nheld < 64) mesh_held[mesh_nheld++] = r;
@@ -3390,6 +3845,8 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     dummies_init();
     if (indirect) {   // not run yet: the arguments read back for OOT_MESH_LOG
         VkMemSpan ip;
+        mwatch_add(d->ind);
+        gwr_note(d->ind, 16);
         int slot = mesh_rb_slot();
         if (slot < 0 || !vk_mem_resolve(d->ind, 16, &ip)) return;
         vk_exec_barrier(ex);
@@ -3398,7 +3855,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
         vkCmdCopyBuffer(ex->cb, ip.buffer, MRB.buf, 1, &cp);
         ex->recorded++;
         vk_exec_barrier(ex);
-        mesh_rb_done(ex, slot, 1, (uint32_t)d->count | (has_task ? 0x100u : 0), 0);
+        mesh_rb_done(ex, slot, 1, ((uint32_t)d->count & 0xff) | (has_task ? 0x100u : 0), 0, d->ind);
         return;
     }
     if (d->first != 0 || d->count <= 0 || (uint32_t)d->count > MESH_MAX_TASKS)
@@ -3456,7 +3913,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
         for (uint32_t c = 0; c < 4; c++) cp[9 + c] = (VkBufferCopy){M.task_size + 0x80 * c, o + 48 + 4 * c, 4};
         vkCmdCopyBuffer(ex->cb, M.buf, MRB.buf, 13, cp);
         ex->recorded++;
-        mesh_rb_done(ex, slot, 0, tasks, groups);
+        mesh_rb_done(ex, slot, 0, tasks, groups, 0);
     }
 }
 

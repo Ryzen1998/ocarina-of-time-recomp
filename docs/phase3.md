@@ -422,7 +422,7 @@ translator traces through `GlobalToStorage`). Next: read the translated SPIR-V o
 `vkCmdUpdateBuffer` has no recorder wrapper (`vk_rec.h`), so it went into the command buffer out of order and from a
 second thread; and completion callbacks in the harness run before its submission, hence `OOT_MESH_SYNC`.
 
-**Found and fixed (2026-11-07, after a reboot):** k_exec_draw.c nswers_for read the workgroup size raw from control
+**Found and fixed (2026-11-07, after a reboot):** `vk_exec_draw.c` `answers_for` read the workgroup size raw from control
 +0x58 as 16-bit values: for a mesh program that is 32 x 1 x 128 = 4096 threads (the high halves are its output limits),
 four times Vulkan's limit. It now takes sm86_control_parse's values. With it the probe draws 28b30890 cleanly (2 triangles
 per workgroup, plausible vertices, 0 validation errors, 0 driver resets), and a full level run with OOT_MESH=1 (run-70)
@@ -446,10 +446,10 @@ mesh program (the host passes the mesh code with a copy of its control section m
 vertex id / 3 is the primitive, the instance the mesh workgroup; it loads the primitive count and index byte from the
 record's map and the vertex's lines, and stores line k to the output attribute of the k-th set bit of the mesh
 header's output map (bitfield from header byte 0x34, bit b = attribute 0x40 + 4 b; checked on all 26 mesh programs).
-k_exec_draw.c mesh_draw pairs it with the game's fragment stage of the same program and draws 3 * max-primitives
+`vk_exec_draw.c` `mesh_draw` pairs it with the game's fragment stage of the same program and draws 3 * max-primitives
 vertices x workgroups instanced, the records at vertex storage slot 15 (bank 0 + 0x200). All 26 translate; no device
 loss, no driver reset. The direct mesh draws are the depth pre-pass (colour mask 0) and 128x128 shadow layers: with
-them the scene's depth buffer gets the ground where it had holes (uild/logs/mesh-depth-keep.png). The colour of
+them the scene's depth buffer gets the ground where it had holes (`build/logs/mesh-depth-keep.png`). The colour of
 the ground comes from the indirect mesh draws, still only read back. OOT_MESH_NODRAW=1 skips step 3.
 
 **Indirect mesh draws and an intermittent timeout (run-75/76):** the indirect draws come from about ten call sites
@@ -468,9 +468,51 @@ pointer the game pushes with its constants (bank 0 + 0x60), which the replay bou
 every unresolved reader: a garbage list length, a near-endless loop. Fixed: pointers in the pushed constants (before the
 NVN2 tables) bind the buffer they point to (ssbo_info), and written bindings without backing go to a separate
 discard buffer. Result without the mesh path (run-79): the level runs at about 50 fps instead of 1-2, the slowest
-kernel 0.25 ms, and the scene renders lit and textured (uild/logs/level-push-keep.png, Navi over the moss). With
+kernel 0.25 ms, and the scene renders lit and textured (`build/logs/level-push-keep.png`, Navi over the moss). With
 OOT_MESH=1 (run-80): the same speed, no driver reset, the Deku Tree area lit and textured where drawn
-(uild/logs/level-push-mesh-keep.png); the white left is ground drawn by the indirect mesh draws, still not run.
+(`build/logs/level-push-mesh-keep.png`); the white left is ground drawn by the indirect mesh draws, still not run.
+
+**Why the indirect mesh draws read 0: the frame's culling never counts anything (2026-11-07, run-81..110).** The
+chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a frame dump's `OOT_DUMP_BUF`:
+
+- The indirect mesh draws' arguments sit at the head of buffers whose rest is a list (16-byte records, e.g.
+  0x2a0e04010/020/030); the culling kernels that fill them (c8b8, 3076, 75dc, 68e8, 2bb4, d295...) are themselves
+  *indirect* dispatches, and their group counts read `0 1 1` every frame: the CPU writes y = z = 1 and x = 0, a GPU
+  counter at record + 12 is to be counted up first. Nothing writes them: the dump's buffer snapshot of the argument
+  records stays `{0, 1, 1, 0}` through two whole level frames.
+- **Fixed: the lowering corrupted constant bank 1.** The record-less jump-table fix-up in `sm86_lower.c` moved every
+  c1 word that is 0 or a multiple of 16 as if it were a jump target, also in programs without a BRX. The culling
+  kernels add the 64-bit constant 12 in c1 to their argument pointer (`ULDC.64 c[1][0]` + `c[0][0xc0]`); its zero high
+  word became 8, so the counters went 32 GiB past the buffer, and the translator traced the store to c1 + 0 (no
+  address), into the discard buffer. Now only programs with a BRX get the fix-up (`has_brx`), and a bank-1 word of a
+  program without one is forwarded as an immediate (`c1_imm`), so the translator traces such addresses to the bank-0
+  pointer. All 827 of 828 cached programs still lower (the one refusal predates this). KEY_VERSION 19.
+- **The counters are atomics through pointers no trace reaches.** The frame's first kernel, e6d5432f (169 x 128
+  threads, one warp per object), reads an object's type record address from an array in its uniform block 1 at a
+  run-time index (`LDC.64 c[4][R]`), a list pointer from the record, the count at that pointer + 4, and adds the
+  visible objects with `ATOMG.ADD` at `c4[0xe0 + 16 type] + 12`, the culling dispatches' argument records. The
+  translator found no storage buffer for 49 of its accesses (35 loads, 5 stores, 6 atomic adds, 3 atomic max) and
+  emitted nothing for them. **Added, off by default (`OOT_GW=1`): a global window** (`tools/xlate/patches/0019`,
+  `vk_exec_draw.c` `gw_select`): such an access in a compute program is checked on the GPU against 24
+  {address, size} entries at bank 0 + 0x410 (`VK_GW_C0`), each bound as a storage buffer; before each dispatch whose
+  program has them, the host fills them with the buffers the program's pointers can reach: 64-bit values in its read
+  storage buffers, uniform blocks (and this submission's inline updates) and push, looked up among the buffers bound
+  as compute storage so far (a registry of the bound ranges) or, failing that, a backing of at most 256 MiB; then one
+  hop further (256 bytes at each pointer found), then its own buffers. Windows are bound without the mirror's
+  write-back (whole ranges came back every frame). Its cost: 3 ms of CPU a frame on the level (scans cached per
+  buffer for 32 frames; scanning per dispatch cost 28 ms, a poor hash made every lookup miss). With it, e6d5432f's
+  window holds every record, list and argument buffer of the chain (`OOT_GW_TRACE=e6d5432f` checks each hop), the
+  bindings are right (buffer, offset, range logged), the SPIR-V's range check is right (spirv-dis: bank 0 vec4 65 on),
+  and the GPU's copies of the lists hold the CPU's counts (2364 at 0x2a1bb0000 + 4)...
+- ...**and still no thread reaches the atomics**: the argument records never change. What is left is inside e6d5432f
+  after the count check: a warp vote and shared-memory step (`VOTE`, `LDS [0x400]`, `@!P0 EXIT` at 0x6a10) guards the
+  atomics. Next: a probe that can store into a buffer (the `OOT_SM86_PROBE` one needs a storage image, which this
+  kernel lacks) to bisect e6d5432f between 0x430 (the count check) and 0x6bc0 (the first atomic), then the culling
+  kernels' own counters, then `op_draw_mesh`'s indirect path (16-byte records; the argument word layout is still to
+  be read from the culling's writes).
+- With `OOT_GW=1` the intro cutscene looked worse (more of it white, the tree in silhouette, `build/logs/gw-11.png`
+  against `default-after-gw.png`): some kernels whose pointer reads become real get worse, another reason it stays
+  off. No device loss and no driver reset in the 30 runs of this work.
 
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,

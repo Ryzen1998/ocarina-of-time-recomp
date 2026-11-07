@@ -58,8 +58,10 @@ discard buffer, not the shared zero buffer: the level now runs at about 50 fps (
 Mesh draws (`DrawMeshTasks*`) are implemented behind `OOT_MESH=1` (off by default): the task and mesh programs run as
 compute programs on per-workgroup records and a generated pass-through vertex program draws the records with the
 game's fragment stage; the direct draws (depth pre-pass, shadows) work, the indirect ones (most of the ground's colour)
-are not run yet, their arguments read 0. `docs/phase3.md`, the Status sections of 2026-11-07, has the details and the
-order of what is left.
+are not run yet, their arguments read 0, because the frame's culling kernels never count anything: their counters are
+atomics through pointers loaded at run time. A global window for such accesses (`OOT_GW=1`, translator patch 0019,
+`vk_exec_draw.c` `gw_select`) is in place but off: with it the pointers resolve and still no culling thread reaches its
+atomics (open). `docs/phase3.md`, the Status sections of 2026-11-07, has the details and the order of what is left.
 
 ## GPU safety (learned 2026-11-07)
 
@@ -107,6 +109,9 @@ is lost). `tools/kernel.py` and `tools/run.py` also run under native Windows Pyt
 
 ## Environment notes
 
+- `oot.exe` runs the translator next to it (`build/v131072/oot_xlate.exe` + `.id`), not `build/xlate/`: after
+  `tools/build_xlate.py`, copy both there, or the run keeps the old translator (the log's "translator identity" line
+  tells which). `tools/kernel.py` uses `build/xlate/`. `spirv-dis` is in MSYS2 (`C:\msys64\ucrt64\bin`).
 - Native Windows works too (checked 2026-11-07 on a second machine): `.venv-win\Scripts\python.exe tools\run.py ...`,
   `tools\build_game.py` and `tools\kernel.py` run unchanged with MSYS2 UCRT64 at `C:\msys64`; redirect `oot.exe`'s
   output through `cmd /c "... > file 2>&1"`, as PowerShell wraps long native stderr lines.

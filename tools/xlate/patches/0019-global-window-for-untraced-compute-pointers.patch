@@ -1,0 +1,76 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -10,6 +10,10 @@
+     static class GlobalToStorage
+     {
+         private const int DriverReservedCb = 0;
++
++        // The global window of compute programs (runtime/vk_exec.h VK_GW_C0, VK_GW_N).
++        private const int GlobalWindowOffset = 0x410;
++        private const int GlobalWindowCount = 24;
+ 
+         enum LsMemoryType
+         {
+@@ -655,7 +659,20 @@
+ 
+             targetCbs.Sort();
+ 
+-            if (targetCbs.Count == 0)
++            if (targetCbs.Count == 0 && resourceManager.Stage == ShaderStage.Compute)
++            {
++                // The global window (ocarina-of-time-recomp, runtime/vk_exec_draw.c "global window"): an address no
++                // constant buffer word can be traced to (a pointer the program loaded from memory) is checked at run
++                // time against GlobalWindowCount {u64 address, u32 size} entries in c0 at GlobalWindowOffset, which the
++                // host fills per dispatch with the buffers the program's pointers can reach, each bound as storage.
++                for (int k = 0; k < GlobalWindowCount; k++)
++                {
++                    targetCbs.Add(PackCbSlotAndOffset(0, GlobalWindowOffset / 4 + k * 4));
++                }
++
++                gpuAccessor.Log($"Global memory operation \"{operation.Inst}\" goes through the global window.");
++            }
++            else if (targetCbs.Count == 0)
+             {
+                 gpuAccessor.Log($"Failed to find storage buffer for global memory operation \"{operation.Inst}\".");
+             }
+--- a/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/ResourceManager.cs
+@@ -22,7 +22,10 @@
+ 
+         private readonly SetBindingPair[] _cbSlotToBindingMap;
+         private readonly SetBindingPair[] _sbSlotToBindingMap;
+-        private uint _sbSlotWritten;
++        private ulong _sbSlotWritten;
++
++        // The shader stage (GlobalToStorage: the global window of compute programs).
++        public ShaderStage Stage => _stage;
+ 
+         private readonly Dictionary<int, int> _sbSlots;
+         private readonly Dictionary<int, int> _sbSlotsReverse;
+@@ -66,7 +69,7 @@
+             _stagePrefix = GetShaderStagePrefix(stage);
+ 
+             _cbSlotToBindingMap = new SetBindingPair[18];
+-            _sbSlotToBindingMap = new SetBindingPair[16];
++            _sbSlotToBindingMap = new SetBindingPair[64];   // 16 + the global window's entries (GlobalToStorage)
+             _cbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+             _sbSlotToBindingMap.AsSpan().Fill(new(-1, -1));
+ 
+@@ -179,7 +182,7 @@
+ 
+             if (write)
+             {
+-                _sbSlotWritten |= 1u << slot;
++                _sbSlotWritten |= 1ul << slot;
+             }
+ 
+             binding = setAndBinding.Binding;
+@@ -490,7 +493,7 @@
+                 if (setAndBinding.Binding >= 0)
+                 {
+                     (int sbCbSlot, int sbCbOffset) = UnpackSbCbInfo(key);
+-                    BufferUsageFlags flags = (_sbSlotWritten & (1u << slot)) != 0 ? BufferUsageFlags.Write : BufferUsageFlags.None;
++                    BufferUsageFlags flags = (_sbSlotWritten & (1ul << slot)) != 0 ? BufferUsageFlags.Write : BufferUsageFlags.None;
+                     descriptors[descriptorIndex++] = new BufferDescriptor(setAndBinding.SetIndex, setAndBinding.Binding, slot, sbCbSlot, sbCbOffset, flags);
+                 }
+             }

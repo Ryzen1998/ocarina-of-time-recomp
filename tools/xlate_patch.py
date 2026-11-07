@@ -83,7 +83,7 @@ def main() -> int:
             sys.exit("xlate_patch: nothing changed since the snapshot")
         nums = [int(p.name[:4]) for p in PATCHES.glob("[0-9][0-9][0-9][0-9]-*.patch")]
         path = PATCHES / f"{max(nums, default=0) + 1:04d}-{a.slug}.patch"
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8", newline="\n")   # LF on Windows too: git apply refuses CRLF hunks
         shutil.rmtree(BASE)
         shutil.copytree(TREE / "src", BASE / "src", ignore=shutil.ignore_patterns("bin", "obj"))
         print(f"wrote {path.relative_to(ROOT)} ({text.count(chr(10))} lines); the snapshot now includes it")

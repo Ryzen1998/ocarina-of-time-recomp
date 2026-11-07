@@ -194,6 +194,8 @@ void vk_dump_present(uint64_t frame);    // vk_be_present: waits for the dump fr
 // c0, the NVN driver constant bank of one stage (vk_exec_draw.c; OOT_FIX_C0=0 binds zeros instead): bank is
 // VK_C0_BYTES, stage an NVN stage (0 vertex, 1 fragment, 5 compute), ssbo and ubo the 16 bound slots of that stage.
 #define VK_C0_BYTES 0x800u
+#define VK_GW_C0 0x410u   // the global window of compute programs (vk_exec_draw.c, tools/xlate/patches/0019 GlobalWindowOffset)
+#define VK_GW_N 24u       // its entries (GlobalWindowCount)
 void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16], const p_bind_buf ubo[16],
                 const uint32_t dispatch[3], uint32_t base_instance);
 
@@ -201,6 +203,7 @@ void vk_c0_fill(uint8_t bank[VK_C0_BYTES], int stage, const p_bind_buf ssbo[16],
 // vk_exec_draw.c: OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BIND_* (program, state, vattr, vstream, vbuf, ubo, ssbo, tex,
 // samp, img), OP_UPDATE_UB, OP_DRAW_IDX_IND, OP_DISPATCH_IND. payload: nvn_op_payload of the record.
 void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload);
+void vk_exec_mesh_watch(const char *what, int st, uint32_t off, uint64_t addr, uint64_t size);   // OOT_MESH_WATCH (vk_exec_draw.c)
 void vk_exec_mesh_flush(void);   // OOT_MESH_SYNC: print the held mesh read-backs (vk_exec_probe.c probe_cs, after its fence)
 // The aspect a sampled view of img reads (vk_exec_draw.c get_view): stencil for a view in STENCIL depth-stencil mode.
 VkImageAspectFlags vk_exec_view_aspect(const VkTexImage *img, const view_t *v, int hv);

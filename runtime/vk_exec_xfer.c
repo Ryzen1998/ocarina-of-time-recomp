@@ -75,6 +75,7 @@ static void guest_written_cb(void *arg) {
 
 // The GPU wrote [addr, addr+size) of CPU-visible memory: tell the texture cache once the fence is reached.
 static void note_gpu_write(VkExec *ex, uint64_t addr, uint64_t size) {
+    vk_exec_mesh_watch("transfer write", -1, 0, addr, size);   // OOT_MESH_WATCH: copies and fills over indirect mesh args
     vk_usnap_drop(addr, size);
     if (nvn_gpu_only(addr)) return;
     Range *r = malloc(sizeof *r);
@@ -522,6 +523,7 @@ static void clear_buf(VkExec *ex, const p_clear_buf *p) {
     }
     uint64_t dst = p->addr, left = p->size;
     int started = 0;
+    vk_exec_mesh_watch("fill (c0+ is the value)", -1, p->value, p->addr, p->size);
     while (left) {
         VkMemSpan d;
         if (!vk_mem_resolve(dst, 1, &d) || d.offset % 4) {
