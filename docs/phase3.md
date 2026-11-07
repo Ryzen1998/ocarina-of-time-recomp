@@ -14,8 +14,10 @@ fork (Ryzen1998). KEY_VERSION 23.
 - Boot, title, menus and the opening run; the replay (`build/logs/a-spam.txt`, presses A) reaches Kokiri Forest /
   the Deku Tree area about 75 s in (frame ~4500). The level runs at ~59 fps by default, no driver reset, no crash.
 - Much of the scene renders lit and textured: Navi, Link, rocks, moss, roots, the stone path, dialogue text.
-- With `OOT_GW=1 OOT_MESH=1 OOT_MESH_IND=1` (off by default) the frame's GPU culling counts and the indirect mesh
-  draws run: the ground under Link is drawn for the first time (`build/logs/gwskip-ground.png`), ~45 fps.
+- The global window, the mesh stages and the indirect mesh draws are **on by default** since 2026-11-08 evening
+  (`OOT_GW`, `OOT_MESH`, `OOT_MESH_IND`; `=0` turns each off): the frame's GPU culling counts and the ground under
+  Link is drawn. ~50 fps in the level (59 without them). 12 runs with them, from the title too (bound 64), no driver
+  reset, no crash. `build/logs/defaults-on-1.png`, `-2.png`.
 
 ### What is still wrong
 
@@ -73,10 +75,10 @@ show no regression. `SM86_UR=1` (tool build) lists the reads that do not forward
    47ebe041 +0x22a0). And **mesh 072eb70d (code hash a11f465b)**: lowers, but its draws turn the frame into black and
    white blocks (NaN/huge values into the exposure); `OOT_MESH_IND_SKIP` defaults to it. Compare its UP2R / swap
    path with the task program c6f3721f, which works.
-2. **Indirect draws**: raise `OOT_MESH_IND_MAX` or read the real counts, test from the title (only frame ≥ 4500
-   tested since the fixes), then look at the over-bright speckled ground.
-3. **Default on**: when several full runs with `OOT_GW=1 OOT_MESH=1 OOT_MESH_IND=1` stay free of resets and crashes,
-   make them the defaults (cost: ~45 vs ~59 fps; profile `gw_select` with `OOT_TRACE=perf`).
+2. **Indirect draws**: from the title with the bound 64: clean (run-160). Counts seen are at most 29, under the
+   bound; a count above it would lose meshes silently. Then the over-bright speckled ground.
+3. **Done: default on** (2026-11-08 evening). Left: the cost (~50 vs ~59 fps; profile `gw_select` with
+   `OOT_TRACE=perf`), and watching for the game crash at main+0xc938d0 (`OOT_GW_SKIP`).
 4. Find the remaining missing geometry (a frame dump with everything on: which draws leave sky).
 5. The fog kernel's NaN; the wrong traces of 374126bf / 358beb27 (fix them rather than skip them).
 6. A controller play session to see what blocks real play.

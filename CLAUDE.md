@@ -55,11 +55,12 @@ read through it get the pointer from bank 0 + 0x700, filled by the host (`OOT_SM
 as R32F get the depth texels; the fog's volume is still NaN for another cause (`OOT_SKIP_CS=1a62084a` leaves it out).
 Storage pointers a kernel gets in its pushed constants are bound, and written storage bindings without backing go to a
 discard buffer, not the shared zero buffer: the level now runs at about 50 fps (was 1-2) and renders lit and textured.
-Mesh draws (`DrawMeshTasks*`) are implemented behind `OOT_MESH=1` (off by default): the task and mesh programs run as
+Mesh draws (`DrawMeshTasks*`) are implemented (`OOT_MESH`, on by default since 2026-11-08): the task and mesh programs run as
 compute programs on per-workgroup records and a generated pass-through vertex program draws the records with the
 game's fragment stage; the direct draws (depth pre-pass, shadows) work, the indirect ones (most of the ground's colour)
-are not run by default. 2026-11-08: with `OOT_GW=1 OOT_MESH=1 OOT_MESH_IND=1` (all off by default) the frame's GPU
-culling counts and the indirect mesh draws run without device loss: the Kokiri Forest ground is drawn (PLOP3 lowering,
+now run by default too. 2026-11-08: the global window and the mesh stages are on by default (`OOT_GW`, `OOT_MESH`,
+`OOT_MESH_IND`; `=0` turns each off): the frame's GPU culling counts and the indirect mesh draws run without device
+loss, the Kokiri Forest ground is drawn (PLOP3 lowering,
 translator patches 0019/0020, task records of 0x1000, the window for task/mesh stages; KEY_VERSION 22). The white
 areas are the sky the frame draws first, showing where geometry is still missing (12 task/mesh programs do not lower).
 `OOT_SM86_COUNT` counts threads at instructions of one program and dumps its counters at a device loss: the tool for

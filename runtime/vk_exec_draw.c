@@ -1234,10 +1234,11 @@ static inline double gw_now(void) {
     LARGE_INTEGER c, f; QueryPerformanceCounter(&c); QueryPerformanceFrequency(&f); return (double)c.QuadPart / (double)f.QuadPart; }
 static void gw_select(VkExec *ex, const VkPipeInfo *info) {
     gw_n = 0;
-    // OOT_GW=1 (default off until the culling it feeds is seen to work, docs/phase3.md 2026-11-07): off, every access
+    // OOT_GW (default on since 2026-11-08, after the culling and the indirect draws it feeds worked in ~10 clean runs;
+    // OOT_GW=0 turns it off): off, every access
     // through the window reads 0 and its stores are dropped, as before the window.
     static int on = -1;
-    if (on < 0) on = rt_knob("GW", "0");
+    if (on < 0) on = rt_knob("GW", "1");
     if (!on) return;
     if (!(rt_trace & RT_TRACE_PERF)) return gw_select_inner(ex, info);
     static LARGE_INTEGER f;   // OOT_TRACE=perf: its CPU time, logged every 600 frames
@@ -1267,7 +1268,7 @@ static void gw_select(VkExec *ex, const VkPipeInfo *info) {
 static void gw_select_mesh(VkExec *ex, const VkPipeInfo *info) {
     gw_n = 0;
     static int on = -1;
-    if (on < 0) on = rt_knob("GW", "0");
+    if (on < 0) on = rt_knob("GW", "1");
     if (!on || ptr_count(NVN_STAGE_CS)) return;
     int uses = 0;
     for (uint32_t i = 0; i < info->n_bindings && !uses; i++) {
@@ -4061,10 +4062,10 @@ static void mesh_draw(VkExec *ex, const prog_t *mesh, uint32_t groups) {
     ex->ssbo[NVN_STAGE_VS][SM86_MESH_VS_SLOT] = ss;
 }
 
-static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    // OOT_MESH=1 (default off): run the stages. The first run with them lost the device on the first direct mesh draws
+static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    // OOT_MESH (default on since 2026-11-08; OOT_MESH=0 off): run the stages. The first run with them lost the device on the first direct mesh draws
     // of the title (2026-11-07, run-68, cause not known yet), so they stay off until that is understood.
     static int on = -1;
-    if (on < 0) on = rt_knob("MESH", "0");
+    if (on < 0) on = rt_knob("MESH", "1");
     if (!on) return;
     const prog_t *task = ex->mesh_prog[0], *mesh = ex->mesh_prog[1];
     if (!mesh || !stage_entry(mesh, 7)) return warn_once(W_MESH, "a mesh draw without a mesh program is skipped");
@@ -4091,10 +4092,10 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
             ex->recorded++;
             mesh_rb_done(ex, slot, 1, ((uint32_t)d->count & 0xff) | (has_task ? 0x100u : 0), 0, d->ind);
         }
-        // OOT_MESH_IND=1 (default off): run them. The first run with it lost the device on the title (2026-11-08,
+        // OOT_MESH_IND (default on since 2026-11-08; OOT_MESH_IND=0 off): run them. The first run with it lost the device on the title (2026-11-08,
         // run-126, together with a full re-translation; cause not isolated), so it stays off until a run shows it safe.
         static int ind_on = -1;
-        if (ind_on < 0) ind_on = rt_knob("MESH_IND", "0");
+        if (ind_on < 0) ind_on = rt_knob("MESH_IND", "1");
         if (!ind_on) return;
         // OOT_MESH_IND_FROM=<frame>: only from that frame on (run-126 and run-130 lost the device within 2 s of the
         // first indirect draws on the title). OOT_MESH_IND_SKIP=<hex>[,<hex>...]: not the draws whose task or mesh
