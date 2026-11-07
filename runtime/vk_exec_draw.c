@@ -3932,6 +3932,42 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
         static int ind_on = -1;
         if (ind_on < 0) ind_on = rt_knob("MESH_IND", "0");
         if (!ind_on) return;
+        // OOT_MESH_IND_FROM=<frame>: only from that frame on (run-126 and run-130 lost the device within 2 s of the
+        // first indirect draws on the title). OOT_MESH_IND_SKIP=<hex>[,<hex>...]: not the draws whose task or mesh
+        // program's code hash (FNV-1a 64, as kernel.py prints "hash") starts with one of these. Every new pair of
+        // programs is logged before it is recorded, so a device loss names its candidates.
+        static long long ind_from = -1;
+        if (ind_from < 0) { const char *e = getenv("OOT_MESH_IND_FROM"); ind_from = e ? atoll(e) : 0; }
+        if ((long long)gfx_stats().frames < ind_from) return;
+        uint64_t hp[2] = {0, 0};
+        for (int m = 0; m < 2; m++) {
+            const NVNshaderData *e = stage_entry(ex->mesh_prog[m], 6 + m);
+            if (!e) continue;
+            uint32_t len;
+            memcpy(&len, (const uint8_t *)e->control + 0x44, 4);
+            uint64_t h = 0xcbf29ce484222325ull;
+            for (uint32_t i = 0; i < len; i++) h = (h ^ ((const uint8_t *)(uintptr_t)e->data)[i]) * 0x100000001b3ull;
+            hp[m] = h;
+        }
+        const char *skip = getenv("OOT_MESH_IND_SKIP");
+        for (const char *p = skip; p && *p;) {
+            size_t k = strcspn(p, ",");
+            char hx[2][17];
+            snprintf(hx[0], 17, "%016llx", (unsigned long long)hp[0]), snprintf(hx[1], 17, "%016llx", (unsigned long long)hp[1]);
+            if (k && k <= 16 && ((hp[0] && !strncmp(hx[0], p, k)) || !strncmp(hx[1], p, k))) return;
+            p += k + (p[k] == ',');
+        }
+        static struct { uint64_t t, m; } seen[256];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen && !known; i++) known = seen[i].t == hp[0] && seen[i].m == hp[1];
+        if (!known && nseen < 256) {
+            seen[nseen].t = hp[0], seen[nseen].m = hp[1], nseen++;
+            rt_log("meshind: f%llu first indirect mesh draw with task %016llx mesh %016llx (arg %d, at %#llx)",
+                   (unsigned long long)gfx_stats().frames, (unsigned long long)hp[0], (unsigned long long)hp[1], d->count,
+                   (unsigned long long)d->ind);
+            fflush(stdout), fflush(stderr);
+        }
     } else if (d->first != 0 || d->count <= 0 || (uint32_t)d->count > MESH_MAX_TASKS)
         return warn_once(W_MESH, "a mesh draw from %d of %d task groups is skipped", d->first, d->count);
     static int ind_max = -1;

@@ -545,6 +545,17 @@ chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a 
   workgroups whose count copy did not happen would read past their lists), the task prologue, or the re-translation
   load. The indirect path is now off by default and refuses to run without the count copy. Next, one change per run:
   `OOT_MESH=1` alone (prologue, translator), then `OOT_GW=1`, then `OOT_MESH_IND=1`.
+- **Bisected after a reboot (run-127..130):** defaults (re-translating KEY 21), `OOT_MESH=1`, and
+  `OOT_MESH=1 OOT_GW=1` all ran clean (59, 58, 56 fps in the level; no reset). Adding `OOT_MESH_IND=1` (bound 16)
+  lost the device again, 30 s in on the title, within 2 s of the first indirect mesh draws (fault IP 0x2003b7e70,
+  `build/logs/fault-run130.bin`). So it is the indirect path or a task/mesh program only the indirect draws use,
+  running for the first time. The programs that translated in that run were not saved before the crash. Added
+  `meshind:` log lines (each new task/mesh pair, before it is recorded), `OOT_MESH_IND_FROM=<frame>` and
+  `OOT_MESH_IND_SKIP=<hash prefixes>` to name and then exclude the culprit.
+- 12 task/mesh programs used only by the indirect draws do not lower (11 mesh, 1 task: register pressure at the
+  start, "no general register dead over a uniform register's span" and similar, and two "uniform datapath opcode");
+  the same with the lowering before the task prologue. Their draws are skipped, so even with the crash fixed, part
+  of the ground will stay white until the lowering handles them.
 - Also seen once (run-119, `OOT_GW=1` with a count probe, during a re-translation): the game itself crashed on a null
   pointer (main+0xc938d0 reads +0x150 of an entry its table lacks, index from an object record at 0x29bc01638); not
   seen again in the three `OOT_GW=1` runs after.
