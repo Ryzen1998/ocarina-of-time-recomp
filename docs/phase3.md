@@ -410,6 +410,18 @@ a program bound for stage 6/7 that is stale for these draws, an out-of-range acc
 or the task count. Next: run one mesh program alone with `--probe-cs` on made-up records (one dispatch, no game), then
 the game with `OOT_MESH=1` and `OOT_MESH_LOG=1`, one run.
 
+**The mesh program faults the GPU on its own** (2026-11-07, `--probe-cs` now replays a mesh draw: `stage 7` programs
+are drawn with `mesh <count>`, `ubo` lines bind uniform blocks, `task <ctl> <code>` adds a task program). The
+smallest mesh program, 28b308906146a98b, drawn alone with a uniform block saying 64 items (2 workgroups), caused a
+GPU exception and reset every time (nvlddmkm events 13 and 153, fifteen runs), while the harness printed "fence
+reached": **the harness does not notice a device loss; read the driver's event log after every probe run.** So the
+title's device loss (run-68) is the lowered program itself, not the replay's state; the likeliest cause is an access
+outside the bound record buffers (the per-workgroup addressing in `lower_isbe`, or the bank-0 record entries the
+translator traces through `GlobalToStorage`). Next: read the translated SPIR-V of 28b30890 for the buffer indexing
+(offline), and check it against a CPU model of the lowered program before any GPU run. Also fixed on the way:
+`vkCmdUpdateBuffer` has no recorder wrapper (`vk_rec.h`), so it went into the command buffer out of order and from a
+second thread; and completion callbacks in the harness run before its submission, hence `OOT_MESH_SYNC`.
+
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
 the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that

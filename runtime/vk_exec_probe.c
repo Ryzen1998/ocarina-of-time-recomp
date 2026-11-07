@@ -1042,8 +1042,6 @@ static int probe_tensor_run(const GfxBackend *b, uint8_t *guest, int *n_bad) {
     static _Alignas(8) uint8_t stream[1024];
     uint8_t *q = stream;
     q = put(q, OP_BEGIN, NULL, 0);
-    const p_bind_program bp = {&prog, 1 << 5};
-    q = put(q, OP_BIND_PROGRAM, &bp, sizeof bp);
     const p_bind_buf sb = {5, 0, (uint64_t)(uintptr_t)buf, TN_BUF};
     q = put(q, OP_BIND_SSBO, &sb, sizeof sb);
     const p_dispatch dp = {1, 1, 1, 0};
@@ -1133,6 +1131,11 @@ int probe_tensor(void) {
 //   tex <slot> <w> <h>               a texture slot: an RGBA8 2D texture of zeros (unbound slots get the dummy)
 //   dispatch <x> <y> <z>
 //   trunc <n>                        lower only the first n instructions (OOT_SM86_TRUNC) to bisect inside the kernel
+//   stage <n>                        (first line) the program's NVN stage and the stage the binds go to: 7 for a mesh
+//                                    program, which is then drawn with mesh <count> instead of dispatched
+//   task <ctl> <code>                a task program (files in <dir>) bound with the mesh program (stage 7 only)
+//   ubo <slot> <size> [<file>]       a uniform buffer slot of the stage, like ssbo
+//   mesh <count>                     DrawMeshTasks(0, count) through vk_exec_draw.c op_draw_mesh (OOT_MESH on)
 // After the fence the storage buffers are written back as <dir>/out_ssbo<slot>.bin.
 
 static uint8_t *cs_read(const char *path, long *size) {
@@ -1173,21 +1176,44 @@ int probe_cs(const char *dir) {
     memset(&prog, 0, sizeof prog);
     prog.magic = NVN_PROG_MAGIC, prog.serial = 0x7200, prog.nstage = 1;
     prog.sd[0].data = (uint64_t)(uintptr_t)code_buf, prog.sd[0].control = ctl;
+    int stage = ctl[0x56] == 7 ? 7 : 5;
+    if (stage == 7) _putenv_s("OOT_MESH", "1"), _putenv_s("OOT_MESH_LOG", "1"), _putenv_s("OOT_MESH_SYNC", "1");
+    static _Alignas(256) uint8_t task_buf[1 << 16];
+    uint8_t *task_ctl = NULL;
 
     static _Alignas(8) uint8_t stream[4096];
     uint8_t *q = stream;
     q = put(q, OP_BEGIN, NULL, 0);
-    const p_bind_program bp = {&prog, 1 << 5};
-    q = put(q, OP_BIND_PROGRAM, &bp, sizeof bp);
     uint64_t off = 0x10000;
     struct { int slot; uint64_t off, size; } ssbo[16];
     int nssbo = 0;
     p_dispatch dp = {1, 1, 1, 0};
+    p_draw_mesh dm = {0, 0, 0, 0};
     char line[600];
+    while (fgets(line, sizeof line, bf)) {   // the task line comes before the binds
+        char a1[200], a2[200];
+        if (stage == 7 && sscanf(line, "task %199s %199s", a1, a2) == 2) {
+            long n1 = 0, n2 = 0;
+            snprintf(path, sizeof path, "%s/%s", dir, a1);
+            task_ctl = cs_read(path, &n1);
+            snprintf(path, sizeof path, "%s/%s", dir, a2);
+            uint8_t *tc = cs_read(path, &n2);
+            CHECK(task_ctl && tc && n2 <= (long)sizeof task_buf, "cannot read the task program");
+            memcpy(task_buf, tc, (size_t)n2);
+            free(tc);
+            prog.sd[1].data = (uint64_t)(uintptr_t)task_buf, prog.sd[1].control = task_ctl, prog.nstage = 2;
+            printf("probe-cs: task program %s with the mesh program\n", a1);
+        }
+    }
+    rewind(bf);
+    const p_bind_program bp = {&prog, stage == 7 ? (1 << 7) | (task_ctl ? 1 << 6 : 0) : 1 << 5};
+    q = put(q, OP_BIND_PROGRAM, &bp, sizeof bp);
     while (fgets(line, sizeof line, bf)) {
         int slot, x, y, z;
         unsigned long long size;
         char file[400];
+        int is_ubo = !strncmp(line, "ubo ", 4);
+        if (is_ubo) { char tmp[620]; snprintf(tmp, sizeof tmp, "ss%s", line + 1); strcpy(line, tmp); }   // ubo -> ssbo syntax
         if (sscanf(line, "ssbo %d %llx %399s", &slot, &size, file) >= 2) {
             if (sscanf(line, "ssbo %d %llx %399s", &slot, &size, file) == 2) file[0] = 0;
             CHECK(nssbo < 16 && off + size <= pool.size, "too many or too large storage buffers");
@@ -1202,10 +1228,12 @@ int probe_cs(const char *dir) {
                 free(d);
                 printf("probe-cs: ssbo slot %d: %ld bytes from %s\n", slot, n, file);
             }
-            const p_bind_buf sb = {5, slot, (uint64_t)(uintptr_t)mem, size};
-            q = put(q, OP_BIND_SSBO, &sb, sizeof sb);
+            const p_bind_buf sb = {stage, slot, (uint64_t)(uintptr_t)mem, size};
+            q = put(q, is_ubo ? OP_BIND_UBO : OP_BIND_SSBO, &sb, sizeof sb);
             ssbo[nssbo].slot = slot, ssbo[nssbo].off = off, ssbo[nssbo].size = size, nssbo++;
             off = (off + size + 0xffff) & ~0xffffull;
+        } else if (sscanf(line, "mesh %d", &x) == 1) {
+            dm.count = x;
         } else if (sscanf(line, "dispatch %d %d %d", &x, &y, &z) == 3) {
             dp.x = x, dp.y = y, dp.z = z;
         } else if (sscanf(line, "trunc %d", &x) == 1) {
@@ -1216,7 +1244,8 @@ int probe_cs(const char *dir) {
         }
     }
     fclose(bf);
-    q = put(q, OP_DISPATCH, &dp, sizeof dp);
+    if (stage == 7) q = put(q, OP_DRAW_MESH, &dm, sizeof dm);
+    else q = put(q, OP_DISPATCH, &dp, sizeof dp);
     const p_barrier bar = {0, 0};
     q = put(q, OP_BARRIER, &bar, sizeof bar);
     q = put(q, OP_END, NULL, 0);
@@ -1241,6 +1270,7 @@ int probe_cs(const char *dir) {
                (unsigned long long)nz, (unsigned long long)ssbo[i].size, path);
     }
     b->finish();
+    if (stage == 7 && done) vk_exec_mesh_flush();   // after every part of the submission
     vk_pipeline_shutdown();
     vk_exec_draw_shutdown();
     vk_exec_xfer_shutdown();

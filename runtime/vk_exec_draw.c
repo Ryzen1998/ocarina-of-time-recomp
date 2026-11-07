@@ -3177,11 +3177,25 @@ static int mesh_rb_slot(void) {
     if (!on || InterlockedIncrement(&n) > 80) return -1;
     return (int)(MRB.next++ % 64);
 }
+// OOT_MESH_SYNC (--probe-cs): the entries wait for vk_exec_mesh_flush, called after the harness's fence wait (its
+// completion callbacks run before the GPU has run the submission).
+static MeshRead *mesh_held[64];
+static int mesh_nheld;
+void vk_exec_mesh_flush(void) {
+    for (int i = 0; i < mesh_nheld; i++) mesh_read(mesh_held[i]);
+    mesh_nheld = 0;
+}
 static void mesh_rb_done(VkExec *ex, int slot, uint32_t kind, uint32_t a, uint32_t b) {
     MeshRead *r = malloc(sizeof *r);
     if (!r) return;
     *r = (MeshRead){(uint32_t)slot, kind, a, b};
-    vk_completion_add(ex->fence, mesh_read, r);
+    (void)ex;
+    if (getenv("OOT_MESH_SYNC")) {
+        if (mesh_nheld < 64) mesh_held[mesh_nheld++] = r;
+        else free(r);
+        return;
+    }
+    vk_completion_add(vk_sync_issued() + 1, mesh_read, r);   // the submission being recorded (ex->fence is set at its submit)
 }
 
 // The record buffer, grown when a draw needs more; the old one goes after the submission being recorded.
@@ -3289,11 +3303,15 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {
         return warn_once(W_MESH, "no memory for %u mesh records: mesh draws are skipped", groups);
     vk_exec_barrier(ex);
     vkCmdFillBuffer(ex->cb, M.buf, 0, M.task_size, 0);   // a task record no task wrote asks for no meshes
+    ex->recorded++;
     if (!has_task) {
-        uint32_t w[2] = {0, ~0u};   // a mesh-only draw: one stand-in task that asks for every mesh group
-        vkCmdUpdateBuffer(ex->cb, M.buf, 0, sizeof w, w);
+        vk_exec_barrier(ex);   // transfers are not ordered among themselves: the fill could land after the update
+        // a mesh-only draw: one stand-in task whose count (+4) asks for every mesh group. A fill, not vkCmdUpdateBuffer:
+        // that has no recorder wrapper (vk_rec.h), so it went into the command buffer at once, out of order and from
+        // a second thread while the recorder wrote the rest (run-68's device loss had it in every mesh-only draw).
+        vkCmdFillBuffer(ex->cb, M.buf, 4, 4, ~0u);
+        ex->recorded++;
     }
-    ex->recorded += 2;
     M.on = 1, M.shift = shift;
     int ok = !has_task || mesh_dispatch(ex, 0, tasks);
     if (ok) ok = mesh_dispatch(ex, 1, groups);
