@@ -40,6 +40,25 @@ void sm86_lower_free(Sm86Lowered *out);
 #define SM86_PTR_MAX 32u
 #define SM86_PTR_MAGIC 0x52545050u   // "PPTR"
 
+// Task and mesh programs lowered as compute programs (sm86_lower.c lower_isbe; docs/phase3.md, "the mesh stages
+// decoded"). Their stage buffer accesses become loads and stores into per-workgroup records in two storage buffers
+// whose addresses the host puts in bank 0: task record t at TASK base + t * SM86_TASK_STRIDE (the mesh workgroup count
+// at +4, the payload from +0x10), mesh record g at MESH base + g * SM86_MESH_STRIDE (the attribute lines from 0, the
+// index map from SM86_MESH_MAP: the primitive count in its first word, byte indices from +4). A mesh workgroup g of a
+// task draw is mesh i = g & MASK of task t = g >> SHIFT; one whose i is not below its task's count stores a primitive
+// count of 0 and exits at once. Without a task program the host gives SHIFT 31, MASK ~0 and a task record with count
+// ~0.
+#define SM86_MESH_C0_MESH  0x6c0u   // u64 the mesh records
+#define SM86_MESH_C0_TASK  0x6c8u   // u64 the task records
+#define SM86_MESH_C0_MASK  0x6d0u   // u32
+#define SM86_MESH_C0_SHIFT 0x6d4u   // u32
+#define SM86_MESH_C0_END   0x6e0u
+#define SM86_TASK_STRIDE   0x100u
+#define SM86_MESH_STRIDE   0x8000u
+#define SM86_MESH_STRIDE_LOG2 15u
+#define SM86_TASK_STRIDE_LOG2 8u
+#define SM86_MESH_MAP      0x7000u
+
 // The control section's fields the host needs (offsets measured over the game's archives, tools/shader_census.py).
 typedef struct {
     uint32_t size;             // the control section's own size (+0xd4; the archives repeat it at +0x30)

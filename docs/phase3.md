@@ -384,7 +384,22 @@ storage-held pointers above (bank-0 words the host fills). A small expansion pas
 buffer (unused slots degenerate), and one ordinary indexed draw reads the vertex lines through a generated
 pass-through vertex shader whose outputs follow the mesh program header's output map, so the materials' pixel
 shaders link unchanged. Lichii instead translates to `VK_EXT_mesh_shader` (its notes, row 89); either way the host
-must also learn which programs NVN2 binds for a mesh draw. Not started.
+must also learn which programs NVN2 binds for a mesh draw.
+
+Step 1 done (2026-11-07): `sm86_lower.c` `lower_isbe` lowers task and mesh programs as compute programs, the stage
+buffer accesses becoming LDG / STG on per-workgroup records whose bases the host is to put at bank 0 + 0x6c0 (mesh)
+and + 0x6c8 (task); a mesh workgroup that its task did not ask for stores a primitive count of 0 and exits first
+(`mesh_prologue`); the layout is in `sm86_lower.h` (`SM86_MESH_*`). All 12 programs lower and translate to SPIR-V
+offline as compute (notes: none, but one untraced storage load in task 20eee5a0). A request for a task or mesh
+program in a graphics slot is refused (`gfx_shader.c` `req_init`). Nothing calls them yet. The draw stubs' arguments,
+from the stub log: `DrawMeshTasks(cmd, first 0, count 12)`; `DrawMeshTasksIndirect(cmd, address, 1 or 0)`.
+
+Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
+workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
+the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that
+reads the records (vertex = mesh record of `index / (3 max-primitives)`, index map byte, attribute lines) and writes
+the outputs the mesh program header's map names, so the materials' pixel shaders link unchanged; a primitive past
+the count gives a degenerate triangle; (4) the draw itself, non-indexed, `workgroups * 3 * max-primitives` vertices.
 
 ## Status (2026-11-07): pointers held in storage buffers; the fog's volume still NaN
 

@@ -1354,6 +1354,9 @@ static int req_init(Req *r, int stage, const uint8_t *control, const uint8_t *co
     r->stage_name = stage == GFX_STAGE_VS ? "vs" : stage == GFX_STAGE_FS ? "ps" : stage == GFX_STAGE_CS ? "cs" : NULL;
     if (!r->stage_name) return fail("stage is not translated", NULL), 0;
     if (!control || !sm86_control_parse(control, CONTROL_BOUND, &r->ctl)) return fail("bad control section", NULL), 0;
+    // Task and mesh programs lower as compute programs only (sm86_lower.c lower_isbe): not in a graphics slot.
+    if ((r->ctl.stage == 6 || r->ctl.stage == 7) && stage != GFX_STAGE_CS)
+        return fail("a task or mesh program in a graphics stage", NULL), 0;
     r->length = r->ctl.code_size;
     if (!code || r->length > code_size) return fail("code block shorter than its control section says", NULL), 0;
     r->c1_len = r->ctl.c1_len;

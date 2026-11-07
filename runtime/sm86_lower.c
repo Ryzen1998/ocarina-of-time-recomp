@@ -113,6 +113,7 @@ typedef struct {
     int hmma_count;                                // HMMAs lowered so far (OOT_TENSOR_HMMA_MASK)
     uint32_t index;                                // the current native instruction
     uint32_t nptr, ptr_desc[SM86_PTR_MAX], ptr_off[SM86_PTR_MAX];   // storage-held pointers (lower_ldg)
+    uint32_t mesh;                                 // 6 task, 7 mesh: lowered as a compute program (lower_isbe)
     int failed;
     char error[96];
     uint32_t error_index;
@@ -2893,6 +2894,8 @@ static void lower_brx(L *l, const Insn *x, uint32_t op) {
 }
 
 static void lower_one_inner(L *l, const Insn *x);
+static void lower_isbe(L *l, const Insn *x, int write);
+static void mesh_prologue(L *l);
 
 static void lower_one(L *l, const Insn *x) {
     uint32_t p = bits(x, 12, 4);
@@ -3043,10 +3046,108 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x822: return lower_fswzadd(l, x);
     case 0x3c2: return lower_r2ur(l, x);
     case 0x3c4: return lower_redux(l, x);
+    case 0x923: case 0x927: return lower_isbe(l, x, op == 0x927);
     default:
         if (base_op >= 0x080 && base_op < 0x100) return lower_uniform_alu(l, x, op);
         return (void)fail(l, "opcode");
     }
+}
+
+// ---- task and mesh programs as compute programs (sm86_lower.h SM86_MESH_*)
+// ISBERD (0x923) / ISBEWR (0x927): address register 24-31, byte offset 40-63, ISBERD destination 16-23, ISBEWR data
+// 32-39, 75 .32 (else a byte), 76-77 the region (3 attributes, 0 the index map), 78 .SKEW, 79 .O (the output buffer).
+// Behaviour as Lichii's NX2_NOTES.md (row 89) describes it, checked against this game's 12 programs: addresses are
+// linear bytes in the region. The lowering turns them into LDG / STG on the record of the workgroup, through a 64-bit
+// base from bank 0, which the translator binds as a storage buffer.
+#define IADD_R(rd, ra, rb) (0x5c10000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20))
+#define SHL_R(rd, ra, rb) (0x5c48000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(rb) << 20))
+#define S2R_CTAID_X(rd) (0xf0c8000000000000ull | (rd) | ((uint64_t)37 << 20))
+
+// lo:lo+1 = the bank-0 u64 at c0off + off32 (a register or RZ); returns lo.
+static uint32_t mesh_addr(L *l, uint32_t c0off, uint32_t off32, int k) {
+    uint32_t lo = S(l, k), hi = S(l, k + 1);
+    if (l->failed) return RZ;
+    Src s = {0};
+    s.kind = 2, s.cb_bank = 0, s.cb_off = c0off;
+    mov_cbuf(l, lo, &s);
+    s.cb_off += 4;
+    mov_cbuf(l, hi, &s);
+    emit(l, IADD_R(lo, lo, off32) | l->pred | ((uint64_t)1 << 47));      // .CC
+    emit(l, IADD_R(hi, hi, RZ) | l->pred | ((uint64_t)1 << 43));         // .X
+    return lo;
+}
+
+// t = g >> SHIFT into rt, i = g - (t << SHIFT) into ri, with g the workgroup id (scratch k..k+1 for the constants).
+static void mesh_split(L *l, uint32_t g, uint32_t rt, uint32_t ri, int k) {
+    uint32_t sh = S(l, k);
+    Src s = {0};
+    s.kind = 2, s.cb_bank = 0, s.cb_off = SM86_MESH_C0_SHIFT;
+    mov_cbuf(l, sh, &s);
+    emit(l, SHR_R(rt, g, sh) | l->pred);
+    emit(l, SHL_R(sh, rt, sh) | l->pred);
+    emit(l, IADD_R(ri, g, sh) | l->pred | ((uint64_t)1 << 48));          // g - (t << SHIFT)
+}
+
+static void lower_isbe(L *l, const Insn *x, int write) {
+    uint32_t reg = write ? bits(x, 32, 8) : bits(x, 16, 8), ra = bits(x, 24, 8), off = bits(x, 40, 24);
+    uint32_t wide = bits(x, 75, 1), region = bits(x, 76, 2), out = bits(x, 79, 1);
+    if (!l->mesh) return (void)fail(l, "stage buffer access outside a task or mesh program");
+    if ((x->w[2] & ~0xf800u) || (region != 0 && region != 3) || (!wide && (!write || region != 0)) || off >= 0x800000)
+        return (void)fail(l, "stage buffer access mode");
+    if (!write && reg == RZ) return;
+    uint32_t g = S(l, 0), rec = S(l, 1);
+    emit(l, S2R_CTAID_X(g) | l->pred);
+    uint32_t c0off, log2stride, base_off = 0;
+    if (out || l->mesh == 6) {
+        // Own record: the task's (its .O reads too) or the mesh's attributes and map.
+        if (!out && !(l->mesh == 6 && region == 3)) return (void)fail(l, "stage buffer input of a task program");
+        if (l->mesh == 6 && !out && ra == RZ && off == 0) {   // ISBERD.SKEW [0x0]: the task workgroup's index
+            mov_reg(l, reg, g);
+            return;
+        }
+        c0off = l->mesh == 6 ? SM86_MESH_C0_TASK : SM86_MESH_C0_MESH;
+        log2stride = l->mesh == 6 ? SM86_TASK_STRIDE_LOG2 : SM86_MESH_STRIDE_LOG2;
+        if (l->mesh == 7 && region == 0) base_off = SM86_MESH_MAP;
+        emit(l, SHL_IMM(rec, g, log2stride) | l->pred);
+    } else {
+        // A mesh program's input: [0x0] its index within the task, the rest the task's payload.
+        uint32_t t = S(l, 2), i = S(l, 3);
+        mesh_split(l, g, t, i, 4);
+        if (ra == RZ && off == 0) {
+            mov_reg(l, reg, i);
+            return;
+        }
+        c0off = SM86_MESH_C0_TASK;
+        emit(l, SHL_IMM(rec, t, SM86_TASK_STRIDE_LOG2) | l->pred);
+    }
+    if (ra != RZ) emit(l, IADD_R(rec, rec, ra) | l->pred);
+    uint32_t a = mesh_addr(l, c0off, rec, 6);
+    uint64_t size = wide ? 4 : 0, imm = off + base_off;
+    if (write) emit(l, 0xeed8000000000000ull | l->pred | reg | ((uint64_t)a << 8) | (imm << 20) | ((uint64_t)1 << 45) | (size << 48));
+    else emit(l, 0xeed0000000000000ull | l->pred | reg | ((uint64_t)a << 8) | (imm << 20) | ((uint64_t)1 << 45) | (size << 48));
+}
+
+// A mesh workgroup its task did not ask for: primitive count 0 and exit, before the program runs (P0 is free at the
+// start). Keeps the mesh program off a payload that was never written.
+static void mesh_prologue(L *l) {
+    uint64_t saved = l->pred;
+    l->pred = (uint64_t)PT << 16;
+    uint32_t g = S(l, 0), rec = S(l, 1), t = S(l, 2), i = S(l, 3), cnt = S(l, 8);
+    emit(l, S2R_CTAID_X(g));
+    mesh_split(l, g, t, i, 4);
+    emit(l, SHL_IMM(rec, t, SM86_TASK_STRIDE_LOG2));
+    uint32_t a = mesh_addr(l, SM86_MESH_C0_TASK, rec, 6);
+    emit(l, 0xeed0000000000000ull | l->pred | cnt | ((uint64_t)a << 8) | ((uint64_t)4 << 20) | ((uint64_t)1 << 45) | ((uint64_t)4 << 48));
+    // P0 = i >= count (unsigned)
+    emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)0 << 3) | ((uint64_t)i << 8) | ((uint64_t)cnt << 20) |
+                ((uint64_t)PT << 39) | ((uint64_t)6 << 49));
+    l->pred = 0;   // @P0
+    emit(l, SHL_IMM(rec, g, SM86_MESH_STRIDE_LOG2) | l->pred);
+    a = mesh_addr(l, SM86_MESH_C0_MESH, rec, 6);
+    emit(l, 0xeed8000000000000ull | l->pred | RZ | ((uint64_t)a << 8) | ((uint64_t)SM86_MESH_MAP << 20) | ((uint64_t)1 << 45) |
+                ((uint64_t)4 << 48));
+    emit(l, 0xe30000000000000full | l->pred);
+    l->pred = saved;
 }
 
 // ---- OOT_SM86_PROBE (diagnostic): a register's value at one instruction of one compute program
@@ -3144,10 +3245,11 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
     L l = {0};
     l.force_swap = force_swap;
     l.stage = c.stage;
-    l.graphics = c.stage != 5;
+    l.mesh = c.stage == 6 || c.stage == 7 ? c.stage : 0;   // lowered as compute programs (lower_isbe)
+    l.graphics = c.stage != 5 && !l.mesh;
     l.tensor = tensor && !l.graphics && c.local[0] * c.local[1] * c.local[2] % 32 == 0;
     l.control = control, l.ctl_size = c.size, l.c1 = code + c.c1_off, l.c1_len = c.c1_len;
-    uint32_t header = l.graphics ? SM86_HEADER : 0;
+    uint32_t header = c.stage == 5 ? 0 : SM86_HEADER;
     l.in = (const Insn *)(code + header);
     l.n = (c.code_end - header) / 16;
     if (l.n == 0 || l.n > 65536) { snprintf(out->error, sizeof out->error, "program size"); return 0; }
@@ -3169,6 +3271,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
         if (l.liveness) scratch_at(&l, l.index);
         if (probe.on && !l.graphics && l.index == 0) probe_emit(&l, 1);
+        if (l.mesh == 7 && l.index == 0) mesh_prologue(&l);
         lower_one(&l, &l.in[l.index]);
         if (probe.on && !l.graphics && header + l.index * 16 == probe.at) probe_emit(&l, 0);
         int pair;
