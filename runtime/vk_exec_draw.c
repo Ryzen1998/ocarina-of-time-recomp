@@ -389,11 +389,13 @@ static void pool_sets_release(VkCtx *c);
 
 // Releases the stand-ins, the depth twins and the pool sets. The device must be idle; the game path leaves them to process exit like
 // the pipelines.
+static void mesh_release(VkCtx *c);
 void vk_exec_draw_shutdown(void) {
     if (!Z.ready) return;
     VkCtx *c = vk_ctx();
     twins_release(c);
     pool_sets_release(c);
+    mesh_release(c);
     for (int i = 0; i < DV_COUNT; i++) {
         if (Z.img[i].sview != Z.img[i].view) vkDestroyImageView(c->device, Z.img[i].sview, NULL);
         vkDestroyImageView(c->device, Z.img[i].view, NULL);
@@ -737,12 +739,20 @@ static void answers_for(VkExec *ex, int st, const uint8_t *ctl, uint32_t mask, G
     memset(a, 0, sizeof *a);
     if (st == NVN_STAGE_VS) vk_pipeline_answers(&ex->pipe, a, NULL);
     else if (st == NVN_STAGE_FS) vk_pipeline_answers(&ex->pipe, NULL, a);
-    else
-        for (int k = 0; k < 3; k++) {
-            uint32_t l;
-            memcpy(&l, ctl + 0x58 + 4 * k, 4);
-            a->local[k] = (uint16_t)(l ? l : 1);
-        }
+    else {
+        // The workgroup size as sm86_control_parse reads it: for task and mesh programs only the low half of +0x58 (the
+        // high halves of +0x58..+0x63 hold their output limits). Read raw, a mesh program got 32 x 1 x 128 = 4096
+        // threads, four times Vulkan's limit, and faulted the GPU on every mesh draw (2026-11-07, run-68, --probe-cs).
+        Sm86Control c;
+        if (sm86_control_parse(ctl, SM86_CONTROL_MIN, &c))
+            for (int k = 0; k < 3; k++) a->local[k] = (uint16_t)(c.local[k] ? c.local[k] : 1);
+        else
+            for (int k = 0; k < 3; k++) {
+                uint32_t l;
+                memcpy(&l, ctl + 0x58 + 4 * k, 4);
+                a->local[k] = (uint16_t)(l ? l : 1);
+            }
+    }
     // The shared memory the kernel may use: the NVN2 control section's field for it is not identified yet (none of
     // its words matches the kernels' STS/LDS/LDSM use), and 0 loses every shared store, so every compute program
     // gets Maxwell's and Vulkan's common limit; it costs occupancy, not correctness (2026-11-06, docs/phase3.md).
@@ -3196,6 +3206,12 @@ static void mesh_rb_done(VkExec *ex, int slot, uint32_t kind, uint32_t a, uint32
         return;
     }
     vk_completion_add(vk_sync_issued() + 1, mesh_read, r);   // the submission being recorded (ex->fence is set at its submit)
+}
+
+static void mesh_release(VkCtx *c) {   // vk_exec_draw_shutdown
+    if (M.buf) vmaDestroyBuffer(c->vma, M.buf, M.mem);
+    if (MRB.buf) vmaDestroyBuffer(c->vma, MRB.buf, MRB.mem);
+    memset(&M, 0, sizeof M), memset(&MRB, 0, sizeof MRB);
 }
 
 // The record buffer, grown when a draw needs more; the old one goes after the submission being recorded.

@@ -422,6 +422,14 @@ translator traces through `GlobalToStorage`). Next: read the translated SPIR-V o
 `vkCmdUpdateBuffer` has no recorder wrapper (`vk_rec.h`), so it went into the command buffer out of order and from a
 second thread; and completion callbacks in the harness run before its submission, hence `OOT_MESH_SYNC`.
 
+**Found and fixed (2026-11-07, after a reboot):** k_exec_draw.c nswers_for read the workgroup size raw from control
++0x58 as 16-bit values: for a mesh program that is 32 x 1 x 128 = 4096 threads (the high halves are its output limits),
+four times Vulkan's limit. It now takes sm86_control_parse's values. With it the probe draws 28b30890 cleanly (2 triangles
+per workgroup, plausible vertices, 0 validation errors, 0 driver resets), and a full level run with OOT_MESH=1 (run-70)
+has no device loss and no driver reset over 69 direct mesh draws. But every task record comes back with a mesh count
+of 0, and every indirect mesh draw's arguments read 0: both likely come from the frame's culling compute passes,
+whose outputs are empty. Next: find which dispatches write the indirect arguments and the task programs' inputs.
+
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
 the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that
