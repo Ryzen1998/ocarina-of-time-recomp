@@ -397,6 +397,14 @@ Runs run-225 to run-229, 0 driver resets.
   view of the range once (`cpu_<pass>.bin`) next to the GPU's copies.
 - Next for the shadows: why e6d5432f's own append path (counter == 0xff) never runs; with the records now written,
   count R13 again and look at what 358beb27 writes.
+- Later (run-230..232, 0 resets, no crash in 5 runs with the new default): e6d5432f's counters are still all 0 and its
+  append never runs; the chain's sizes vary with the shot (68e84b77 and 2bb46270 0 again in that run). 374126bf is
+  not dispatched at all in the level (`OOT_SM86_COUNT` saw 0 dispatches), so it is not what starts them here. The
+  record table behind cell 0x29bb2b940 (0x2a19e9000, 991 records) has counter byte 0 in every record on both the CPU
+  copy and the GPU copy (`OOT_DUMP_BUF` with `cpu_0000.bin`), the copies differing only in a word the GPU writes
+  (+0x38 of each record): no CPU write of 0xff is lost there. Not settled: whether that is the table e6d5432f reads for
+  the objects in question (it picks one per object type through c4 rows 0-3), and which program or CPU code should set
+  0xff. Parked here for the fog.
 
 ### Safety (learned the hard way)
 
