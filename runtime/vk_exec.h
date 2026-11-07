@@ -172,6 +172,7 @@ void vk_exec_frame_log(const tex_t *presented, uint64_t frame);
 // textures, samplers) and images.txt (per image value statistics). The hooks run only when vk_dump_armed is set.
 extern int vk_dump_armed;
 int vk_dump_probe_draw(void);
+int vk_dump_probe_count(int count);   // OOT_XFB_COUNT: a draw with that many indices in any pass
 int vk_exec_vb_bound(int st, VkBuffer *b, VkDeviceSize *o);
 const char *vk_dump_dir(void);
 int vk_dump_pass_seq(void);

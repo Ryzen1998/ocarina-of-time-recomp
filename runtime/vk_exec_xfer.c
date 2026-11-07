@@ -234,7 +234,28 @@ static void oq_cb(void *arg) {
     else {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
-        if (s->addr) write_counter(s->addr, oq_count);
+        // Every samples-passed report says visible (OOT_OQ_VISIBLE, default on since 2026-11-09; =0 writes the real
+        // counts). The level tests each object's proxy box against a coarse occluder depth (a 256x144 pass that the
+        // compute kernel aea924bf builds from the previous frame's depth) and colours only what counted samples: 61% of
+        // the reports came back 0, the depth pre-pass still drew those objects, and the colour pass skipped them, so the
+        // sky showed through as the level's large white areas (docs/phase3.md, 2026-11-09). Whether the occluder or the
+        // results' timing is wrong is not known yet; reporting visible costs no measurable frame rate (48 fps either
+        // way), and an object drawn behind another still fails the depth test. OOT_OQ_LOG=1: zero and non-zero reports.
+        static int vis = -1, lg = -1;
+        static uint64_t nz, nn, nq;
+        if (vis < 0) {
+            const char *e = getenv("OOT_OQ_VISIBLE");
+            vis = !(e && !strcmp(e, "0")), lg = getenv("OOT_OQ_LOG") != NULL;
+            rt_log("vk: samples-passed reports %s (OOT_OQ_VISIBLE)", vis ? "say visible" : "carry the real counts");
+        }
+        if (s->addr) write_counter(s->addr, vis && oq_count < (1u << 20) ? 1u << 20 : oq_count);
+        if (lg && s->addr) {
+            nq += s->n;
+            if (oq_count) nn++; else nz++;
+            if ((nz + nn) % 2000 == 0)
+                rt_log("vk: samples-passed reports: %llu zero, %llu non-zero, %llu queries (OOT_OQ_LOG)",
+                       (unsigned long long)nz, (unsigned long long)nn, (unsigned long long)nq);
+        }
     }
     free(s);
 }

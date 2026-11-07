@@ -963,6 +963,16 @@ int vk_dump_probe_draw(void) {
     if (!xfb_probe || in_draw_copy || draws_pass < 0) return -1;   // =eq: only once its pass is known
     return active() && frame_now() == dump_frame && seq == draws_pass ? pass_draws : -1;
 }
+
+// OOT_XFB_COUNT=<n> (with OOT_DUMP_XFB_PROBE=1): every indexed draw of the dump frame with exactly n indices, in any
+// pass, is probed (the same triangles in the depth pre-pass and the colour pass; OOT_XFB_POSITION=1 captures
+// gl_Position). The number the draw will get, else -1.
+int vk_dump_probe_count(int count) {
+    static int want = -1;
+    if (want < 0) { const char *e = getenv("OOT_XFB_COUNT"); want = e && *e ? atoi(e) : 0; }
+    if (!xfb_probe || in_draw_copy || !want || count != want) return -1;
+    return active() && frame_now() == dump_frame ? pass_draws : -1;
+}
 const char *vk_dump_dir(void) { return dir; }
 int vk_dump_pass_seq(void) { return seq; }
 

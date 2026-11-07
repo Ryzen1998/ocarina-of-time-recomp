@@ -25,7 +25,9 @@ window, 0020 RED signed offset; after `tools/build_xlate.py` copy `oot_xlate.exe
 
 ### What is still wrong
 
-1. **Large white areas** (the biggest visible problem). Found with frame dumps: each frame first fills its HDR target
+1. **Large white areas: fixed 2026-11-09 (workaround)**, see the Status section of that date: the game skipped the
+   colour draws of objects whose occlusion test counted 0 samples; samples-passed reports now say visible by default
+   (`OOT_OQ_VISIBLE=0` for the real counts). The cause of the zero counts is still open. Original notes: each frame first fills its HDR target
    with the sky (one full-screen draw, values 24..34), then draws the scene over it; wherever no geometry is drawn
    the lit sky shows and tone-maps to pure white. So the white is **missing geometry**, not a colour bug. It shows in
    default runs too (earlier "clean" default screenshots were taken in dark spots). Known sources:
@@ -170,6 +172,24 @@ maths" is not proven for skinned meshes. Next: run both programs on the dumped v
 `OOT_DUMP_XFB_PROBE` lifted beyond 64-vertex draws) and compare positions bit for bit; the white vines around the tree
 trunks behave the same way. `--probe-tensor` fails (all values zero, the loads too) with the old lowering as well: a
 separate, earlier break of the probe.
+
+**Found: the white is occlusion culling.** A transform-feedback capture of the same mesh's positions showed that in
+some frames the colour pass has **no draw at all** for a mesh the depth pre-pass drew: the game left it out. The game
+tests objects for visibility on the GPU (samples-passed counters, `vk_exec_xfer.c`): pass ~115 renders at 256x144,
+its first draw writes a coarse occluder depth (vertex program ce30c06b, from storage buffers the compute kernel
+aea924bf fills from the depth image at 0x1500000000, i.e. the previous frame's), then ~85 proxy boxes are drawn
+(vs 6192e1e8, depth test LEQUAL, no writes, depth clamp on) between counter resets and reports, and the CPU colours
+only what counted samples. `OOT_OQ_LOG=1`: of ~3.5 M reports in a run, 61% were 0. With every report forced visible
+(`OOT_OQ_VISIBLE=1`, then made the default) the white is gone: the `OOT_DUMP_WHEN=white:60000@4500` trigger never fires
+from frame 4500 to 6665 (it fired at once before), the forest path, Link's house and the close-ups render whole
+(`build/logs/oqvis2.png`, `oq-default.png`, noise 0.72 / 0.39), 48 fps either way, no driver reset. Drawing an occluded
+object costs only its draws; the depth test still hides it. Still to find: why the proxies count 0 (the occluder's
+minimum depth is 0.188 against ~0.77 in the scene, but pass 115 uses a projection of its own with near 0.6; or the
+results reach guest memory too late, on the completion thread, after the CPU read them; or the camera cuts of the
+cutscene, where the previous frame's depth is another shot). Turning the workaround off (`OOT_OQ_VISIBLE=0`) and
+logging the counts per proxy against what the colour pass then draws is the way in. New diagnostics:
+`OOT_XFB_POSITION=1` (the transform feedback probe captures gl_Position, `vk_pipeline.c spirv_add_xfb_position`),
+`OOT_XFB_COUNT=<n>` (probe every indexed draw of the dump frame with n indices, any pass), `OOT_OQ_LOG=1`.
 
 Diagnostics added: `OOT_DEPTH_EQ_LE=1|2|3` (EQUAL tested as LESS_OR_EQUAL / GREATER_OR_EQUAL / left half LE and
 right half EQUAL in one frame); `OOT_DUMP_DRAWS=eq` (the colour target after each of the first 160 draws of the

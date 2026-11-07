@@ -961,7 +961,53 @@ static void pin_subgroup32(VkPipelineShaderStageCreateInfo *st, VkPipelineShader
 // the variable is retyped to that width and the prologue stores to the rest are dropped (the SPH output map, which
 // would say the same, is not read). Adds the TransformFeedback capability, the Xfb execution mode and the XfbBuffer,
 // XfbStride and Offset decorations. NULL when the module has no located output or an output is read back.
+// OOT_XFB_POSITION=1 (diagnostic, with the dump's transform feedback probe): the capture layout is gl_Position alone,
+// 16 bytes per vertex at offset 0 of buffer 0, to compare the positions two passes compute for the same triangles
+// (2026-11-09: the colour pass's depth-EQUAL test drops draws whose depth-pass partners have the same maths and
+// inputs). Decorates member 0 of the BuiltIn Position block with Offset 0 and its Output variable with XfbBuffer 0
+// and XfbStride 16; adds the TransformFeedback capability and the Xfb execution mode.
+static uint32_t *spirv_add_xfb_position(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    enum { OP_CAPABILITY = 17, OP_EXECUTION_MODE = 16, OP_MEMBER_DECORATE = 72, CAP_XFB = 53, MODE_XFB = 11, DEC_OFFSET = 35,
+           DEC_XFB_BUFFER = 36, DEC_XFB_STRIDE = 37, POSITION = 0 };
+    uint64_t cap_end = 0, ep_end = 0, ann_end = 0;
+    uint32_t ep_id = 0, block = 0, ptr_t = 0, var = 0;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > n) return NULL;
+        const uint32_t *a = w + i + 1;
+        if (op == OP_CAPABILITY) cap_end = i + len;
+        else if (op == SPV_OP_ENTRY_POINT) ep_id = a[1], ep_end = i + len;
+        else if (op == OP_EXECUTION_MODE) ep_end = i + len;
+        else if (op == SPV_OP_DECORATE || op == OP_MEMBER_DECORATE || op == 73 || op == 74 || op == 75 || op == 332) {
+            ann_end = i + len;
+            if (op == OP_MEMBER_DECORATE && len >= 5 && a[1] == 0 && a[2] == SPV_DEC_BUILTIN && a[3] == POSITION) block = a[0];
+        } else if (op == SPV_OP_TYPE_POINTER && len >= 4 && a[1] == SPV_SC_OUTPUT && a[2] == block && block) ptr_t = a[0];
+        else if (op == SPV_OP_VARIABLE && len >= 4 && a[2] == SPV_SC_OUTPUT && a[0] == ptr_t && ptr_t) var = a[1];
+        i += len;
+    }
+    if (!cap_end || !ep_id || !block || !var || ep_end < cap_end || ann_end < ep_end) return NULL;
+    uint32_t *o = malloc((n + 2 + 3 + 5 + 8) * 4), *p = o;
+    if (!o) return NULL;
+    memcpy(p, w, 5 * 4), p += 5;
+    for (uint64_t i = 5; i < n;) {
+        uint32_t len = w[i] >> 16;
+        memcpy(p, w + i, len * 4), p += len, i += len;
+        if (i == cap_end) *p++ = 2u << 16 | OP_CAPABILITY, *p++ = CAP_XFB;
+        if (i == ep_end) *p++ = 3u << 16 | OP_EXECUTION_MODE, *p++ = ep_id, *p++ = MODE_XFB;
+        if (i == ann_end) {
+            *p++ = 5u << 16 | OP_MEMBER_DECORATE, *p++ = block, *p++ = 0, *p++ = DEC_OFFSET, *p++ = 0;
+            *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = var, *p++ = DEC_XFB_BUFFER, *p++ = 0;
+            *p++ = 4u << 16 | SPV_OP_DECORATE, *p++ = var, *p++ = DEC_XFB_STRIDE, *p++ = 16;
+        }
+    }
+    *out_n = (uint64_t)(p - o);
+    return o;
+}
+
 static uint32_t *spirv_add_xfb(const uint32_t *w, uint64_t n, uint64_t *out_n) {
+    static int pos = -1;
+    if (pos < 0) pos = getenv("OOT_XFB_POSITION") != NULL;
+    if (pos) return spirv_add_xfb_position(w, n, out_n);
     enum { OP_CAPABILITY = 17, OP_EXECUTION_MODE = 16, OP_ACCESS_CHAIN = 65, OP_LOAD = 61, OP_STORE = 62, OP_LABEL = 248,
            CAP_XFB = 53, MODE_XFB = 11, DEC_OFFSET = 35, DEC_XFB_BUFFER = 36, DEC_XFB_STRIDE = 37, MAXV = 64 };
     uint64_t cap_end = 0, ep_end = 0, ann_end = 0, fn_at = 0;

@@ -3519,6 +3519,7 @@ static void op_draw_idx(VkExec *ex, const p_draw_idx *d) {
     if (d->itype < 0 || d->itype > 2) return warn_once(W_INDEX, "index type %d is unknown: draw skipped", d->itype);
     int restart = restart_for(ex, d->prim, d->itype);
     int probe = vk_dump_armed && !ex->xfb_active && d->count <= 64 ? vk_dump_probe_draw() : -1;   // sprites only
+    if (probe < 0 && vk_dump_armed && !ex->xfb_active) probe = vk_dump_probe_count(d->count);
     if (probe >= 0) ex->xfb_active = 1;   // prepare_draw picks the pipeline with the capture layout
     int ok = d->count > 0 && prepare_draw(ex, d->prim, d->count, restart);
     if (probe >= 0) ex->xfb_active = 0;
