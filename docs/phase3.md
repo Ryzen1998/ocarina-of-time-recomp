@@ -480,6 +480,32 @@ reboot before the next GPU run.**
   culling kernels), and fix that kernel's address trace. Until then the defaults (window on, pushes kept, views
   reformatted) give the right picture but crash in most runs past frame ~4,000; `OOT_GW_SKIP=<the 18>` ran clean.
 
+### Status (2026-11-10, night): the crash is a game-side table mismatch; stable runs with 18 programs off the window
+
+After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
+
+- `OOT_WATCH_RANGE=29bc00000:29bd00000` with the window on (run-274): no written binding, window entry, copy or fill
+  covers the crashing records (0x29bc01728, 0x29bc02b78, 0x29bc0d7e8; the nearest writers start at 0x29bc26000).
+- `OOT_MEMORY=import` (no VRAM mirror, run-275, mode confirmed in the log): the same crash at frame ~6,470. So the
+  mirror's whole-range write-back (research report idea 2, mechanism A) is not the cause.
+- What the crash is (the researcher's decompile of main+0xc938d0 and its caller main+0x560b38, read for behaviour):
+  the caller walks a list of 0x28-byte entries (position, orientation, a resource index at +0x1c, a kind at +0x20),
+  CPU-built in a CPU-visible pool; for each it reads a per-index state byte (a 256-byte table in CPU heap, here
+  0x1aef1e6d8) and, when the byte's top bit is set, looks the index up in a resource table (+0x848 of the object at
+  `*(main+0x4e22540) + 0x120`) and dereferences the entry. The index is 0x56 in every crash dump: the state byte says
+  "present", the table slot is empty. Two of the game's own CPU tables disagree, a thread race inside the game that
+  only shows with the window on for 18 programs (the window changes the replay thread's timing, or what the game
+  decides from GPU results). Not explained yet.
+- **Workaround, now the default**: those 18 programs get no window (`OOT_GW_SKIP` default, `OOT_GW_SKIP=none` = full
+  window). Clean in run-271, 272, 277 and the plain 200 s runs run-278, 279 (and 280, below). The picture keeps the
+  ground and characters: `build/logs/skip18.png` (Saria under the shop sign, lit, Navi glowing; noise 0.86) and
+  `build/logs/skip18-f4600.png` (the Deku Tree cutscene, mist and light shafts, noise 1.11). The bright mist in the
+  background still shows some banding.
+- Translator patch 0022 (`0022-float-atomic-add-as-cas-loop.patch`, identity c0e112ed...): `RED/ATOM.ADD.F32.FTZ.RN`
+  on global memory becomes a compare-and-swap loop (the shape Ryujinx's GlobalToStorage already uses for small
+  integer atomics); before, the add was dropped ("Invalid reduction type: F32FtzRn", 70 cached programs). After the
+  re-translation no program carries the note. It did not change the crash.
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count

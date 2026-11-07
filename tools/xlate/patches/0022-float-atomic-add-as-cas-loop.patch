@@ -1,0 +1,39 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
+@@ -222,6 +222,13 @@
+                     {
+                         res = context.AtomicAdd(storageKind, e0, e1, value);
+                     }
++                    else if (type == AtomSize.F32FtzRn && storageKind == StorageKind.GlobalMemory)
++                    {
++                        // ocarina-of-time-recomp: a float add (ATOM/RED.E.ADD.F32.FTZ.RN) as a compare-and-swap loop on
++                        // the word; GlobalToStorage turns the load and the CAS into storage (or window) accesses as for
++                        // any global access. Before, the add was dropped (OoT's BRXU culling kernels accumulate floats).
++                        res = EmitGlobalFloatAddCasLoop(context, e0, e1, value);
++                    }
+                     else
+                     {
+                         context.TranslatorContext.GpuAccessor.Log($"Invalid reduction type: {type}.");
+@@ -308,6 +315,22 @@
+             }
+ 
+             return res;
++        }
++
++        private static Operand EmitGlobalFloatAddCasLoop(EmitterContext context, Operand addrLow, Operand addrHigh, Operand value)
++        {
++            Operand lblLoopHead = Label();
++
++            context.MarkLabel(lblLoopHead);
++
++            Operand oldValue = context.Load(StorageKind.GlobalMemory, addrLow, addrHigh);
++            Operand newValue = context.FPAdd(oldValue, value);
++
++            Operand casResult = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, addrLow, addrHigh, oldValue, newValue);
++
++            context.BranchIfTrue(lblLoopHead, context.ICompareNotEqual(casResult, oldValue));
++
++            return oldValue;
+         }
+ 
+         private static void EmitLoad(
