@@ -460,6 +460,18 @@ over 110-150 s. Suspect: a loop in the culling task program (c72ef95d) or a mesh
 from storage. Keep OOT_MESH off until that is found; next, find the timed-out shader offline (the fault addresses
 against the pipelines built in that run) before any further run.
 
+**The timeout was not the mesh path (2026-11-07, run-77..80).** OOT_CS_TIME with OOT_MESH=1 showed one ordinary kernel,
+ace1cec0 (64x64 groups), at 400-670 ms a dispatch (99.9% of the GPU), against 0.008 ms without the mesh path; the
+task and mesh stages took 0.001 ms. Its control section declares no storage slots: the list it loops over is a
+pointer the game pushes with its constants (bank 0 + 0x60), which the replay bound to the shared zero buffer. And every
+*written* storage binding without backing also got that zero buffer, so a kernel's stores could make it non-zero for
+every unresolved reader: a garbage list length, a near-endless loop. Fixed: pointers in the pushed constants (before the
+NVN2 tables) bind the buffer they point to (ssbo_info), and written bindings without backing go to a separate
+discard buffer. Result without the mesh path (run-79): the level runs at about 50 fps instead of 1-2, the slowest
+kernel 0.25 ms, and the scene renders lit and textured (uild/logs/level-push-keep.png, Navi over the moss). With
+OOT_MESH=1 (run-80): the same speed, no driver reset, the Deku Tree area lit and textured where drawn
+(uild/logs/level-push-mesh-keep.png); the white left is ground drawn by the indirect mesh draws, still not run.
+
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
 the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that
