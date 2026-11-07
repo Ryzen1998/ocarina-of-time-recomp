@@ -3957,6 +3957,19 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
             if (k && k <= 16 && ((hp[0] && !strncmp(hx[0], p, k)) || !strncmp(hx[1], p, k))) return;
             p += k + (p[k] == ',');
         }
+        // OOT_MESH_IND_ONLY=<hex>[,<hex>...]: only the draws whose mesh (or task) program hash starts with one of these.
+        const char *only = getenv("OOT_MESH_IND_ONLY");
+        if (only && *only) {
+            int hit = 0;
+            for (const char *p = only; *p && !hit;) {
+                size_t k = strcspn(p, ",");
+                char hx[2][17];
+                snprintf(hx[0], 17, "%016llx", (unsigned long long)hp[0]), snprintf(hx[1], 17, "%016llx", (unsigned long long)hp[1]);
+                hit = k && k <= 16 && ((hp[0] && !strncmp(hx[0], p, k)) || !strncmp(hx[1], p, k));
+                p += k + (p[k] == ',');
+            }
+            if (!hit) return;
+        }
         static struct { uint64_t t, m; } seen[256];
         static int nseen;
         int known = 0;

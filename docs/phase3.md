@@ -552,6 +552,13 @@ chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a 
   running for the first time. The programs that translated in that run were not saved before the crash. Added
   `meshind:` log lines (each new task/mesh pair, before it is recorded), `OOT_MESH_IND_FROM=<frame>` and
   `OOT_MESH_IND_SKIP=<hash prefixes>` to name and then exclude the culprit.
+- **run-131** (after a reboot; `OOT_MESH_IND_FROM=4500`, bound 16): the level's first frame of indirect draws lost
+  the device too (third reset; fault IP 0x2009d6030, `build/logs/fault-run131.bin`). 29 task/mesh pairs were
+  recorded in that frame (the `meshind:` lines: 2 task programs, 1ddd3643 and c7f0444a, and 27 mesh programs, 9 of
+  them translated for the first time in that frame). Read offline: the mesh programs have no loops (only the
+  trailing self-branch); the task program 1ddd3643 (a01eebd2) loops over a list but every loop is bounded by clamped
+  counts (0x100 >> 5, 0x11, 0x1f) and its exit is a predicated CALL lowered as a branch. Nothing found offline yet.
+  Added `OOT_MESH_IND_ONLY=<hash prefixes>` to run a subset (bisection costs one reset per bad half).
 - 12 task/mesh programs used only by the indirect draws do not lower (11 mesh, 1 task: register pressure at the
   start, "no general register dead over a uniform register's span" and similar, and two "uniform datapath opcode");
   the same with the lowering before the task prologue. Their draws are skipped, so even with the crash fixed, part
