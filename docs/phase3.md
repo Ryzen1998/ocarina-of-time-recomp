@@ -146,6 +146,31 @@ Item 1 above, worked through with frame dumps (run-163..183, all with zero drive
   that do not lower (the log fails them on every draw: 6194772d, 4478d9b1, 392f0c37, 2b82fd56, 19f6e020; 3406d516 is
   "no general register free for the uniform predicates"); (3) the Saria pose difference (skinned depth vs colour).
 
+**Later the same day: every program lowers.** The four colour-pass mesh programs the log failed on every draw
+(52ed87ef, 47ebe041, fa159bf2, 9a4accb7; they draw big scenery such as the Deku Tree's trunk, which the depth pass draws
+with ordinary draws) and 6d98affa and the compute program 3406d516 failed for want of general registers: around their
+instructions 1600-1750 ~245 of 255 registers are live, and a uniform register read over most of the program needs one
+register dead over all of it. `sm86_lower.c` now retries such a failure (`sm86_lower_ex`, `relaxed`): a uniform
+register's home is held only over its span (`span_hold`), a uniform register with none dead over its span lives in a
+local-memory word (`spill`, `spill_temp`: loaded into scratch 10/11/8/9 before each instruction naming it, stored back
+after, unpredicated), the uniform predicates' register likewise (`up_spill`), and an instruction without 12 free
+registers borrows 12 it does not name, saving the live ones before it and reloading them after (`scratch_at`,
+`scratch_restore`; never around a branch). Local memory: compute and mesh programs only (the translator gives them
+4 KiB), above the program's own LDL/STL. Survey of all 1,283 cached inputs, old against new lowering: 1,260 byte-identical,
+23 newly lower, 0 newly fail; the 23 translate to SPIR-V that `spirv-val` accepts. Lowering failures are not cached
+(the `.fail.*` files are only dumps), so no `KEY_VERSION` bump: the new programs translate on first use and nothing
+else re-translates. Runs: zero driver resets, 0 "translation failed" lines (was ~7,000 per program per run), the level
+at ~48 fps (was ~40; the failed lowering was retried on every draw). The white is **not** gone: the new mesh draws run
+but, on the frames dumped, add no colour pixels; in the Saria close-up (found with the new `OOT_DUMP_WHEN=white:<n>@<present>`,
+which arms the dump on the first frame with that many pure-white pixels, needs `OOT_SHOT_RING=2`) her body draws
+(vertex programs 6ffe3c6b, 60aeb179) add almost nothing in the colour pass although their depth-pass partners
+(de5a862a, bba76300) draw the same triangles from the same vertex buffer with the same uniforms. Their position code has
+branches (value selections on an index == 0 / == 8) that the scratch expression evaluator does not model, so "same
+maths" is not proven for skinned meshes. Next: run both programs on the dumped vertex data (`OOT_DUMP_VB`, or
+`OOT_DUMP_XFB_PROBE` lifted beyond 64-vertex draws) and compare positions bit for bit; the white vines around the tree
+trunks behave the same way. `--probe-tensor` fails (all values zero, the loads too) with the old lowering as well: a
+separate, earlier break of the probe.
+
 Diagnostics added: `OOT_DEPTH_EQ_LE=1|2|3` (EQUAL tested as LESS_OR_EQUAL / GREATER_OR_EQUAL / left half LE and
 right half EQUAL in one frame); `OOT_DUMP_DRAWS=eq` (the colour target after each of the first 160 draws of the
 frame's first full-size depth-EQUAL pass); the dump prints polygon offset state, uniform floats with `%.9g`, keeps

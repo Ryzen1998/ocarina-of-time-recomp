@@ -316,20 +316,24 @@ static void ring_shot(const tex_t *t, uint64_t n) {
     box_filter(px, w, h, bgra, ring[ring_next].px, RING_W, RING_H);
     ring[ring_next].frame = n;
     static unsigned long long when_blue = ULLONG_MAX, when_from;
+    static int when_white;   // "white:<count>": pure-white pixels (all channels > 245), the level's missing geometry
     if (when_blue == ULLONG_MAX) {
         const char *e = cfg_get("OOT_DUMP_WHEN");
         char *q = NULL;
-        when_blue = e && !strncmp(e, "blue:", 5) ? strtoull(e + 5, &q, 10) : 0;
+        when_white = e && !strncmp(e, "white:", 6);
+        when_blue = e && !strncmp(e, "blue:", 5) ? strtoull(e + 5, &q, 10) : when_white ? strtoull(e + 6, &q, 10) : 0;
         when_from = q && *q == '@' ? strtoull(q + 1, NULL, 10) : 0;
     }
     if (when_blue && n >= when_from) {
         const uint8_t *o = ring[ring_next].px;
         unsigned long long blue = 0;
         for (uint64_t i = 0; i < 4ull * RING_W * RING_H; i += 4)
-            blue += o[i + 2] > 200 && o[i] < 80 && o[i + 1] < 120;
+            blue += when_white ? o[i] > 245 && o[i + 1] > 245 && o[i + 2] > 245 : o[i + 2] > 200 && o[i] < 80 && o[i + 1] < 120;
         if (blue >= when_blue) {
-            rt_log("boot: present %llu has %llu pure-blue pixels: arming the dump", (unsigned long long)n, blue);
+            rt_log("boot: present %llu has %llu pure-%s pixels: arming the dump", (unsigned long long)n, blue,
+                   when_white ? "white" : "blue");
             vk_dump_arm(n + 2);
+            when_blue = 0;   // once
         }
     }
     if (++ring_next == ring_n) ring_next = 0, ring_full = 1;

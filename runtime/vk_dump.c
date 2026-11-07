@@ -970,11 +970,12 @@ int vk_dump_pass_seq(void) { return seq; }
 void vk_dump_after_draw(VkExec *ex) {
     if (in_draw_copy || draws_pass == -1) return;
     AcquireSRWLockExclusive(&rec_lock);
+    static int eq_pass = -1;   // =eq: every pass of the dump frame whose first draw tests depth EQUAL on a wide target
     if (draws_pass == -2 && active() && frame_now() == dump_frame && pass_draws == 1 && vk_depth_eq_now &&
-        ex->color[0].image && ex->color[0].width >= 1280)
-        draws_pass = seq, fprintf(passes_f, "OOT_DUMP_DRAWS=eq: pass %d\n", seq);
-    int go = active() && frame_now() == dump_frame && seq == draws_pass && ex->color[0].image &&
-             pass_draws <= DRAWS_EQ_MAX;
+        ex->color[0].image && ex->color[0].width >= 1280 && eq_pass != seq)
+        eq_pass = seq, fprintf(passes_f, "OOT_DUMP_DRAWS=eq: pass %d\n", seq);
+    int go = active() && frame_now() == dump_frame && (seq == draws_pass || (draws_pass == -2 && seq == eq_pass)) &&
+             ex->color[0].image && pass_draws <= DRAWS_EQ_MAX;
     ReleaseSRWLockExclusive(&rec_lock);
     if (!go) return;
     in_draw_copy = 1;
@@ -1196,8 +1197,8 @@ void vk_dump_init(void) {
     const char *du = cfg_get("OOT_DUMP_UBO");
     dump_ubo = du && *du && *du != '0' ? (atoi(du) > 1 ? atoi(du) : 40) : 0;   // a number above 1: that many vec4
     const char *dd = cfg_get("OOT_DUMP_DRAWS");
-    // =eq: the first pass of the dump frame whose first draw tests depth EQUAL on a target at least 1280 wide (the
-    // level's colour pass; its number changes from run to run), its first DRAWS_EQ_MAX draws
+    // =eq: every pass of the dump frame whose first draw tests depth EQUAL on a target at least 1280 wide (the
+    // level's colour passes; their numbers change from run to run), the first DRAWS_EQ_MAX draws of each
     draws_pass = dd && *dd ? (!strcmp(dd, "eq") ? -2 : atoi(dd)) : -1;
     const char *xp = cfg_get("OOT_DUMP_XFB_PROBE");
     xfb_probe = xp && *xp == '1';

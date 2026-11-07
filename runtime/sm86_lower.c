@@ -97,6 +97,22 @@ typedef struct {
     int liveness;                                  // scratch comes from the registers dead at each instruction
     uint32_t scratch_len;                          // registers in the scratch block (liveness mode: per instruction)
     uint64_t reserved[4];                          // registers the lowering holds for the program's length
+    // Liveness mode: a uniform register's home dead over its span holds that register only over the span (alloc_dead),
+    // and each lowered instruction's scratch registers are recorded, so a home found later never takes one an
+    // instruction of its span already used as scratch.
+    struct { uint32_t a, b; uint32_t r; } span[128];
+    uint32_t nspan;
+    uint64_t (*scr_used)[4];                       // [n]: scratch registers each lowered instruction used
+    // Spilled uniform registers (compute and mesh programs, liveness mode): a uniform register no general register
+    // is dead over the whole span of lives in a local-memory word (spill_base + 4 n). Each instruction that names it
+    // loads it into a scratch temporary first and stores the temporary back after itself (spill_temp, spill_flush).
+    uint8_t ur_spill[64], sp_tmp[64];              // sp_tmp: the temporary of the instruction sp_idx (0 = none)
+    uint32_t sp_idx, sp_used, spill_base;          // sp_used: scratch indices 8-11 taken at sp_idx; spill_base 0: unset
+    // Borrowed scratch (same programs): an instruction with no 12 free registers takes 12 it does not name; the live
+    // ones are saved to local memory (spill_base + 0x100 + 4 k) before the instruction, scratch_restore reloads them.
+    uint32_t bw_live, bw_saved;                    // bit k: scratch k is live there / was saved
+    int relaxed;                                   // the retry (sm86_lower_ex): spans, spills and borrowed scratch on;
+                                                   // the first attempt keeps the allocation every program had before
     struct { uint8_t kind, bank; uint32_t value; } cur_def[64];   // local forwarding: the constant uniform
                                                    // register n holds at this point of its block (kind as ur_def)
     uint8_t needs_reg[64];                         // uniform register n has a use no forwarding covers
@@ -114,6 +130,7 @@ typedef struct {
                                                    // swapped into Pn around each instruction naming it
     uint32_t up_reg;
     int up_reg_set;                                // up_reg is allocated (register 0 is a valid choice)
+    int up_spill;                                  // up_reg lives in local memory (spill_base + 4 * 63), see lower_one
     uint64_t pred;                                 // the current instruction's predicate, in Maxwell's bits 16-19
     int tensor;                                    // HMMA to the MMA marker (sm86_lower_tensor_cores, compute)
     int hmma_count;                                // HMMAs lowered so far (OOT_TENSOR_HMMA_MASK)
@@ -174,12 +191,16 @@ static uint32_t alloc_gpr(L *l) {
     return l->ur_next++;
 }
 
+static void local_word(L *l, int store, uint32_t r, uint32_t off);
+
 // Scratch register k of the current expansion: scratch_base + k, the block growing on first use.
 static uint32_t S(L *l, int k) {
     if (k >= NSCRATCH || l->scratch_base + (uint32_t)k > 254 || (l->liveness && (uint32_t)k >= l->scratch_len))
         return fail(l, "no general register free for scratch"), RZ;
     if (l->nscratch <= k) l->nscratch = k + 1;
-    return l->scratch_base + (uint32_t)k;
+    uint32_t r = l->scratch_base + (uint32_t)k;
+    if (l->scr_used && l->index < l->n) l->scr_used[l->index][r / 64] |= 1ull << (r % 64);
+    return r;
 }
 
 typedef struct Src Src;
@@ -193,20 +214,126 @@ struct Src {
 
 static Src reg_src(uint32_t r) { Src s = {0}; s.reg = r; return s; }
 
+// Is register r held by a uniform register's span that meets instructions a..b?
+static int span_busy(const L *l, uint32_t r, uint32_t a, uint32_t b) {
+    for (uint32_t k = 0; k < l->nspan; k++)
+        if (l->span[k].r == r && l->span[k].a <= b && a <= l->span[k].b) return 1;
+    return 0;
+}
+
+// The registers not free over instructions a..b: reserved, live in the program, or scratch an instruction there used.
+static void busy_over(const L *l, uint32_t a, uint32_t b, uint64_t busy[4]) {
+    memcpy(busy, l->reserved, 4 * sizeof *busy);
+    for (uint32_t i = a; i <= b && i < l->n; i++)
+        for (int w = 0; w < 4; w++) busy[w] |= l->live_out[i][w] | (l->relaxed && l->scr_used ? l->scr_used[i][w] : 0);
+}
+
+// Holds register r over instructions a..b (the whole program when the span table is full, or on a first attempt).
+static void span_hold(L *l, uint32_t r, uint32_t a, uint32_t b) {
+    if (!l->relaxed || l->nspan == sizeof l->span / sizeof *l->span) { l->reserved[r / 64] |= 1ull << (r % 64); return; }
+    l->span[l->nspan].a = a, l->span[l->nspan].b = b, l->span[l->nspan].r = r, l->nspan++;
+}
+
 // The general register standing in for uniform register n (URZ = RZ).
-// Liveness mode: a register neither reserved nor live anywhere in instructions a..b (NOREG when there is none).
+// Liveness mode: a register neither reserved nor live nor held by another span anywhere in instructions a..b,
+// held only over a..b (NOREG when there is none). Until 2026-11-09 it was held for the whole program, and the
+// mesh programs that use R0..R250 ran out of registers for later uniform registers and for scratch.
 static uint32_t alloc_dead(L *l, uint32_t a, uint32_t b) {
     uint64_t busy[4];
-    memcpy(busy, l->reserved, sizeof busy);
-    for (uint32_t i = a; i <= b && i < l->n; i++)
-        for (int w = 0; w < 4; w++) busy[w] |= l->live_out[i][w];
+    busy_over(l, a, b, busy);
     for (uint32_t c = 0; c < 255; c++)
-        if (!(busy[c / 64] >> (c % 64) & 1)) { l->reserved[c / 64] |= 1ull << (c % 64); return c; }
+        if (!(busy[c / 64] >> (c % 64) & 1) && !span_busy(l, c, a, b)) { span_hold(l, c, a, b); return c; }
     return NOREG;
+}
+
+// Local memory: an unpredicated 32-bit LDL / STL of register r at offset off (Maxwell, as lower_ldl_stl emits them).
+static void local_word(L *l, int store, uint32_t r, uint32_t off) {
+    uint64_t saved = l->pred;
+    l->pred = (uint64_t)PT << 16;
+    emit(l, (store ? 0xef50000000000000ull : 0xef40000000000000ull) | l->pred | r | ((uint64_t)RZ << 8) |
+                ((uint64_t)off << 20) | ((uint64_t)4 << 48));
+    l->pred = saved;
+}
+
+// The first local-memory byte above the program's own LDL / STL (with room for 16 bytes of its widest access).
+static uint32_t own_local_end(const L *l) {
+    uint32_t end = 0;
+    for (uint32_t i = 0; i < l->n; i++) {
+        uint32_t op = l->in[i].w[0] & 0xfff;
+        if (op != 0x983 && op != 0x387 && op != 0x987) continue;
+        if (bits(&l->in[i], 24, 8) != RZ || bits(&l->in[i], 91, 1)) return 0x1000;   // a register address: any offset
+        uint32_t e = bits(&l->in[i], 40, 24) + 16;
+        if (e > end) end = e;
+    }
+    return (end + 15) & ~15u;
+}
+
+// Uniform register n (spilled) at the current instruction: its temporary, loaded from its slot on first use there
+// (a pair half brings its partner along into the adjacent temporary).
+static uint32_t spill_temp(L *l, uint32_t n) {
+    if (l->sp_idx != l->index) memset(l->sp_tmp, 0, sizeof l->sp_tmp), l->sp_used = 0, l->sp_idx = l->index;
+    if (l->sp_tmp[n]) return l->sp_tmp[n];
+    int pair = l->ur_pair[n] && (n ^ 1) < 63 && l->ur_spill[n ^ 1];
+    static const int order[4] = {10, 11, 8, 9};
+    for (int j = 0; j < 4; j += pair ? 2 : 1) {
+        int k = order[j];
+        uint32_t m = pair ? 3u << (k - 8) : 1u << (k - 8);
+        if (l->sp_used & m) continue;
+        l->sp_used |= m;
+        if (pair) {
+            uint32_t e = n & ~1u, t0 = S(l, k), t1 = S(l, k + 1);
+            if (l->failed) return RZ;
+            l->sp_tmp[e] = (uint8_t)t0, l->sp_tmp[e + 1] = (uint8_t)t1;
+            local_word(l, 0, t0, l->spill_base + 4 * e), local_word(l, 0, t1, l->spill_base + 4 * (e + 1));
+        } else {
+            uint32_t t = S(l, k);
+            if (l->failed) return RZ;
+            l->sp_tmp[n] = (uint8_t)t;
+            local_word(l, 0, t, l->spill_base + 4 * n);
+        }
+        return l->sp_tmp[n];
+    }
+    return fail(l, "no scratch temporary for a spilled uniform register"), RZ;
+}
+
+// After an instruction: its spilled uniform registers' temporaries back to their slots (unpredicated: an instruction
+// predicated off left the loaded value, so the store writes what was there).
+static void spill_flush(L *l) {
+    if (l->sp_idx != l->index) return;
+    for (uint32_t n = 0; n < 63; n++)
+        if (l->sp_tmp[n]) local_word(l, 1, l->sp_tmp[n], l->spill_base + 4 * n);
+    memset(l->sp_tmp, 0, sizeof l->sp_tmp), l->sp_used = 0, l->sp_idx = NOREG;
+}
+
+// Spills uniform register n (and its pair partner) when the program may: compute and mesh programs, whose local
+// memory the translator sizes at 4 KiB, with room above the program's own use.
+static int spill_room(L *l) {
+    if (l->graphics || !l->relaxed) return 0;
+    if (!l->spill_base) {
+        uint32_t b = own_local_end(l);
+        if (b + 0x100 + 4 * NSCRATCH > 0x1000) return 0;
+        l->spill_base = b ? b : 16;
+    }
+    return 1;
+}
+
+static int spill(L *l, uint32_t n) {
+    if (!spill_room(l)) return 0;
+    l->ur_spill[n] = 1;
+    if (l->ur_pair[n] && (n ^ 1) < 63 && l->needs_reg[n ^ 1] && !l->ur_map[n ^ 1]) l->ur_spill[n ^ 1] = 1;
+    return 1;
+}
+
+// After an instruction (and spill_flush): the borrowed scratch registers that held live values, reloaded.
+static void scratch_restore(L *l) {
+    for (uint32_t k = 0; k < NSCRATCH; k++)
+        if (l->bw_saved >> k & 1) local_word(l, 0, l->scratch_base + k, l->spill_base + 0x100 + 4 * k);
+    l->bw_live = l->bw_saved = 0;
 }
 
 static uint32_t ur(L *l, uint32_t n) {
     if (n == 63) return RZ;
+    if (n < 63 && l->ur_spill[n]) return spill_temp(l, n);
     if (n > 63) return fail(l, "uniform register number"), RZ;
     if (l->scanned && !l->needs_reg[n]) return fail(l, "uniform register read the scan did not see"), RZ;
     if (!l->ur_map[n]) {
@@ -232,18 +359,19 @@ static uint32_t ur(L *l, uint32_t n) {
                 if (a2 < a) a = a2;
                 if (b2 > b) b = b2;
                 uint64_t busy[4];
-                memcpy(busy, l->reserved, sizeof busy);
-                for (uint32_t i = a; i <= b && i < l->n; i++)
-                    for (int w = 0; w < 4; w++) busy[w] |= l->live_out[i][w];
+                busy_over(l, a, b, busy);
                 for (uint32_t c = 0; c + 1 < 255; c++)
-                    if (!(busy[c / 64] >> (c % 64) & 1) && !(busy[(c + 1) / 64] >> ((c + 1) % 64) & 1)) {
-                        l->reserved[c / 64] |= 1ull << (c % 64), l->reserved[(c + 1) / 64] |= 1ull << ((c + 1) % 64);
+                    if (!(busy[c / 64] >> (c % 64) & 1) && !(busy[(c + 1) / 64] >> ((c + 1) % 64) & 1) &&
+                        !span_busy(l, c, a, b) && !span_busy(l, c + 1, a, b)) {
+                        span_hold(l, c, a, b), span_hold(l, c + 1, a, b);
                         l->ur_map[e] = (uint8_t)c, l->ur_map[e + 1] = (uint8_t)(c + 1);
                         return l->ur_map[n];
                     }
+                if (spill(l, n)) return spill_temp(l, n);
                 return fail(l, "no register pair dead over a uniform pair's span"), RZ;
             }
             r = alloc_dead(l, a, b);
+            if (r == NOREG && spill(l, n)) return spill_temp(l, n);
             if (r == NOREG) return fail(l, "no general register dead over a uniform register's span"), RZ;
         } else {
             return fail(l, "no general register free for a uniform register"), RZ;
@@ -891,12 +1019,37 @@ static void scratch_at(L *l, uint32_t i) {
 #endif
     uint32_t best = 0, best_len = 0, run = 0;
     for (uint32_t r = 0; r < 255; r++) {
-        int busy = get_bit(l->live_out[i], r) || get_bit(l->reserved, r);
+        int busy = get_bit(l->live_out[i], r) || get_bit(l->reserved, r) || span_busy(l, r, i, i);
         if (busy) run = 0;
         else if (++run > best_len) best_len = run, best = r + 1 - run;
         if (best_len >= NSCRATCH) break;
     }
     l->scratch_base = best, l->scratch_len = best_len > NSCRATCH ? NSCRATCH : best_len, l->nscratch = 0;
+    l->bw_live = l->bw_saved = 0;
+    if (l->scratch_len >= NSCRATCH || l->graphics) return;
+    // Too few free registers here (a mesh program keeps ~245 live): borrow 12 the instruction does not name and no
+    // uniform register holds, saving the live ones on first use. Not around a branch: its restore would be skipped.
+    uint32_t op = l->in[i].w[0] & 0xfff;
+    if (op == 0x947 || op == 0x944 || op == 0x94d || op == 0x949 || op == 0x958 || op == 0x950) return;
+    if (!spill_room(l)) return;
+    uint64_t use[4] = {0}, def[4] = {0};
+    insn_regs(&l->in[i], use, def);
+    for (uint32_t r = 0; r < 255; r++) if (get_bit(def, r)) set_run(use, r, 4);
+    run = 0;
+    for (uint32_t r = 0; r < 255; r++) {
+        int busy = get_bit(use, r) || get_bit(l->reserved, r) || span_busy(l, r, i, i);
+        run = busy ? 0 : run + 1;
+        if (run == NSCRATCH) {
+            l->scratch_base = r + 1 - NSCRATCH, l->scratch_len = NSCRATCH;
+            // saved at once, before anything of the instruction: an expansion's own branch could skip a later save
+            for (uint32_t k = 0; k < NSCRATCH; k++)
+                if (get_bit(l->live_out[i], l->scratch_base + k)) {
+                    l->bw_live |= 1u << k, l->bw_saved |= 1u << k;
+                    local_word(l, 1, l->scratch_base + k, l->spill_base + 0x100 + 4 * k);
+                }
+            return;
+        }
+    }
 }
 
 // ---- operands
@@ -3114,8 +3267,17 @@ static void lower_one(L *l, const Insn *x) {
         uint32_t keep = swap & ~wr;
         if (!l->up_reg_set) {
             l->up_reg = l->liveness && l->ur_next >= l->scratch_base ? alloc_dead(l, 0, l->n - 1) : alloc_gpr(l);
-            if (l->up_reg == NOREG) return (void)fail(l, "no general register free for the uniform predicates");
+            // none dead over the whole program: the uniform predicates live in local memory (2026-11-09, mesh 6d98affa)
+            if (l->up_reg == NOREG && l->liveness && spill_room(l)) l->up_spill = 1;
+            else if (l->up_reg == NOREG) return (void)fail(l, "no general register free for the uniform predicates");
             l->up_reg_set = 1;
+        }
+        uint32_t upr = l->up_reg;
+        if (l->up_spill) {   // scratch 11 for this instruction, kept away from the spilled uniform registers' temporaries
+            if (l->sp_idx != l->index) memset(l->sp_tmp, 0, sizeof l->sp_tmp), l->sp_used = 0, l->sp_idx = l->index;
+            l->sp_used |= 1u << 3;
+            upr = S(l, 11);
+            local_word(l, 0, upr, l->spill_base + 4 * 63);
         }
         uint32_t save = S(l, 7);
         emit(l, 0x38e8000000070000ull | save | ((uint64_t)RZ << 8) | ((uint64_t)(swap | temps) << 20));
@@ -3123,9 +3285,10 @@ static void lower_one(L *l, const Insn *x) {
             if (temps >> k & 1)
                 emit(l, 0x5090000000000000ull | 7 | ((uint64_t)k << 3) | ((uint64_t)PT << 12) | ((uint64_t)PT << 29) |
                             ((uint64_t)copy_from[k] << 39) | ((uint64_t)7 << 16));
-        emit(l, 0x38f0000000070000ull | ((uint64_t)l->up_reg << 8) | ((uint64_t)swap << 20));
+        emit(l, 0x38f0000000070000ull | ((uint64_t)upr << 8) | ((uint64_t)swap << 20));
         lower_one_inner(l, x);
-        if (keep) emit(l, 0x38e8000000070000ull | l->up_reg | ((uint64_t)l->up_reg << 8) | ((uint64_t)keep << 20));
+        if (keep) emit(l, 0x38e8000000070000ull | upr | ((uint64_t)upr << 8) | ((uint64_t)keep << 20));
+        if (keep && l->up_spill) local_word(l, 1, upr, l->spill_base + 4 * 63);
         if (keep | temps) emit(l, 0x38f0000000070000ull | ((uint64_t)save << 8) | ((uint64_t)(keep | temps) << 20));
         return;
     }
@@ -3586,7 +3749,7 @@ int sm86_lower(const uint8_t *code, uint32_t code_size, const uint8_t *control, 
 }
 
 static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size,
-                         Sm86Lowered *out, int tensor, int force_swap) {
+                         Sm86Lowered *out, int tensor, int force_swap, int relaxed) {
     memset(out, 0, sizeof *out);
     Sm86Control c;
     if (!sm86_control_parse(control, control_size, &c) || c.code_size > code_size) {
@@ -3595,6 +3758,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
     }
     L l = {0};
     l.force_swap = force_swap;
+    l.relaxed = relaxed;
     l.stage = c.stage;
     l.mesh = c.stage == 6 || c.stage == 7 ? c.stage : 0;   // lowered as compute programs (lower_isbe)
     l.graphics = c.stage != 5 && !l.mesh;
@@ -3629,6 +3793,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         // No room above the program's registers: scratch comes from the registers dead at each instruction.
         l.liveness = compute_liveness(&l);
         if (!l.liveness) free(l.live_out), l.live_out = NULL;
+        else if (!(l.scr_used = calloc(l.n, sizeof *l.scr_used))) fail(&l, "out of memory");
     }
     for (l.index = pass_vs ? l.n : 0; l.index < l.n && !l.failed; l.index++) {
         l.first_out[l.index] = l.nout;
@@ -3647,6 +3812,8 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
             for (uint32_t k = 0; k < cnt.n; k++)
                 if (cnt.at[k] == header + l.index * 16) count_emit(&l, k);
         lower_one(&l, &l.in[l.index]);
+        spill_flush(&l);
+        if (l.bw_saved) scratch_restore(&l);
         if (probe.on && !l.graphics && header + l.index * 16 == probe.at) probe_emit(&l, 0);
         int pair;
         uint8_t kind, bank;
@@ -3737,13 +3904,22 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         out->error_offset = header + l.error_index * 16;
         sm86_lower_free(out);
     }
-    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out), free(l.ur_in), free(l.ur_live), free(l.ur_rdnf);
+    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out), free(l.scr_used), free(l.ur_in), free(l.ur_live), free(l.ur_rdnf);
     return !l.failed;
 }
 
 int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *control, uint32_t control_size, Sm86Lowered *out,
                   int tensor) {
-    if (lower_attempt(code, code_size, control, control_size, out, tensor, 0)) return 1;
-    if (strcmp(out->error, "no predicate free for a uniform predicate")) return 0;
-    return lower_attempt(code, code_size, control, control_size, out, tensor, 1);
+    if (lower_attempt(code, code_size, control, control_size, out, tensor, 0, 0)) return 1;
+    int swap = !strcmp(out->error, "no predicate free for a uniform predicate");
+    if (swap && lower_attempt(code, code_size, control, control_size, out, tensor, 1, 0)) return 1;
+    // Out of general registers (mesh programs that keep ~245 live, 2026-11-09): a retry where a uniform register's
+    // home is held only over its span, a uniform register (or the uniform predicates) with none dead over its span
+    // lives in local memory, and an instruction without 12 free registers borrows and saves 12 it does not name.
+    if (!strstr(out->error, "register") || !strstr(out->error, "free") && !strstr(out->error, "dead over")) return 0;
+    char first[96];
+    snprintf(first, sizeof first, "%s", out->error);
+    if (lower_attempt(code, code_size, control, control_size, out, tensor, swap, 1)) return 1;
+    snprintf(out->error, sizeof out->error, "%s", first);   // report the first attempt's reason
+    return 0;
 }
