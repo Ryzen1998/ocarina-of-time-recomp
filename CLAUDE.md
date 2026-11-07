@@ -64,7 +64,7 @@ loss, the Kokiri Forest ground is drawn (PLOP3 lowering,
 translator patches 0019/0020, task records of 0x1000, the window for task/mesh stages; KEY_VERSION 22). The white
 areas are the sky the frame draws first, showing where geometry is still missing (12 task/mesh programs do not lower).
 `OOT_SM86_COUNT` counts threads at instructions of one program and dumps its counters at a device loss: the tool for
-any GPU hang. **`docs/phase3.md` "Current state (2026-11-08)" is the summary: what works, what was fixed, the
+any GPU hang. **`docs/phase3.md` "Current state (2026-11-08, end of day)" is the summary: what works, what was fixed, the
 diagnostics, and the order of what is left.**
 
 ## GPU safety (learned 2026-11-07)

@@ -4,52 +4,70 @@ Hand-off written 2026-11-05 at commit `b46d663`, for a fresh session. Read `CLAU
 history is in `docs/plan.md` (Phases 0 to 2 and the NVN2 survey). This file says where the port stands, exactly what
 blocks it, what is already measured, and the order to do the work in.
 
-## Current state (2026-11-08): read this first
+## Current state (2026-11-08, end of day): read this first
 
 The dated Status sections below are the lab notebook, oldest first; this one is the summary. Branch `visuals` of the
-fork (Ryzen1998). KEY_VERSION 23.
+fork (Ryzen1998), last code commit `3f4d5c2`. KEY_VERSION 23; translator identity c0a08c42... (patches 0019 global
+window, 0020 RED signed offset; after `tools/build_xlate.py` copy `oot_xlate.exe` + `.id` into `build/v131072/`).
 
 ### What works
 
-- Boot, title, menus and the opening run; the replay (`build/logs/a-spam.txt`, presses A) reaches Kokiri Forest /
-  the Deku Tree area about 75 s in (frame ~4500). The level runs at ~59 fps by default, no driver reset, no crash.
-- Much of the scene renders lit and textured: Navi, Link, rocks, moss, roots, the stone path, dialogue text.
-- The global window, the mesh stages and the indirect mesh draws are **on by default** since 2026-11-08 evening
-  (`OOT_GW`, `OOT_MESH`, `OOT_MESH_IND`; `=0` turns each off): the frame's GPU culling counts and the ground under
-  Link is drawn. ~50 fps in the level (59 without them). 12 runs with them, from the title too (bound 64), no driver
-  reset, no crash. `build/logs/defaults-on-1.png`, `-2.png`.
+- Boot, title, menus and the opening; the replay (`build/logs/a-spam.txt`, presses A) reaches Kokiri Forest / the
+  Deku Tree area about 75 s in (frame ~4500).
+- **The mesh pipeline is on by default** (since 2026-11-08 evening): the global window (`OOT_GW`), the task/mesh
+  stages (`OOT_MESH`) and the indirect mesh draws (`OOT_MESH_IND`); `=0` turns each off. With them the frame's GPU
+  culling counts, the culling kernels' indirect dispatches get real group counts, and the indirect mesh draws run:
+  the forest ground, the stone path, rocks, ferns, fences, Link and Navi are drawn lit and textured where their
+  programs lower (`build/logs/gwskip-ground.png`, `k23-final.png`, `defaults-on-1.png`, `defaults-on-2.png`).
+- Level speed: ~50 fps with the mesh pipeline, ~59 fps without (`OOT_GW=0 OOT_MESH=0`).
+- Stability: about 15 runs since the last reboot (run-146..162), from the title and from the level, no driver reset
+  and no game crash. All six driver resets of 2026-11-08 were before `7ed675d`.
 
 ### What is still wrong
 
-1. **White areas.** Found with frame dumps (2026-11-08): each frame fills its HDR target with the sky first (values
-   24..34), then draws the scene over it; where no geometry is drawn the lit sky shows and tone-maps to white. So the
-   white is missing geometry, in default runs too (the clean default screenshots were taken in dark spots). Sources:
-   the indirect mesh draws (off by default, bounded), 12 task/mesh programs that do not lower, possibly more.
-2. **The picture is dark/over-bright in places** with the ground draws on (yellow, speckled ground); not studied yet.
+1. **Large white areas** (the biggest visible problem). Found with frame dumps: each frame first fills its HDR target
+   with the sky (one full-screen draw, values 24..34), then draws the scene over it; wherever no geometry is drawn
+   the lit sky shows and tone-maps to pure white. So the white is **missing geometry**, not a colour bug. It shows in
+   default runs too (earlier "clean" default screenshots were taken in dark spots). Known sources:
+   - 7 indirect-only mesh programs still do not lower (their draws are skipped), see next steps;
+   - mesh program 072eb70d (code hash a11f465b) lowers but its draws turn the frame into black and white blocks, so
+     it is skipped by default (`OOT_MESH_IND_SKIP` defaults to `a11f465b`);
+   - possibly other draws not yet identified (no frame dump with everything on has been read yet).
+2. **Ground colour**: with the indirect draws the ground looks over-bright, yellow and speckled in places; not
+   studied.
 3. **Fog** kernel 1a62084a: ~60% NaN volume, skipped (`OOT_SKIP_CS=1a62084a` in every test run).
-4. Untested: controller play, other areas, scene loads, combat, saving, the movies (skipped in tests).
+4. **Speed**: the mesh pipeline costs ~9 fps (window selection on the CPU, extra task/mesh dispatches).
+5. **Untested**: controller play, other areas, scene loads, combat, saving, the movies (skipped in tests).
 
 ### What was found and fixed (2026-11-07 / 11-08, in order)
 
-| Commit | Bug | Effect |
+| Commit | Bug | Effect / fix |
 |---|---|---|
-| `4669605` | The lowering's record-less jump-table fix-up rewrote constant bank 1 in programs without a BRX (the culling's 64-bit offset 12 became 8 << 32 + 12) | culling counters were written 32 GiB away |
-| `0804b09` | Accesses through pointers loaded at run time had no storage buffer (49 in culling kernel e6d5432f) | global window: translator patch 0019 + `gw_select`, `OOT_GW=1` |
-| `c8441d1` | PLOP3 was lowered to PSETP with its first and third operands swapped (asymmetric tables wrong; 231 of 902 programs change, KEY_VERSION 20) | every culling thread exited before its atomics |
+| `4669605` | The lowering's record-less jump-table fix-up rewrote constant bank 1 in programs without a BRX (the culling's 64-bit offset 12 became 8 << 32 + 12) | culling counters were written 32 GiB away; fix-up only with a BRX, plain c1 words as immediates (KEY 19) |
+| `0804b09` | Accesses through pointers loaded at run time had no storage buffer (49 in culling kernel e6d5432f) | global window: translator patch 0019 + `gw_select` (24 bank-0 entries at 0x410) |
+| `c8441d1` | PLOP3 was lowered to PSETP with its first and third operands swapped (asymmetric tables wrong; 231 of 902 programs change) | every culling thread exited before its atomics (KEY 20) |
 | `c8441d1` | Ryujinx's `Red` reads RED's 20-bit offset unsigned (`Atom` sign-extends) | `RED [p - 12]` went 1 MiB off; translator patch 0020 |
-| `c8441d1` | Indirect mesh draws were never run | `op_draw_mesh` runs them: bound of task workgroups, count copied on the GPU to bank 0 + 0x628, `task_prologue` (KEY 21) |
-| `00c4d56` | Task records were 0x100 bytes; the indirect draws' task programs write payload to ~0x898 | records 0x1000 (KEY 22) |
-| `7ed675d` | The global window was never filled for task/mesh stage dispatches | task program c7f0444a read 0 and looped 0x07ffffff times: the device losses of run-126..135 |
-| `0c2f1a0` | Storage views ignored the game's R32 view format (the AA kernel stores packed R11G11B10 through R32UI) | R32 views, STORAGE by extension (`storage_r32`), live image over the same bytes |
-| (this) | Uniform registers: forwarding stopped at every block, and a register' span was every touch of its number; UP2R (0x883) not lowered | 5 of the 12 indirect-only task/mesh programs now lower (task c6f3721f/bbcf8a53, meshes f5d63a4c, b55ba187, d12f99f4; 072eb70d/a11f465b lowers but draws garbage: skipped by default); KEY 23 |
-| `932a551` | Kernels 374126bf / 358beb27 (wrong traces: stores to float words of bank 3) got window entries over the culling results | game crash at main+0xc938d0 in 3/12 `OOT_GW=1` runs; `OOT_GW_SKIP` |
+| `c8441d1` | Indirect mesh draws were never run | `op_draw_mesh` runs them: a bound of task workgroups, the count copied on the GPU to bank 0 + 0x628, `task_prologue` (KEY 21) |
+| `00c4d56` | Task records were 0x100 bytes; the indirect draws' task programs write payload to ~0x898 | records of 0x1000 (KEY 22) |
+| `7ed675d` | The global window was never filled for task/mesh stage dispatches | task program c7f0444a read 0 and looped 0x07ffffff times: the device losses of run-126..135; `gw_select_mesh` |
+| `0c2f1a0` | Storage views ignored the game's R32 view format (the AA kernel stores packed R11G11B10 through R32UI) | R32 views, STORAGE by extension (`storage_r32`), the live image over the same bytes |
+| `932a551` | Kernels 374126bf / 358beb27 (wrong traces: stores to float words of bank 3) got window entries over the culling results | game crash at main+0xc938d0 in 3 of 12 window runs, none in 10+ since; `OOT_GW_SKIP` |
+| `b0d964b` | Uniform registers: forwarding stopped at every block start, a register's span was every touch of its number, dead definitions still wrote; UP2R (0x883) not lowered | 5 of the 12 indirect-only task/mesh programs now lower (task c6f3721f = hash bbcf8a53, meshes f5d63a4c, b55ba187, d12f99f4, and 072eb70d which is skipped); KEY 23 |
+| `3f4d5c2` | — | `OOT_GW`, `OOT_MESH`, `OOT_MESH_IND` on by default |
 
 Uniform register changes in detail (`sm86_lower.c`): `ur_flow` is a forward dataflow of the constant each uniform
 register holds; a block leader starts the local forwarding from it, so a register loaded with the same constant on
 every path forwards there too. `ur_liveness` is a backward dataflow over the reads that do not forward; a register
 that needs one gets its span from where it is live, and a definition whose value is dead writes no register
-(`ur_has_reg` per instruction). 421 of 942 cached programs lower differently (mostly dropped dead writes); runs
-show no regression. `SM86_UR=1` (tool build) lists the reads that do not forward.
+(`ur_has_reg` per instruction). UP2R (`case 0x083`): URd = (URa & ~mask) | packed uniform predicates, one OR per mask
+bit under the predicate standing for that UP. 421 of 942 cached programs lower differently (mostly dropped dead
+writes); runs show no regression. `SM86_UR=1` (tool build) lists the reads that do not forward.
+
+How the bugs were found, for next time: the culling chain was traced with `OOT_IND_LOG` / `OOT_MESH_WATCH` /
+`OOT_GW_TRACE`; PLOP3 and the RED offset with `OOT_SM86_COUNT` (threads per instruction, registers summed); the
+device losses by bisecting the indirect draws (`OOT_MESH_IND_ONLY`), then `OOT_SM86_COUNT`'s dump at the loss showed
+the loop and its zero inputs; the white with frame dumps at a fixed frame (`run.py --dump 7000`); the game crash with
+`OOT_WATCH_RANGE`.
 
 ### Diagnostics added (keep using them)
 
@@ -68,27 +86,32 @@ show no regression. `SM86_UR=1` (tool build) lists the reads that do not forward
 
 ### What to do next, in order
 
-1. **The 7 indirect-only mesh programs that still do not lower** (2026-11-08 evening: ur_flow / ur_liveness / UP2R
-   fixed 5 of 12): four "no ... register dead over a uniform register's span" (6d98affa x3 at +0x320, 9a4accb7 at
-   +0x360: a computed uniform value live across code that uses R0..R251; needs spilling uniform registers to local
-   memory or rematerialising), three "no general register free for scratch" (52ed87ef +0x6c90, fa159bf2 +0x3960,
-   47ebe041 +0x22a0). And **mesh 072eb70d (code hash a11f465b)**: lowers, but its draws turn the frame into black and
-   white blocks (NaN/huge values into the exposure); `OOT_MESH_IND_SKIP` defaults to it. Compare its UP2R / swap
-   path with the task program c6f3721f, which works.
-2. **Indirect draws**: from the title with the bound 64: clean (run-160). Counts seen are at most 29, under the
-   bound; a count above it would lose meshes silently. Then the over-bright speckled ground.
-3. **Done: default on** (2026-11-08 evening). Left: the cost (~50 vs ~59 fps; profile `gw_select` with
-   `OOT_TRACE=perf`), and watching for the game crash at main+0xc938d0 (`OOT_GW_SKIP`).
-4. Find the remaining missing geometry (a frame dump with everything on: which draws leave sky).
-5. The fog kernel's NaN; the wrong traces of 374126bf / 358beb27 (fix them rather than skip them).
-6. A controller play session to see what blocks real play.
+1. **Find the remaining missing geometry.** A frame dump at a fixed frame (7000) with the defaults: list the draws
+   of the main colour pass, find what is missing where the sky shows (skipped draws in the log: `translation
+   failed`, `meshind:` pairs, `OOT_MESH_IND_SKIP`), and which of them matter most.
+2. **Mesh program 072eb70d (code hash a11f465b)**: lowers since UP2R but draws garbage. Run it alone
+   (`OOT_MESH_IND_ONLY=a11f465b OOT_MESH_IND_SKIP=none`) with a frame dump, read its mesh records (`OOT_MESH_LOG`),
+   compare its UP2R / uniform-predicate swap path with task program c6f3721f, which works.
+3. **The 7 mesh programs that still do not lower**: four "no ... register dead over a uniform register's span"
+   (6d98affa x3 at +0x320, 9a4accb7 at +0x360: a computed uniform value live across code that uses R0..R251; needs
+   spilling uniform registers to local memory, or recomputing them at each use), three "no general register free for
+   scratch" (52ed87ef +0x6c90, fa159bf2 +0x3960, 47ebe041 +0x22a0: the same, for the expansion scratch). Failing
+   inputs are in the cache as `.fail.ctl` / `.fail.code`; lower them with `build/tools/sm86_lower.exe --batch`
+   (paths without spaces), `SM86_POOL=1 SM86_LIVE=1 SM86_UR=1` for details.
+4. **The over-bright, speckled ground** (indirect draws): compare its pass-through vertex outputs with what the
+   fragment shader expects (`mesh_vs`), and the depth/blend state of the stand-in draw.
+5. **Speed** (~50 vs ~59 fps): profile `gw_select` (`OOT_TRACE=perf`) and the task/mesh dispatches (`OOT_CS_TIME`).
+6. **Correctness left**: the fog kernel's NaN; fix the wrong traces of 374126bf / 358beb27 rather than skip them;
+   counts above `OOT_MESH_IND_MAX` (64; seen up to 29) would lose meshes silently.
+7. **A controller play session** with the user, to see what blocks real play (movement, other areas, saving).
 
 ### Safety (learned the hard way)
 
-Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`. After every GPU run count nvlddmkm
-events; after any reset stop and reboot before the next run (check `LastBootUpTime`). Bisect a hang by halves with
-`OOT_MESH_IND_ONLY` / `OOT_SKIP_CS` and put `OOT_SM86_COUNT` points in the suspect: its dump at the device loss
-shows the loop. Run one game at a time (`run.py` refuses overlaps).
+Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count
+nvlddmkm events; after any reset stop and reboot before the next run (check `LastBootUpTime`). Bisect a hang by
+halves with `OOT_MESH_IND_ONLY` / `OOT_SKIP_CS` and put `OOT_SM86_COUNT` points in the suspect: its dump at the device
+loss shows the loop. Run one game at a time (`run.py` refuses overlaps; run them one after the other, never in
+parallel tool calls).
 
 ## Status (2026-11-05, later the same day)
 
