@@ -405,6 +405,13 @@ Runs run-225 to run-229, 0 driver resets.
   (+0x38 of each record): no CPU write of 0xff is lost there. Not settled: whether that is the table e6d5432f reads for
   the objects in question (it picks one per object type through c4 rows 0-3), and which program or CPU code should set
   0xff. Parked here for the fog.
+- **Fog, continued** (run-233, 0 resets): the weight sum that is 0 is a blend of eight light probes, each weighted by
+  its trilinear fraction times `valid ? 1 : R91` (validity bits of the loaded probe data: SHF/SGXT/ISETP/FSEL from
+  0x2a00 on; R91 is a bank-4 value). A sum of exactly 0 needs every probe invalid and R91 = 0, which is what probe
+  data read as zeros would give. Not the virtual pool: with `OOT_VPOOL_PHYS=1` the volume is still ~56% NaN and the
+  frame black (`build/logs/fog-vpool.png`). Next: `OOT_SM86_COUNT` sums of R91 and of the validity words loaded at
+  0x2a00..0x31f0 (`=r<n>` on the instruction after each load), then where those loads' base (R14:R15, an
+  `IMAD.WIDE` base) comes from: likely a storage-held pointer (bank 0 + 0x60 table) whose buffer the host binds wrong.
 
 ### Safety (learned the hard way)
 
