@@ -322,9 +322,10 @@ A contributor's run on native Windows (RTX 5070 Ti, driver 621.01, no WSL), from
 - **The fog volume is still 0 and NaN** with both (frame dump, 64x36x96 volume, about 60% of the voxels NaN), so
   there is another cause. `OOT_SM86_PROBE` (`sm86_lower.c`) stores, for one register at one instruction of one
   program, NaN / positive / negative flags per thread into the volume. Results so far: the first channel stored at
-  0x7290 (R12) is 0 or positive, never NaN or negative; the interpolation weight R23 after 0x6bc0, in the same basic
-  block, is exactly 0 in every voxel. The guess
-  to check next: the weights' sum (R19 at 0x6c70) is 0 and the reciprocal at 0x6c90 turns it into the NaN. The
+  0x7290 (R12) is 0 or positive, never NaN or negative; R90 after 0x5300 (a weight product) is positive in 73% of
+  the voxels and 0 in the rest, never NaN. (An earlier probe of R23 read "0 everywhere", but that version wrote the
+  same value for 0 and for "not reached": discard it. The probe now writes a state code, 0 meaning not reached.) So
+  the NaN is not an all-zero weight; where it comes from is open. The
   kernel uses about ten instruction forms that no other cached program uses (FSETP, ISETP, PLOP3, I2FP and FFMA
   variants, `forms` from the census), the likeliest place for a lowering defect.
 - **Hazards met.** A probe run must translate the probed program alone (a copy of the warm shader cache with its

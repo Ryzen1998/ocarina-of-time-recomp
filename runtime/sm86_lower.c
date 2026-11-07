@@ -2877,11 +2877,12 @@ static void lower_one_inner(L *l, const Insn *x) {
 
 // ---- OOT_SM86_PROBE (diagnostic): a register's value at one instruction of one compute program
 // OOT_SM86_PROBE=<code hash, hex>:<instruction offset, hex>:<register>[:<image handle offset, hex>]: after the
-// instruction at that offset, every thread stores the flags (isnan v, v > 0, v < 0) scaled to 2^-14, and 1, of the
-// register read as a float, into the storage image whose handle is the constant c0[handle] (default 0x98) at its
-// global invocation id, and goes on; at the program's start each thread stores (0, 0, 0, 1) there, and the program's
-// own stores into that image are dropped. A frame dump (OOT_DUMP=cs:<id>) then shows in that image's channel maxima
-// whether any thread saw v NaN (R), positive (G) or negative (B). Compute programs only.
+// instruction at that offset, every thread stores a state code of the register read as a float into the first channel
+// of the storage image whose handle is the constant c0[handle] (default 0x98) at its global invocation id, and goes on:
+// 0.25 zero, 0.5 positive, 0.75 negative, 1.0 NaN; at the program's start each thread stores 0 there (not reached).
+// The program's own stores into that image are dropped. A frame dump (OOT_DUMP=cs:<id>) then shows the codes per
+// voxel. Compute programs only. Any value the program's next consumer of that image loops on can hang the GPU: the
+// fog's RG8 volume (handle 0xa8) lost the device once even with codes in 0..1 (2026-11-07).
 // Translate the probed program alone: a copy of the warm shader cache with that program's translation removed
 // (OOT_SHADER_CACHE). An empty cache (run.py --fresh-cache) translated every shader in the background and lost the
 // device on the title screen, and repeated device losses took Windows down once (bugcheck 0x10E, 2026-11-07).
@@ -2916,18 +2917,23 @@ static void probe_emit(L *l, int init) {
     S(l, 3), S(l, 6);   // reserve d..d+3 and c..c+2
     if (l->failed) return;
     uint32_t v = probe.reg;
+    mov_imm(l, d + 1, 0), mov_imm(l, d + 2, 0), mov_imm(l, d + 3, 0x3f800000);
     if (init) {
-        mov_imm(l, d, 0), mov_imm(l, d + 1, 0), mov_imm(l, d + 2, 0);
+        mov_imm(l, d, 0);                                                  // 0: the probe point was not reached
     } else {
-        // FSET.BF (Maxwell R form): 1.0 or 0.0 from v cmp b; NaN 8 (v against itself), GT 4 and LT 1 (against zero).
-        emit(l, base(l, 0x5800000000000000ull, d, v) | ((uint64_t)v << 20) | ((uint64_t)PT << 39) | ((uint64_t)8 << 48) | ((uint64_t)1 << 52));
-        emit(l, base(l, 0x5800000000000000ull, d + 1, v) | ((uint64_t)RZ << 20) | ((uint64_t)PT << 39) | ((uint64_t)4 << 48) | ((uint64_t)1 << 52));
-        emit(l, base(l, 0x5800000000000000ull, d + 2, v) | ((uint64_t)RZ << 20) | ((uint64_t)PT << 39) | ((uint64_t)1 << 48) | ((uint64_t)1 << 52));
-        // Scaled to 2^-14, the smallest normal of the volume's R11G11B10 format: the next kernel (c82d3cba) loops on
-        // the in-scattering it reads, and flags of 1.0 there hung the GPU (zeros and NaN do not, 2026-11-07).
-        for (uint32_t k = 0; k < 3; k++) emit(l, 0x1e00000000000000ull | l->pred | (d + k) | ((uint64_t)(d + k) << 8) | ((uint64_t)0x38800000u << 20));
+        // A state code in the first channel: 0.25 zero, 0.5 positive, 0.75 negative, 1.0 NaN. FSET.BF (Maxwell R
+        // form) gives 1.0 or 0.0 from v cmp b: GT 4 and LT 1 against zero, NaN 8 against itself; FFMA32I folds each in.
+        uint32_t f = d + 1;
+        mov_imm(l, d, 0x3e800000);                                         // 0.25
+        static const struct { uint32_t cmp, b, w; } st[3] = {{4, RZ, 0x3e800000}, {1, RZ, 0x3f000000}, {8, 0, 0x3f400000}};
+        for (int k = 0; k < 3; k++) {
+            uint32_t b = st[k].b == RZ ? RZ : v;
+            emit(l, base(l, 0x5800000000000000ull, f, v) | ((uint64_t)b << 20) | ((uint64_t)PT << 39) | ((uint64_t)st[k].cmp << 48) |
+                        ((uint64_t)1 << 52));
+            emit(l, 0x0c00000000000000ull | l->pred | d | ((uint64_t)f << 8) | ((uint64_t)st[k].w << 20) | ((uint64_t)d << 0));
+        }
+        mov_imm(l, f, 0);
     }
-    mov_imm(l, d + 3, 0x3f800000);
     for (uint32_t i = 0; i < 3; i++) {   // c + i = ctaid.i * local.i + tid.i
         emit(l, 0xf0c8000000000000ull | l->pred | (c + i) | ((uint64_t)(33 + i) << 20));   // SR_TID.X+i
         emit(l, 0xf0c8000000000000ull | l->pred | t | ((uint64_t)(37 + i) << 20));         // SR_CTAID.X+i

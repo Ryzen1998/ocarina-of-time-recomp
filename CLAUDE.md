@@ -85,7 +85,7 @@ the depth texels; the fog's volume is still NaN for another cause.
 crash dump's memory and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`),
 `build/logs/nvn-proc-got.json` (GOT slot -> proc name, from the loader at `main+0x129e290`), `--probe-tensor` and
 `--probe-cs` (a kernel in isolation), `OOT_DUMP=dispatch`, `OOT_SKIP_DISPATCH_FROM`, `OOT_MQ_LOG`, `OOT_THREAD_DUMP`,
-`OOT_SM86_PROBE=<code hash>:<offset>:<register>` (one register's NaN / sign per thread into a compute program's storage
+`OOT_SM86_PROBE=<code hash>:<offset>:<register>` (one register's state (zero, positive, negative, NaN, not reached) per thread into a compute program's storage
 image; read its comment in `sm86_lower.c` first: run it with a warm cache that lacks only that program, or the device
 is lost). `tools/kernel.py` and `tools/run.py` also run under native Windows Python (MSYS2 UCRT64 gcc for the tool).
 
