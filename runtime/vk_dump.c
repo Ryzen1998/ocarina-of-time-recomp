@@ -509,7 +509,7 @@ typedef struct { VkPipeline p; uint64_t th; int draws; char *text; } Ent;
 static Ent ents[MAX_ENTS];
 static int nents, ents_over, pass_draws;
 static int last_ent;                   // the pipe entry of the latest draw, for its "draw n of pass" line
-typedef struct { VkImage image; VkFormat format; uint32_t w, h, d; int id, is2d; } Lut;
+typedef struct { VkImage image; VkFormat format; uint32_t w, h, d, layers; int id, is2d; } Lut;
 static Lut luts[MAX_LUTS];          // queued for the next pass end or dispatch
 static int nluts;
 static VkImage luts_done[MAX_LUTS];
@@ -521,8 +521,8 @@ static void queue_lut(const VkTexImage *t, int id) {
         if (luts_done[i] == t->image) return;
     if (nluts_done == MAX_LUTS) return;
     luts_done[nluts_done++] = t->image;
-    luts[nluts++] = (Lut){t->image, t->format, t->width, t->height, t->type == VK_IMAGE_TYPE_3D ? t->depth : 1, id,
-                          t->type != VK_IMAGE_TYPE_3D};
+    luts[nluts++] = (Lut){t->image, t->format, t->width, t->height, t->type == VK_IMAGE_TYPE_3D ? t->depth : 1,
+                          t->type == VK_IMAGE_TYPE_3D ? 1 : t->layers, id, t->type != VK_IMAGE_TYPE_3D};
 }
 
 // The uncompressed format of a BC format's block size, UNDEFINED for other formats: a BC texture is dumped as its raw
@@ -539,15 +539,25 @@ static void flush_luts(VkExec *ex, int n) {
     char fn[16];
     for (int i = 0; i < nluts; i++) {
         const Lut *l = &luts[i];
-        char name[160];
         VkFormat bf = block_format(l->format);
-        snprintf(name, sizeof name, "pass_%04d_%s%d_%ux%ux%u_%d_%s%s", n, l->is2d ? "tex" : "lut", l->id, l->w, l->h, l->d,
-                 (int)l->format, fmt_name(l->format, fn), bf ? "_blocks" : "");
-        const char *why = bf ? copy_region(ex, l->image, bf, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 0,
-                                           (VkExtent3D){l->w, l->h, l->d}, (l->w + 3) / 4, (l->h + 3) / 4, l->d, name)
-                             : copy_out(ex, l->image, l->format, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, l->w, l->h, l->d, name);
-        fprintf(passes_f, "  %s tex %d -> %s.png%s%s\n", l->is2d ? "2D" : "3D", l->id, name, why ? " skipped: " : "",
-                why ? why : "");
+        // Depth textures (OOT_DUMP_TEX of a shadow map) are copied from their depth aspect, every layer (up to 8) of an
+        // array as _L<n>; colour textures as before, layer 0.
+        int depth = l->format == VK_FORMAT_D16_UNORM || l->format == VK_FORMAT_D32_SFLOAT ||
+                    l->format == VK_FORMAT_D24_UNORM_S8_UINT || l->format == VK_FORMAT_D32_SFLOAT_S8_UINT ||
+                    l->format == VK_FORMAT_X8_D24_UNORM_PACK32;
+        uint32_t nl = depth && l->layers > 1 ? (l->layers < 8 ? l->layers : 8) : 1;
+        for (uint32_t layer = 0; layer < nl; layer++) {
+            char name[160], ls[16] = "";
+            if (nl > 1) snprintf(ls, sizeof ls, "_L%u", layer);
+            snprintf(name, sizeof name, "pass_%04d_%s%d_%ux%ux%u_%d_%s%s%s", n, l->is2d ? "tex" : "lut", l->id, l->w, l->h,
+                     l->d, (int)l->format, fmt_name(l->format, fn), bf ? "_blocks" : "", ls);
+            const char *why = bf ? copy_region(ex, l->image, bf, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 0,
+                                               (VkExtent3D){l->w, l->h, l->d}, (l->w + 3) / 4, (l->h + 3) / 4, l->d, name)
+                                 : copy_out(ex, l->image, l->format, depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT,
+                                            0, layer, l->w, l->h, l->d, name);
+            fprintf(passes_f, "  %s tex %d -> %s.png%s%s\n", l->is2d ? "2D" : "3D", l->id, name, why ? " skipped: " : "",
+                    why ? why : "");
+        }
     }
     nluts = 0;
 }
@@ -748,13 +758,16 @@ static void state_line(Str *b, const VkExec *ex, const VkPipeState *s) {
            ex->vp[0][5]);
     if (ex->has_scissor) sp(b, "; scissor %d,%d %dx%d", ex->scissor.x, ex->scissor.y, ex->scissor.w, ex->scissor.h);
     sp(b, "; depth range %g..%g", ex->depth_range[0], ex->depth_range[1]);
-    for (int t = 0; t < 2; t++)   // the first two targets' blend functions (NVN_BLEND_FUNC_* and NVN_BLEND_EQUATION_*)
+    // The first two targets' blend functions: NVN_BLEND_FUNC_* (0x61..0x64 the constant colour and alpha) and
+    // NVN_BLEND_EQUATION_* (1 add, 2 sub, 3 reverse sub, 4 min, 5 max), then the blend constant.
+    static const char *const eqn[6] = {"?", "+", "-", "r-", "min", "max"};
+    for (int t = 0; t < 2; t++)
         if (s->color.blend_en >> t & 1)
             sp(b, "; blend%d rgb %u*src %s %u*dst, a %u*src %s %u*dst", t, (unsigned)s->blend[t].src_rgb,
-               s->blend[t].eq_rgb == 0 ? "+" : s->blend[t].eq_rgb == 1 ? "-" : s->blend[t].eq_rgb == 2 ? "r-" : s->blend[t].eq_rgb == 3 ? "min" : "max",
-               (unsigned)s->blend[t].dst_rgb, (unsigned)s->blend[t].src_a,
-               s->blend[t].eq_a == 0 ? "+" : s->blend[t].eq_a == 1 ? "-" : s->blend[t].eq_a == 2 ? "r-" : s->blend[t].eq_a == 3 ? "min" : "max",
-               (unsigned)s->blend[t].dst_a);
+               eqn[s->blend[t].eq_rgb < 6 ? s->blend[t].eq_rgb : 0], (unsigned)s->blend[t].dst_rgb, (unsigned)s->blend[t].src_a,
+               eqn[s->blend[t].eq_a < 6 ? s->blend[t].eq_a : 0], (unsigned)s->blend[t].dst_a);
+    if (s->color.blend_en)
+        sp(b, "; blend constant %g %g %g %g", ex->blend_color[0], ex->blend_color[1], ex->blend_color[2], ex->blend_color[3]);
     if (s->color.logic_op) sp(b, "; logic op %u", (unsigned)s->color.logic_op);
     sp(b, "\n");
     for (int i = 0; i < 16; i++) {

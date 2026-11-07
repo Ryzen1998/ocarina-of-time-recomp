@@ -88,6 +88,7 @@ void sm86_lower_free(Sm86Lowered *out);
 #define SM86_COUNT_MAX 64u
 // Nonzero for a program a diagnostic (OOT_SM86_PROBE, OOT_SM86_COUNT) changes: a tag of the setting, which the host
 // mixes into that program's cache key, so the probed lowering never comes from the cache nor goes into the normal entry.
+// Also nonzero, a fixed tag, for programs whose lowering changed without a KEY_VERSION bump (a BRXU, 2026-11-09).
 uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size);
 // The OOT_SM86_COUNT entries (n of them) as labels for the log ("6a00=p3"), NULL when off.
 const char (*sm86_count_points(uint32_t *n))[16];

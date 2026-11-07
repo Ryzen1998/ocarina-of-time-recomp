@@ -253,6 +253,46 @@ Commands (one GPU run at a time, count nvlddmkm events after each):
 Then the fog kernel 1a62084a (`OOT_SKIP_CS=1a62084a` in every test run): ~60% NaN volume when it runs (Status
 2026-11-07); start from `OOT_SM86_PROBE` / `OOT_SM86_COUNT` on it with a warm cache, as described there.
 
+### Status (2026-11-09, night): the ambient light cube was black — a jump table the translator could not follow
+
+Found with three dumps (run-200 to run-203, all frame 4900, 0 driver resets):
+
+- **The cause of most of the darkness.** The level's ambient/reflection light is a 128x128 cube (tex 753 in run-200)
+  that 175 draws of the frame sample. The game renders one face of a capture cube per frame (passes ~0090) and a
+  filter pass blends it into the light cube level by level (`fs ea1f57f5`, blend 0.2*src + 0.8*dst, the blend
+  constant now printed in the dump). The filter's vertex program (`cb9f78977313150b` input) picks the face direction
+  with a `switch` on the face index: `ULDC` of the jump table in c1, then `BRXU` (0x958). We lowered it to a Maxwell
+  BRX on a uniform register's home; the translator only finds BRX targets by matching an LDC from c1 guarded by a
+  bounds-check branch, this program clamps with `USEL` instead, so it logged "Failed to find targets for BRX
+  instruction" and dropped the rest of the program: every vertex at (0,0,0,1), nothing drawn, the light cube stayed
+  zero for ever. 24 cached translations had the note: 12 vertex (this program under different answers) and 12 compute
+  (`865cee2bf198d6f1` and variants).
+- **Fix** (`sm86_lower.c` lower_brx): a BRXU with a known jump-table record becomes a compare chain on the loaded
+  value (ISETP.EQ on a free predicate + predicated BRA per entry, a plain BRA to the last), and its table in c1 keeps
+  the native offsets. BRX (0x949) is unchanged (the fragment programs' tables are matched fine). No KEY_VERSION bump:
+  programs with a BRXU get their own cache key through `sm86_probe_tag`, so only those are translated again (a bump
+  would translate the whole cache in a run). Checked: the compute program validates (spirv-val) and its SPIR-V grew
+  from 2,425 to 3,274 words; in the game the cube chain is non-zero at every level (1x1 = 0.18 0.14 0.10, no NaN), no
+  "Failed to find targets" left, screenshot `build/logs/brxu-on.png` (Saria close-up) noise 0.31, skin and hands lit,
+  ~43 fps.
+- **Also fixed:** a depth texture read without a compare kept the game's compare sampler (`vk_texture.c`
+  vk_sampler_point_by_id_locked); Vulkan leaves that undefined (the forward pass reads a 4096x4096 d16 map so).
+  `OOT_POINT_CMP=1` restores the old behaviour. Not measured separately.
+- **Dump tools:** `OOT_DUMP_TEX` copies depth textures from their depth aspect, every layer of an array (`_L<n>`);
+  the blend line names NVN's equations right (1 is add, the dump printed it as "-") and prints the blend constant.
+
+Still open, in order:
+1. **The three shadow cascades (1600x1600 d16 array) stay empty** (all 1.0, also as the next frame's compute pass
+   finds them), though ~100 draws per frame target them (vertex draws and indirect mesh draws without a task stage).
+   An empty map reads "lit", so this does not darken, but there are no sun shadows. Next: per-draw depth of one
+   cascade pass (`OOT_DUMP_DRAWS=<pass>` works on colour target 0 only: extend it to depth) and the draws' positions.
+2. **The compute variants of the same BRXU programs** also drop `RED.ADD.F32.FTZ.RN` ("Invalid reduction type:
+   F32FtzRn" in the translator notes): float atomic adds are lost. Find which kernel `865cee2bf198d6f1` is and add the
+   reduction to the translator (a patch) if it matters for the picture.
+3. Scenes may still be darker than on the console; compare with a reference picture of the same shot before chasing
+   exposure.
+4. Then the fog kernel 1a62084a, as planned.
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count

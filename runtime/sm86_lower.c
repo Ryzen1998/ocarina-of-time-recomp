@@ -124,6 +124,7 @@ typedef struct {
     uint8_t ur_whole[64];                          // a use before its first definition: live over the whole program
     int scanned;                                   // needs_reg is final: a read of another register is a scan bug
     uint32_t used_preds;                           // predicates the program touches (bit n = Pn)
+    uint32_t brx_chain[16], nbrx_chain;            // native indices of the BRXs lowered as compare chains (lower_brx)
     uint8_t up_map[8];                             // uniform predicate -> predicate (0xff unmapped, 7 = UPT)
     int force_swap;                                // up_swap although predicates are free (a retry)
     int up_swap;                                   // no predicate is free: UPn lives in bit n of up_reg and is
@@ -3213,6 +3214,33 @@ static void lower_brx(L *l, const Insn *x, uint32_t op) {
         return (void)fail(l, "BRX mode");
     if ((int64_t)l->index * 16 + 16 + sext(raw, 50) != 0) return (void)fail(l, "BRX relative base");
     uint32_t src = op == 0x958 ? ur(l, bits(x, 24, 8)) : bits(x, 24, 8);
+    // BRXU (the target loaded from c1 into a uniform register, ULDC c[1][UR]) with a known jump table: a compare
+    // chain on the loaded value, one ISETP.EQ + predicated BRA per entry and a plain BRA to the last, and c1 keeps
+    // the table's native offsets (sm86_lower_ex skips its record). The translator finds a BRX's targets only by
+    // matching an LDC from c1 guarded by a bounds-check branch; the uniform form clamps its index with USEL and
+    // left it "Failed to find targets for BRX", dropping the rest of the program (2026-11-09: the reflection
+    // probe's cube-face vertex program 0xcb9f7897, its six faces at position 0 and the level's ambient cube
+    // black, and 12 compute kernels).
+    uint32_t tg[64], nt = op == 0x958 ? brx_targets(l, l->index, tg, 64) : 0;
+    if (nt && l->nbrx_chain < 16 && !l->up_swap) {
+        uint32_t k = 0, mapped = 0;
+        for (int u = 0; u < 7; u++) if (l->up_map[u] != 0xff) mapped |= 1u << l->up_map[u];
+        while (k < 7 && ((l->used_preds | mapped) >> k & 1)) k++;
+        if (k == 7) return (void)fail(l, "BRX chain: no predicate free");
+        l->used_preds |= 1u << k;
+        for (uint32_t e = 0; e < nt; e++)
+            if (tg[e] * 16 >= 0x80000) return (void)fail(l, "BRX chain: entry offset");
+        for (uint32_t e = 0; e + 1 < nt; e++) {
+            emit(l, 0x3660000000000000ull | ((uint64_t)7 << 16) | 7 | ((uint64_t)k << 3) | ((uint64_t)src << 8) |
+                        ((uint64_t)(tg[e] * 16) << 20) | ((uint64_t)7 << 39) | ((uint64_t)2 << 49));   // ISETP.EQ Pk, src, entry
+            reloc(l, tg[e]);
+            emit(l, 0xe24000000000000full | ((uint64_t)k << 16));                                     // @Pk BRA entry
+        }
+        reloc(l, tg[nt - 1]);
+        emit(l, 0xe24000000000000full | ((uint64_t)7 << 16));
+        l->brx_chain[l->nbrx_chain++] = l->index;
+        return;
+    }
     int64_t offset = -(int64_t)addr_of(l, l->nout) - 8;
     if (offset < -0x800000) return (void)fail(l, "BRX range");
     l->has_brx = 1;
@@ -3606,6 +3634,14 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
         if (strtoull(e, NULL, 16) != h) continue;
         tag ^= fnv64((const uint8_t *)e, (uint32_t)strlen(e)) ^ (uint64_t)(i + 1);
     }
+    // A program with a BRXU (0x958) lowers differently since 2026-11-09 (lower_brx: a compare chain): its own key, so
+    // the translations cached before (the rest of the program dropped) are not used, without a KEY_VERSION bump that
+    // would translate every program again. A word of the header or c1 that looks like one only costs a translation.
+    for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
+        uint32_t w0, w2;
+        memcpy(&w0, code + i, 4), memcpy(&w2, code + i + 8, 4);
+        if ((w0 & 0xfff) == 0x958 && (w2 & ~0x3ffffu) == 0x0b800000u) { tag ^= 0x6272787563686e31ull; break; }   // "brxuchn1"
+    }
     return tag;
 }
 
@@ -3849,6 +3885,9 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
                 memcpy(rec, control + SM86_CONTROL_MIN + 4 + r * 16, 16);
                 uint32_t entries = rec[1], at = rec[3];
                 if (at + entries * 4 > c.c1_len) { fail(&l, "jump-table record"); break; }
+                int chained = 0;   // a BRXU lowered as a compare chain compares the table's native offsets
+                for (uint32_t b = 0; b < l.nbrx_chain; b++) chained |= rec[0] == l.brx_chain[b] * 16;
+                if (chained) continue;
                 for (uint32_t e = 0; e < entries; e++) {
                     uint32_t v;
                     memcpy(&v, out->c1 + at + e * 4, 4);

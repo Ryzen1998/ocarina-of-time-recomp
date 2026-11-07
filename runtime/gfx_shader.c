@@ -1181,7 +1181,8 @@ static int build_code_hash(int stage, const uint8_t *control, uint32_t ctl_size,
     memcpy(p, code, (size_t)code_size), p += code_size;
     rt_sha256(buf, total, hash);
     free(buf);
-    // OOT_SM86_PROBE / OOT_SM86_COUNT: the probed program gets its own key (its lowering differs), the others keep theirs.
+    // OOT_SM86_PROBE / OOT_SM86_COUNT: the probed program gets its own key (its lowering differs), the others keep theirs;
+    // so do programs whose lowering changed without a KEY_VERSION bump (sm86_probe_tag: BRXU, 2026-11-09).
     uint64_t tag = sm86_probe_tag(code, (uint32_t)code_size);
     for (int i = 0; i < 8 && tag; i++) hash[i] ^= (uint8_t)(tag >> (8 * i));
     return 1;

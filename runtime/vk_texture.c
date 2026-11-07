@@ -1865,6 +1865,13 @@ VkSampler vk_sampler_point_by_id_locked(int id) {
         k.minf = k.minf == NVN_MIN_FILTER_LINEAR ? NVN_MIN_FILTER_NEAREST :
                  k.minf > NVN_MIN_FILTER_LINEAR ? NVN_MIN_FILTER_NEAREST_MIPMAP_NEAREST : k.minf;
         k.aniso = 1;
+        // The caller (vk_exec_draw.c, image bindings) uses this form for a depth texture the shader reads without a
+        // compare. The game binds its compare sampler there too (the level's 4096x4096 d16 map in the forward pass,
+        // 2026-11-09); Maxwell ignores the sampler's compare for a TEX without .DC, but Vulkan leaves a non-Dref
+        // sample through a compare sampler undefined. OOT_POINT_CMP=1 keeps the compare (the old behaviour).
+        static int keep_cmp = -1;
+        if (keep_cmp < 0) { const char *e = getenv("OOT_POINT_CMP"); keep_cmp = e && *e == '1'; }
+        if (!keep_cmp) k.cmp_mode = 0, k.cmp_func = 0;
         s->sp = sampler_for(c, &k);
     }
     return s->sp;
