@@ -48,11 +48,11 @@ void sm86_lower_free(Sm86Lowered *out);
 // task draw is mesh i = g & MASK of task t = g >> SHIFT; one whose i is not below its task's count stores a primitive
 // count of 0 and exits at once. Without a task program the host gives SHIFT 31, MASK ~0 and a task record with count
 // ~0.
-#define SM86_MESH_C0_MESH  0x6c0u   // u64 the mesh records
-#define SM86_MESH_C0_TASK  0x6c8u   // u64 the task records
-#define SM86_MESH_C0_MASK  0x6d0u   // u32
-#define SM86_MESH_C0_SHIFT 0x6d4u   // u32
-#define SM86_MESH_C0_END   0x6e0u
+#define SM86_MESH_C0_MESH  0x6c0u   // {u64 address, u32 size} of the mesh records, as a storage table entry
+#define SM86_MESH_C0_TASK  0x6d0u   // {u64 address, u32 size} of the task records
+#define SM86_MESH_C0_MASK  0x6e0u   // u32
+#define SM86_MESH_C0_SHIFT 0x6e4u   // u32
+#define SM86_MESH_C0_END   0x6f0u
 #define SM86_TASK_STRIDE   0x100u
 #define SM86_MESH_STRIDE   0x8000u
 #define SM86_MESH_STRIDE_LOG2 15u
@@ -67,7 +67,8 @@ typedef struct {
     uint32_t code_size;        // the whole code block (+0x44)
     uint32_t stage;            // NVN's enum at byte +0x56: 0 vertex, 1 fragment, 2 geometry, 3 tess control,
                                // 4 tess eval, 5 compute, 6 task, 7 mesh
-    uint32_t local[3];         // compute: the workgroup size (+0x58)
+    uint32_t local[3];         // compute: the workgroup size (+0x58); task and mesh: {the low half of +0x58, 1, 1} (the
+                               // high halves of +0x58..+0x63 hold the output limits there)
 } Sm86Control;
 // 0 when the magic or the bounds are wrong.
 int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Control *c);

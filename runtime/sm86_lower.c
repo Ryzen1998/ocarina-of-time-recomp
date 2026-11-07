@@ -52,6 +52,7 @@ int sm86_control_parse(const uint8_t *control, uint32_t control_size, Sm86Contro
     memcpy(&c->code_size, control + 0x44, 4);
     c->stage = control[0x56];
     memcpy(c->local, control + 0x58, 12);
+    if (c->stage == 6 || c->stage == 7) c->local[0] &= 0xffff, c->local[1] = c->local[2] = 1;
     if (c->size < SM86_CONTROL_MIN || c->size > control_size) c->size = SM86_CONTROL_MIN;
     uint32_t header = c->stage == 5 ? 0 : SM86_HEADER;
     if (c->stage > 7 || c->code_end <= header || c->code_end % 16 || c->c1_off < c->code_end ||

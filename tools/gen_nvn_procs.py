@@ -217,6 +217,8 @@ NVN2_OOT = [
     "nvnProgramBuilderGetRayTracingModuleData", "nvnProgramBuilderSetSubroutineLinkage",
     "nvnProgramBuilderGetSubroutineLinkage", "nvnProgramBuilderGetSubroutineLinkageCount",
     "nvnProgramBuilderGetDebugDataHashes", "nvnProgramInitializeFromBuilder",
+    # the mesh draws (nvn_api_cmd.c): the level's ground is drawn through them
+    "nvnCommandBufferDrawMeshTasks", "nvnCommandBufferDrawMeshTasksIndirect",
 ]
 
 

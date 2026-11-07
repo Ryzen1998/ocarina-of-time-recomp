@@ -43,7 +43,7 @@
 #define NVN_STAGE_CS 5
 #define ONESHOT_WAIT_MS 30000u   // prepare_draw: how long a one-shot draw waits for its pipeline before it is skipped
 
-enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_COUNT };
+enum { W_PROGRAM, W_SHADER, W_PIPELINE, W_NO_VS, W_INDEX, W_UB, W_BIND, W_SSBO_ALIGN, W_SSBO_SLOT, W_RESTART, W_INDIRECT, W_MESH, W_COUNT };
 
 static void warn_once(int key, const char *fmt, ...) {
     static volatile long seen[W_COUNT];
@@ -937,6 +937,30 @@ static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *ns, uint32
     return 1;
 }
 
+// ---- mesh draws (op_draw_mesh): the task and mesh programs run as compute programs (sm86_lower.c lower_isbe) on
+// records in one device-local buffer, the task records first. While M.on, the compute bank 0 also carries the record
+// table entries and the split (sm86_lower.h SM86_MESH_C0_*), and those two storage bindings are the records. The
+// addresses in bank 0 are stand-ins: the translated program subtracts the entry's address from the one it computes, so
+// only the binding matters.
+#define MESH_FAKE_TASK 0x7e0000000000ull
+#define MESH_FAKE_MESH 0x7f0000000000ull
+static struct {
+    int on;
+    uint32_t shift;
+    VkBuffer buf;
+    VmaAllocation mem;
+    VkDeviceSize cap, task_size, mesh_size;   // the mesh records follow the task records
+} M;
+
+static void mesh_c0(uint8_t bank[VK_C0_BYTES]) {
+    uint64_t a = MESH_FAKE_MESH;
+    uint32_t sz = (uint32_t)M.mesh_size, shift = M.shift, mask = shift >= 31 ? ~0u : (1u << shift) - 1;
+    memcpy(bank + SM86_MESH_C0_MESH, &a, 8), memcpy(bank + SM86_MESH_C0_MESH + 8, &sz, 4);
+    a = MESH_FAKE_TASK, sz = (uint32_t)M.task_size;
+    memcpy(bank + SM86_MESH_C0_TASK, &a, 8), memcpy(bank + SM86_MESH_C0_TASK + 8, &sz, 4);
+    memcpy(bank + SM86_MESH_C0_MASK, &mask, 4), memcpy(bank + SM86_MESH_C0_SHIFT, &shift, 4);
+}
+
 static uint32_t ptr_count(int st);
 static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
 
@@ -1004,6 +1028,7 @@ static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
     uint8_t tmp[VK_C0_BYTES];
     if (nvn2) nvn2_c0_fill_cs(ex, tmp);
     else vk_c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
+    if (M.on && st == NVN_STAGE_CS) mesh_c0(tmp);   // op_draw_mesh clears c0_valid, so no stale bank is reused
     if (!B.c0_valid[k] || memcmp(tmp, B.c0[k], VK_C0_BYTES)) {
         memcpy(scratch(ex, VK_C0_BYTES, &B.c0_buf[k], &B.c0_off[k]), tmp, VK_C0_BYTES);
         memcpy(B.c0[k], tmp, VK_C0_BYTES);
@@ -1186,6 +1211,11 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
     int pi;
+    if (M.on && st == NVN_STAGE_CS && r->cbuf_slot == 0) {   // op_draw_mesh: the records
+        uint32_t off = (uint32_t)r->handle * 4;
+        if (off == SM86_MESH_C0_TASK) return (VkDescriptorBufferInfo){M.buf, 0, M.task_size};
+        if (off == SM86_MESH_C0_MESH) return (VkDescriptorBufferInfo){M.buf, M.task_size, M.mesh_size};
+    }
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
     else if ((pi = ptr_res(ex, st, r)) >= 0) up.addr = ptr_value(ex, st, (uint32_t)pi), b = &up;   // the same
@@ -3102,6 +3132,187 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});
 }
 
+// ---- OP_DRAW_MESH / OP_DRAW_MESH_IND (nvn_api_cmd.c DrawMeshTasks*): step 2 of docs/phase3.md "the mesh stages":
+// the task program (if the bound program has one) and the mesh program run as compute programs on the records (M);
+// nothing is drawn from them yet. A task draw of n tasks dispatches n task workgroups, then n << MESH_SHIFT mesh
+// workgroups (each beyond its task's count exits at once: sm86_lower.c mesh_prologue); a mesh-only draw of n
+// dispatches n mesh workgroups. Indirect draws are not run yet: their argument layout is not known, and a wrong
+// guess could launch a huge grid; OOT_MESH_LOG=1 reads their first 16 bytes back instead, and the record heads of
+// the direct draws, the first 40 of each.
+#define MESH_SHIFT 4u
+#define MESH_MAX_TASKS 4096u
+static const NVNshaderData *stage_entry(const prog_t *p, int st);
+
+static struct { VkBuffer buf; VmaAllocation mem; uint32_t *map; uint32_t next; } MRB;   // OOT_MESH_LOG read-back
+typedef struct { uint32_t slot, kind, a, b; } MeshRead;
+static void mesh_read(void *arg) {
+    MeshRead *r = arg;
+    const uint32_t *v = MRB.map + 16 * r->slot;
+    if (r->kind)
+        rt_log("meshlog: indirect mesh draw (%u): args %#x %#x %#x %#x", r->a, v[0], v[1], v[2], v[3]);
+    else
+        rt_log("meshlog: mesh draw of %u tasks, %u mesh groups: task 0 words %#x %#x %#x %#x; primitive counts of groups "
+               "0-7: %u %u %u %u %u %u %u %u; group 0 vertex 0: %g %g %g %g", r->a, r->b, v[0], v[1], v[2], v[3], v[4],
+               v[5], v[6], v[7], v[8], v[9], v[10], v[11], *(const float *)&v[12], *(const float *)&v[13],
+               *(const float *)&v[14], *(const float *)&v[15]);
+    free(r);
+}
+// A read-back slot of 16 words for the next OOT_MESH_LOG line, or -1.
+static int mesh_rb_slot(void) {
+    static int on = -1;
+    static volatile LONG n;
+    if (on < 0) {
+        on = getenv("OOT_MESH_LOG") != NULL;
+        if (on) {
+            VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 64 * 64,
+                                     .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+            VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                          .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                          .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+            VmaAllocationInfo info;
+            if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &MRB.buf, &MRB.mem, &info) == VK_SUCCESS) MRB.map = info.pMappedData;
+            else on = 0;
+        }
+    }
+    if (!on || InterlockedIncrement(&n) > 80) return -1;
+    return (int)(MRB.next++ % 64);
+}
+static void mesh_rb_done(VkExec *ex, int slot, uint32_t kind, uint32_t a, uint32_t b) {
+    MeshRead *r = malloc(sizeof *r);
+    if (!r) return;
+    *r = (MeshRead){(uint32_t)slot, kind, a, b};
+    vk_completion_add(ex->fence, mesh_read, r);
+}
+
+// The record buffer, grown when a draw needs more; the old one goes after the submission being recorded.
+static int mesh_buffer(VkDeviceSize task_bytes, VkDeviceSize mesh_bytes) {
+    VkDeviceSize need = task_bytes + mesh_bytes;
+    if (need > M.cap) {
+        VkDeviceSize want = M.cap ? M.cap * 2 : 8u << 20;
+        while (want < need) want *= 2;
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = want,
+                                 .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                          VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        VkBuffer nb;
+        VmaAllocation nm;
+        if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &nb, &nm, NULL) != VK_SUCCESS) return 0;
+        if (M.buf) {
+            TwinBuf *old = malloc(sizeof *old);
+            if (!old) rt_fatal("vk: out of memory (mesh records)");
+            *old = (TwinBuf){M.buf, M.mem};
+            vk_completion_add(vk_sync_issued() + 1, twin_buf_free, old);
+        }
+        M.buf = nb, M.mem = nm, M.cap = want;
+    }
+    M.task_size = task_bytes, M.mesh_size = mesh_bytes;
+    return 1;
+}
+
+// One stage (m 0 task, 1 mesh) as a compute dispatch of `groups` workgroups: its resources and program in the
+// compute slots for the length of the dispatch.
+static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
+    const int cs_st = NVN_STAGE_CS;
+    static p_bind_buf su[18], ss[16];
+    static uint64_t stx[128], ssp[128], sim[32];
+    memcpy(su, ex->ubo[cs_st], sizeof su), memcpy(ss, ex->ssbo[cs_st], sizeof ss);
+    memcpy(stx, ex->tex[cs_st], sizeof stx), memcpy(ssp, ex->samp[cs_st], sizeof ssp), memcpy(sim, ex->img[cs_st], sizeof sim);
+    const prog_t *sprog = ex->prog;
+    uint32_t spush = ex->push_cc_len;
+    memcpy(ex->ubo[cs_st], ex->mubo[m], sizeof su), memcpy(ex->ssbo[cs_st], ex->mssbo[m], sizeof ss);
+    memcpy(ex->tex[cs_st], ex->mtex[m], sizeof stx), memcpy(ex->samp[cs_st], ex->msamp[m], sizeof ssp);
+    memcpy(ex->img[cs_st], ex->mimg[m], sizeof sim);
+    ex->prog = ex->mesh_prog[m], ex->push_cc_len = 0, ex->tex_serial++, bind_gen++;
+    int ok = 0;
+    const NVNshaderData *e = stage_entry(ex->prog, 6 + m);
+    const GfxShader *cs = NULL;
+    if (e) {
+        const uint8_t *ctl = e->control, *code = (const uint8_t *)(uintptr_t)e->data;
+        uint32_t len;
+        memcpy(&len, ctl + 0x44, 4);
+        GfxShaderAnswers a;
+        answers_for(ex, cs_st, ctl, 0, &a);
+        cs = gfx_shader_get(GFX_STAGE_CS, ctl, code, len, NULL, &a);
+        if (!cs) warn_once(W_MESH, "a %s program failed to translate: mesh draws with it are skipped", m ? "mesh" : "task");
+    }
+    if (cs && !skip_cs(cs)) {
+        C1CUR[cs_st] = cs;
+        const VkPipeInfo *info = NULL;
+        VkPipeline p = vk_pipeline_compute(cs, &info);
+        if (p && info) {
+            vk_exec_barrier(ex);
+            bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+            c0_dim[0] = groups, c0_dim[1] = c0_dim[2] = 1;
+            B.c0_valid[2] = 0;
+            bind_resources(ex, info);
+            vkCmdDispatch(ex->cb, groups, 1, 1);
+            ex->recorded++;
+            ok = 1;
+        }
+    }
+    B.c0_valid[2] = 0;   // the next dispatch gets a bank without the record entries
+    memcpy(ex->ubo[cs_st], su, sizeof su), memcpy(ex->ssbo[cs_st], ss, sizeof ss);
+    memcpy(ex->tex[cs_st], stx, sizeof stx), memcpy(ex->samp[cs_st], ssp, sizeof ssp), memcpy(ex->img[cs_st], sim, sizeof sim);
+    ex->prog = sprog, ex->push_cc_len = spush, ex->tex_serial++, bind_gen++;
+    return ok;
+}
+
+static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {
+    // OOT_MESH=1 (default off): run the stages. The first run with them lost the device on the first direct mesh draws
+    // of the title (2026-11-07, run-68, cause not known yet), so they stay off until that is understood.
+    static int on = -1;
+    if (on < 0) on = rt_knob("MESH", "0");
+    if (!on) return;
+    const prog_t *task = ex->mesh_prog[0], *mesh = ex->mesh_prog[1];
+    if (!mesh || !stage_entry(mesh, 7)) return warn_once(W_MESH, "a mesh draw without a mesh program is skipped");
+    int has_task = task && stage_entry(task, 6) != NULL;
+    cb_res(ex);
+    dummies_init();
+    if (indirect) {   // not run yet: the arguments read back for OOT_MESH_LOG
+        VkMemSpan ip;
+        int slot = mesh_rb_slot();
+        if (slot < 0 || !vk_mem_resolve(d->ind, 16, &ip)) return;
+        vk_exec_barrier(ex);
+        VK_MEM_PICK(ip);
+        VkBufferCopy cp = {ip.offset, (VkDeviceSize)slot * 64, 16};
+        vkCmdCopyBuffer(ex->cb, ip.buffer, MRB.buf, 1, &cp);
+        ex->recorded++;
+        vk_exec_barrier(ex);
+        mesh_rb_done(ex, slot, 1, (uint32_t)d->count, 0);
+        return;
+    }
+    if (d->first != 0 || d->count <= 0 || (uint32_t)d->count > MESH_MAX_TASKS)
+        return warn_once(W_MESH, "a mesh draw from %d of %d task groups is skipped", d->first, d->count);
+    uint32_t tasks = has_task ? (uint32_t)d->count : 1, shift = has_task ? MESH_SHIFT : 31;
+    uint32_t groups = has_task ? tasks << shift : (uint32_t)d->count;
+    if (!mesh_buffer((VkDeviceSize)tasks * SM86_TASK_STRIDE, (VkDeviceSize)groups * SM86_MESH_STRIDE))
+        return warn_once(W_MESH, "no memory for %u mesh records: mesh draws are skipped", groups);
+    vk_exec_barrier(ex);
+    vkCmdFillBuffer(ex->cb, M.buf, 0, M.task_size, 0);   // a task record no task wrote asks for no meshes
+    if (!has_task) {
+        uint32_t w[2] = {0, ~0u};   // a mesh-only draw: one stand-in task that asks for every mesh group
+        vkCmdUpdateBuffer(ex->cb, M.buf, 0, sizeof w, w);
+    }
+    ex->recorded += 2;
+    M.on = 1, M.shift = shift;
+    int ok = !has_task || mesh_dispatch(ex, 0, tasks);
+    if (ok) ok = mesh_dispatch(ex, 1, groups);
+    M.on = 0;
+    vk_exec_barrier(ex);
+    int slot = ok ? mesh_rb_slot() : -1;
+    if (slot >= 0) {
+        VkBufferCopy cp[13];
+        VkDeviceSize o = (VkDeviceSize)slot * 64;
+        cp[0] = (VkBufferCopy){0, o, 16};
+        for (uint32_t g = 0; g < 8; g++)
+            cp[1 + g] = (VkBufferCopy){M.task_size + (VkDeviceSize)(g < groups ? g : 0) * SM86_MESH_STRIDE + SM86_MESH_MAP, o + 16 + 4 * g, 4};
+        for (uint32_t c = 0; c < 4; c++) cp[9 + c] = (VkBufferCopy){M.task_size + 0x80 * c, o + 48 + 4 * c, 4};
+        vkCmdCopyBuffer(ex->cb, M.buf, MRB.buf, 13, cp);
+        ex->recorded++;
+        mesh_rb_done(ex, slot, 0, tasks, groups);
+    }
+}
+
 // OP_PUSH_CC (NVN2 nvnCommandBufferPushComputeConstants): the pushed bytes into the compute stage's block, which
 // c0_info serves as constant bank 0 (the SM86 compute shaders' parameter block: sizes, scales, buffer addresses and
 // texture and image handles, each at the offsets the shader reads).
@@ -3146,7 +3357,7 @@ static uint64_t pool_handle(const VkExec *ex, uint64_t h, int kind) {
 }
 
 static void bind_handles(const VkExec *ex, uint64_t *dst, int cap, const p_bind_handles *b, int kind) {
-    if (b->stage < 0 || b->stage >= 6 || b->first < 0 || b->n < 0 || b->n > 32 || b->first + b->n > cap) {
+    if (!dst || b->stage < 0 || b->stage >= 8 || b->first < 0 || b->n < 0 || b->n > 32 || b->first + b->n > cap) {
         warn_once(W_BIND, "a bind of %d handles at %d of stage %d is out of range: ignored", b->n, b->first, b->stage);
         return;
     }
@@ -3211,6 +3422,8 @@ static const prog_t *combined_program(const prog_t *const sp[6]) {
 static void bind_program(VkExec *ex, const p_bind_program *b) {
     for (int st = 0; st < 6; st++)
         if (b->stages & (1 << st)) ex->stage_prog[st] = b->prog;
+    for (int st = 6; st < 8; st++)   // task and mesh (op_draw_mesh)
+        if (b->stages & (1 << st)) ex->mesh_prog[st - 6] = b->prog;
     ex->prog = combined_program(ex->stage_prog), ex->prog_stages = b->stages;
 }
 
@@ -3261,30 +3474,32 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_BIND_UBO: {
         const p_bind_buf *b = payload;
         if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 18) ex->ubo[b->stage][b->index] = *b;
+        else if ((b->stage == 6 || b->stage == 7) && b->index >= 0 && b->index < 18) ex->mubo[b->stage - 6][b->index] = *b;
         bind_gen++;
         break;
     }
     case OP_BIND_SSBO: {
         const p_bind_buf *b = payload;
         if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) ex->ssbo[b->stage][b->index] = *b;
+        else if ((b->stage == 6 || b->stage == 7) && b->index >= 0 && b->index < 16) ex->mssbo[b->stage - 6][b->index] = *b;
         bind_gen++;
         break;
     }
     case OP_BIND_TEX: {
         const p_bind_handles *b = payload;
-        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->tex[b->stage] : NULL, 128, b, 0);
+        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->tex[b->stage] : b->stage == 6 || b->stage == 7 ? ex->mtex[b->stage - 6] : NULL, 128, b, 0);
         ex->tex_serial++;
         bind_gen++;
         break;
     }
     case OP_BIND_SAMP: {
         const p_bind_handles *b = payload;
-        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->samp[b->stage] : NULL, 128, b, 1);
+        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->samp[b->stage] : b->stage == 6 || b->stage == 7 ? ex->msamp[b->stage - 6] : NULL, 128, b, 1);
         break;
     }
     case OP_BIND_IMG: {
         const p_bind_handles *b = payload;
-        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->img[b->stage] : NULL, 32, b, 2);
+        bind_handles(ex, b->stage >= 0 && b->stage < 6 ? ex->img[b->stage] : b->stage == 6 || b->stage == 7 ? ex->mimg[b->stage - 6] : NULL, 32, b, 2);
         ex->tex_serial++;   // the shader memo's handle check (feedback_scan reads only textures: a rescan at most)
         bind_gen++;
         break;
@@ -3297,6 +3512,7 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
     case OP_DRAW_IND: op_draw_ind(ex, payload); break;
     case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); ex->push_cc_len = 0; break;
+    case OP_DRAW_MESH: case OP_DRAW_MESH_IND: op_draw_mesh(ex, payload, op == OP_DRAW_MESH_IND); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }
 }

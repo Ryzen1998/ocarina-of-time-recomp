@@ -88,6 +88,11 @@ typedef struct VkExec {
     uint64_t tex[6][128], samp[6][128], img[6][32];   // OP_BIND_TEX / OP_BIND_SAMP / OP_BIND_IMG handles per stage
     uint8_t push_cc[0x800];              // OP_PUSH_CC (VK_C0_BYTES, defined below): the compute kernels' pushed constants (NVN2), read as bank 0
     uint32_t push_cc_len;                // bytes pushed so far (0: none, c0 is the driver bank)
+    // NVN2 task (6) and mesh (7) stages, index stage - 6: the program bound for them and their resources (vk_exec_draw.c
+    // op_draw_mesh runs them as compute programs with these in the compute slots)
+    const prog_t *mesh_prog[2];
+    p_bind_buf mubo[2][18], mssbo[2][16];
+    uint64_t mtex[2][128], msamp[2][128], mimg[2][32];
 
     // ---- vk_exec_xfer.c slots (render enable, conditional rendering): left empty by vk_exec.c
     int render_disabled;                 // OP_RENDER_ENABLE false or a failed OP_RENDER_COND: clears and draws skip

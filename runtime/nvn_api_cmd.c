@@ -674,9 +674,20 @@ static void draw_trace(Cpu *c, const char *what) {
     rt_log("nvn: %s under program %llu from %s at frame %llu", what, (unsigned long long)serial, ldr_describe(lr, buf, sizeof buf),
            (unsigned long long)frame);
 }
+static void mesh_log_bind(const char *what, int st, int first, uint64_t a, uint64_t b);
+static int mesh_log_on(void);
 NVN_API(nvnCommandBufferBindProgram) {
     bound_prog = arg_p(c, 1);
     *REC(cmd_of(c), OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){arg_p(c, 1), (int)arg_x(c, 2)};
+    {   // OOT_MESH_LOG: a program with a task or mesh stage
+        const prog_t *p = arg_p(c, 1);
+        int m = 0;
+        for (uint32_t i = 0; p && i < p->nstage && i < 6; i++) { const uint8_t *k = p->sd[i].control; if (k && k[0x56] >= 6) m |= 1 << k[0x56]; }
+        static volatile LONG nm;
+        if (m && mesh_log_on() && InterlockedIncrement(&nm) <= 30)
+            rt_log("meshlog: f%llu BindProgram %p stages %#x (task/mesh %#x) thread %lu cmd %p", (unsigned long long)gfx_stats().frames,
+                   (const void *)p, (unsigned)arg_x(c, 2), (unsigned)m, GetCurrentThreadId(), (const void *)cmd_of(c));
+    }
 }
 // void nvnCommandBufferBind{Blend,Color,ChannelMask,Multisample,Polygon,DepthStencil}State(NVNcommandBuffer *cmd,
 // const NVN*State *state): the state object's bytes are copied (p_bind_state.kind order)
@@ -744,6 +755,7 @@ static void bind_buffers(const Cpu *c, uint32_t op) {   // (cmd, stage, first, n
     for (int i = 0; i < n; i++) {
         *REC(o, op, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
         bind_log(op == OP_BIND_UBO ? "ubo[]" : "ssbo[]", st, first + i, n, rg[i].address, rg[i].size);
+        mesh_log_bind(op == OP_BIND_UBO ? "ubo" : "ssbo", st, first + i, rg[i].address, rg[i].size);
         hw_fix(o, 20);
     }
 }
@@ -769,6 +781,7 @@ static void bind_buffer(const Cpu *c, uint32_t op) {    // (cmd, stage, index, N
     cmd_t *o = cmd_of(c);
     *REC(o, op, p_bind_buf) = (p_bind_buf){(int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4)};
     bind_log(op == OP_BIND_UBO ? "ubo" : "ssbo", (int)arg_x(c, 1), (int)arg_x(c, 2), 1, arg_x(c, 3), arg_x(c, 4));
+    mesh_log_bind(op == OP_BIND_UBO ? "ubo" : "ssbo", (int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), arg_x(c, 4));
     hw_fix(o, 20);
 }
 NVN_API(nvnCommandBufferBindUniformBuffer) { bind_buffer(c, OP_BIND_UBO); }
@@ -782,6 +795,7 @@ NVN_API(nvnCommandBufferBindStorageBuffers) { bind_buffers(c, OP_BIND_SSBO); }
 static void bind_handles(cmd_t *o, uint32_t op, int st, int first, int n, const uint64_t *h, int deferred, size_t hw_bytes) {
     if (n < 0 || n > 32) { rt_log("nvn: bind of %d handles", n); return; }
     bind_log(op == OP_BIND_TEX ? "tex" : op == OP_BIND_IMG ? "img" : "handle", st, first, n, n ? h[0] : 0, n > 1 ? h[1] : 0);
+    mesh_log_bind(op == OP_BIND_TEX ? "tex" : op == OP_BIND_IMG ? "img" : "samp", st, first, n ? h[0] : 0, (uint64_t)n);
     p_bind_handles *r = RECN(o, op, p_bind_handles, h, n);
     r->stage = st;
     r->first = first;
@@ -914,6 +928,48 @@ NVN_API(nvnCommandBufferDispatchCompute) {
     *REC(cmd_of(c), OP_DISPATCH, p_dispatch) = (p_dispatch){(int)arg_x(c, 1), (int)arg_x(c, 2), (int)arg_x(c, 3), c->x[30]};
     bind_log("dispatch", 5, (int)arg_x(c, 1), (int)arg_x(c, 2), arg_x(c, 3), c->x[30]);
 }
+// ---- NVN2 mesh draws (docs/phase3.md, "the mesh stages decoded"), recorded as OP_DRAW_MESH / OP_DRAW_MESH_IND and replayed by
+// vk_exec_draw.c op_draw_mesh. OOT_MESH_LOG=1 (diagnostic) logs
+// the first calls with the bound program's stages (NVN stage of each control section, code address) and the binds the
+// game makes to the task and mesh stages (6, 7), which the replay keeps for stages 0-5 only.
+static int mesh_log_on(void) {
+    static int on = -1;
+    if (on < 0) on = getenv("OOT_MESH_LOG") != NULL;
+    return on;
+}
+static void mesh_log_draw(const Cpu *c, const char *what, uint64_t a, uint64_t b) {
+    static volatile LONG n;
+    if (!mesh_log_on() || InterlockedIncrement(&n) > 40) return;
+    char stages[200] = "";
+    size_t o = 0;
+    const prog_t *p = bound_prog;
+    for (uint32_t i = 0; p && i < p->nstage && i < 6 && o < sizeof stages - 40; i++) {
+        const uint8_t *ctl = p->sd[i].control;
+        o += (size_t)snprintf(stages + o, sizeof stages - o, " [%u: stage %d data %#llx local %#x/%#x/%#x]", i,
+                              ctl ? ctl[0x56] : -1, (unsigned long long)p->sd[i].data,
+                              ctl ? *(const uint32_t *)(ctl + 0x58) : 0, ctl ? *(const uint32_t *)(ctl + 0x5c) : 0,
+                              ctl ? *(const uint32_t *)(ctl + 0x60) : 0);
+    }
+    rt_log("meshlog: f%llu %s(%#llx, %#llx) from %#llx, thread %lu, cmd %p, program %p:%s", (unsigned long long)gfx_stats().frames, what,
+           (unsigned long long)a, (unsigned long long)b, (unsigned long long)c->x[30], GetCurrentThreadId(), (const void *)cmd_of(c), (const void *)p, stages);
+}
+static void mesh_log_bind(const char *what, int st, int first, uint64_t a, uint64_t b) {
+    static volatile LONG n;
+    if (!mesh_log_on() || st < 6 || gfx_stats().frames < 500 || InterlockedIncrement(&n) > 80) return;
+    rt_log("meshlog: f%llu bind %s stage %d slot %d %#llx %#llx", (unsigned long long)gfx_stats().frames, what, st, first,
+           (unsigned long long)a, (unsigned long long)b);
+}
+// void nvnCommandBufferDrawMeshTasks(NVNcommandBuffer *cmd, int first, int count) (from the stub log: first 0, count 12)
+NVN_API(nvnCommandBufferDrawMeshTasks) {
+    mesh_log_draw(c, "DrawMeshTasks", arg_x(c, 1), arg_x(c, 2));
+    *REC(cmd_of(c), OP_DRAW_MESH, p_draw_mesh) = (p_draw_mesh){(int)arg_x(c, 1), (int)arg_x(c, 2), 0, c->x[30]};
+}
+// void nvnCommandBufferDrawMeshTasksIndirect(NVNcommandBuffer *cmd, NVNbufferAddress indirect, int ?) (1 or 0 seen)
+NVN_API(nvnCommandBufferDrawMeshTasksIndirect) {
+    mesh_log_draw(c, "DrawMeshTasksIndirect", arg_x(c, 1), arg_x(c, 2));
+    *REC(cmd_of(c), OP_DRAW_MESH_IND, p_draw_mesh) = (p_draw_mesh){0, (int)arg_x(c, 2), arg_x(c, 1), c->x[30]};
+}
+
 // void nvnCommandBufferDispatchComputeIndirect(NVNcommandBuffer *cmd, NVNbufferAddress indirect): vkCmdDispatchIndirect
 NVN_API(nvnCommandBufferDispatchComputeIndirect) {
     *REC(cmd_of(c), OP_DISPATCH_IND, p_dispatch_ind) = (p_dispatch_ind){arg_x(c, 1), c->x[30]};
@@ -1114,7 +1170,7 @@ const char *nvn_op_name(uint32_t op) {
         "BIND_VSTREAM", "BIND_VBUF", "BIND_UBO", "BIND_SSBO", "BIND_TEX", "BIND_SAMP", "STENCIL", "POLY_OFFSET", "DRAW",
         "DRAW_IDX", "DISPATCH", "BARRIER", "SET_TEX_POOL", "SET_SAMP_POOL", "COPY_B2T", "COPY_STRIDE", "BLEND_COLOR",
         "COPY_T2B", "BIND_IMG", "COPY_T2T", "RESET_COUNTER", "CLEAR_TEX", "DEPTH_CLAMP", "RENDER_ENABLE",
-        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMG_STRIDE", "DRAW_IND", "XFB_BIND", "XFB_BEGIN", "XFB_END", "PUSH_CC",
+        "RASTER_DISCARD", "RENDER_COND", "PRIM_RESTART", "DRAW_IDX_IND", "DISPATCH_IND", "CLEAR_BUF", "COPY_IMG_STRIDE", "DRAW_IND", "XFB_BIND", "XFB_BEGIN", "XFB_END", "PUSH_CC", "DRAW_MESH", "DRAW_MESH_IND",
     };
     _Static_assert(sizeof names / sizeof *names == OP_COUNT_, "one name per op");
     return op < OP_COUNT_ ? names[op] : "?";

@@ -394,6 +394,22 @@ offline as compute (notes: none, but one untraced storage load in task 20eee5a0)
 program in a graphics slot is refused (`gfx_shader.c` `req_init`). Nothing calls them yet. The draw stubs' arguments,
 from the stub log: `DrawMeshTasks(cmd, first 0, count 12)`; `DrawMeshTasksIndirect(cmd, address, 1 or 0)`.
 
+Step 2 written, off by default (2026-11-07, `OOT_MESH=1` turns it on): `DrawMeshTasks` and `DrawMeshTasksIndirect`
+are real entry points recorded as `OP_DRAW_MESH(_IND)`; the replay keeps the programs bound for stages 6 and 7 and
+their uniform, storage, texture, sampler and image binds (`VkExec.mesh_prog`, `mubo`...; all were dropped before), and
+`vk_exec_draw.c` `op_draw_mesh` runs a direct draw's task program (n workgroups) and mesh program (n << 4, or n
+without a task) as compute dispatches on records in one device-local buffer, with the stage's resources swapped into
+the compute slots (`mesh_dispatch`). Indirect draws only read their arguments back (`OOT_MESH_LOG=1`), as their layout
+is not known. What the game does, measured with `OOT_MESH_LOG=1` (run-64..67): the mesh programs are 2-stage programs
+(fragment + mesh); they are bound with `BindProgram` stage mask 0xdf and task/mesh 0xc0 or 0x80; the direct draws are
+`DrawMeshTasks(0, 12)` and `(0, 1)` from main+0x273690, recorded on a thread that bound no program in that command
+buffer (the state comes from the caller); the stages' bank-0 entries are now 16 bytes {address, size}
+(`SM86_MESH_C0_*`), as the translator checks the size. **The first run with it on lost the device** (run-68, 27 s, on
+the first direct mesh draws: three new programs translated, no read-back came back). Not understood yet; candidates:
+a program bound for stage 6/7 that is stale for these draws, an out-of-range access in a record (no robust access),
+or the task count. Next: run one mesh program alone with `--probe-cs` on made-up records (one dispatch, no game), then
+the game with `OOT_MESH=1` and `OOT_MESH_LOG=1`, one run.
+
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
 the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that

@@ -534,6 +534,13 @@ static int prog_set_shaders(prog_t *o, int n, const NVNshaderData *sd) {
             }
         }
     }
+    if (getenv("OOT_MESH_LOG")) {   // a program with a task or mesh stage
+        static volatile LONG said;
+        for (int i = 0; i < n; i++)
+            if (sd[i].control && ((const uint8_t *)sd[i].control)[0x56] >= 6 && InterlockedIncrement(&said) <= 40)
+                rt_log("meshlog: program %p: %d stages, stage %d of them NVN stage %d, data %#llx", (void *)o, n, i,
+                       ((const uint8_t *)sd[i].control)[0x56], (unsigned long long)sd[i].data);
+    }
     o->serial = nvn_new_serial();
     NVN_LOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)o, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
