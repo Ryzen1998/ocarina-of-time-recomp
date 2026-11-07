@@ -1902,8 +1902,18 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
             if (written && gw) vk_exec_mesh_watch("window entry (may write)", st, (uint32_t)r->handle * 4, b->addr - lead, bi.range);
             return bi;
         }
-        if (b->addr) warn_once(W_SSBO_ALIGN, "storage buffer %#llx is not backed or not aligned: a zero buffer is bound",
-                               (unsigned long long)b->addr);
+        if (b->addr) {
+            // Which program and binding (the first 8): an "address" made of two floats is a pointer read from the
+            // wrong place (2026-11-09: 0x3f12864e3e51b3a4 in the level).
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 8) {
+                char hx[17];
+                shader_hex(C1CUR[st], hx);
+                rt_log("vk: storage buffer %#llx+%#llx (stage %d, c%d+%#x, program %s) is not backed or not aligned: a zero "
+                       "buffer is bound", (unsigned long long)b->addr, (unsigned long long)b->size, st, r->cbuf_slot,
+                       (uint32_t)r->handle * 4, hx);
+            }
+        }
     } else {
         warn_once(W_SSBO_SLOT, "a storage buffer whose address is at c%d+%#x (stage %d) is not replayed: a zero buffer is bound",
                   r->cbuf_slot, r->handle * 4, st);

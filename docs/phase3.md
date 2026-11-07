@@ -293,6 +293,38 @@ Still open, in order:
    exposure.
 4. Then the fog kernel 1a62084a, as planned.
 
+### Status (2026-11-09, later): why the shadow maps are empty, and where the fog's NaN starts
+
+Runs run-204 to run-212 (10 runs, 0 driver resets). No fix yet; both are narrowed down.
+
+**Shadow cascades.** A dump that copies every pass (no `OOT_DUMP_SKIP_RUNS`) shows the pattern per cascade (three
+layers of the 1600x1600 d16 array): six or seven passes of one mesh draw each (indirect, mesh program only, no task:
+the level's terrain and objects), then one pass of four vertex draws (characters). The vertex draws write depth
+(cascade 1 down to 0.21, cascade 2 to 0.14); the mesh draws write nothing. `OOT_MESH_LOG=1 OOT_MESH_LOG_FROM=4900`
+reads their indirect arguments back as the draw executes: word 0 (the mesh group count) is 0 for almost all of them
+(a few 1), so they draw nothing. The counts are written by the GPU through pointers (the global window), not through
+bound buffers, so the dump's binding list does not name the writer; the frame starts with a chain of eleven indirect
+dispatches (`0x0x0` in passes.txt: eae34290, 407d3d66, ba9439f5, 8119aee6, 5fa77bc0, 038ada51, 22fc2690, 0c4e2311,
+146bd84b, 945063b5, d0dcac29) that are the likely culling. Next: find which of them writes the shadow arguments
+(`OOT_GW_TRACE=<hex>` per kernel, or `OOT_SM86_COUNT` on their stores) and why it culls everything for the cascades
+(the cascade frustum, or a test against an empty shadow depth pyramid from the previous frame).
+
+**Fog kernel 1a62084a** (input 1a62084a3f963a65, code hash d72101b788a2e492): translates with no notes and validates
+now, but still writes NaN in ~69% of its volume, and the frame goes black with it (`build/logs/fog-on.png`, blank).
+- `OOT_SM86_COUNT` on its stores: every one of the 110,592 threads per dispatch stores; ~58% take the computing path
+  (stores at 0x3a00, 0x3b00, 0x7290), the rest write (0,0,0,1) (0x8ad0..0x8be0). The non-NaN voxels are all 0.
+- `OOT_SM86_PROBE=d72101b788a2e492:3990:24`: the value stored at 0x3a00 is NaN in every thread that reaches it.
+- Its uniform blocks are plausible (c5[0x1b8] = 1, c4[0x384] = 0.0066; `OOT_DUMP_UBO=64`, run-210).
+- The block at 0x3200-0x3510 blends eight light-probe samples trilinearly (weights from validity bits, SGXT/FSEL,
+  a 1e-5 floor), sums the weights and takes the reciprocal (MUFU at 0x33d0), then scales spherical-harmonics terms
+  (0.2821, 0.0796). `OOT_SM86_PROBE=d72101b788a2e492:33b0:29`: **the weight sum is exactly 0 in every thread** ->
+  1/0 = inf -> inf * 0 = NaN. Next: probe the weights' inputs (R85, R84, R43, R76 before 0x32b0) and the probe data
+  the kernel loads through its storage-held pointers (`LDG [UR10+0x60]` at 0x3220 etc., bank 0 + 0x60 table); zeros
+  there would explain it.
+- Not the cause: the unbacked storage buffer in the log. `vk_exec_draw.c` now names the program and binding:
+  0x3f12864e3e51b3a4 (two floats read as a pointer) is kernel 374126bf's c3+0x640, and 0x1501194600+0xfd200 (render
+  target memory used as storage) is programs 745220f3 and 3f15911a, c0+0x110/0x1c0. Both are leads of their own.
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count
