@@ -351,6 +351,41 @@ uncertain one.
 Also fixed: `tools/shader_census.py --lower` lowered nothing when the repository's path held a space (the helper's
 batch request is split at spaces); it now passes paths relative to the output folder.
 
+## Status (2026-11-07, the mesh stages decoded): ISBEWR / ISBERD and the stage buffer layout
+
+With PR #7 merged on top of the work below, every program the level route meets lowers (0 refusals in run-55, 804
+programs offline; 173 refused before) and the frame dump shows the tree, the roots, textured rocks and rippled water.
+What is left white is the horizon showing through where the ground should be: the ground is mesh-drawn, and the
+eight NVN2 mesh entry points are still stubs.
+
+The ISBE encoding, from Lichii's `NX2_NOTES.md` (row 89) and its lowering's field comments (GPL-3.0, read for
+behaviour only), checked against all 12 of this game's mesh-pipeline programs (`build/v131072/shaders`, a listing
+script over the 0x923 / 0x927 words; every instruction matches):
+- Fields: address register 24-31, byte offset 40-63; ISBERD destination 16-23, ISBEWR data 32-39; bit 75 `.32`
+  (else a byte), bits 76-77 the region (3 attributes, 0 the index map), 78 `.SKEW`, 79 `.O` (the output buffer). No
+  other bits of word 2 are set anywhere.
+- **Task** (3 programs, 16-32 instructions, workgroup 1 or 32): `ISBERD.ATTR.SKEW [0x0]` is the workgroup index;
+  it writes the mesh workgroup count with `ISBEWR.ATTR.O [0x4]` and the payload from `[0x10]` (one or two words, or
+  `[R+0x10]` per thread).
+- **Mesh** (9 programs, 104-616 instructions, 32 threads): `ISBERD.ATTR [0x0]` is the mesh workgroup's index and
+  `[0x10]` / `[0x14]` (or `[R+0x10]`) the task payload. Vertices: `ISBEWR.32.ATTR.SKEW.O [Rv + 0x80 c]`, one 128-byte
+  line per output component c (32 vertices of 4 bytes): position at lines 0-3 (`0x0..0x180`), then two or three
+  varying words (`0x200`, `0x280`, `0x300`). Index map: `ISBEWR.32.MAP.O [0x3]` the primitive count (written as 0
+  first by the leader, `@!P0`, then the real count), then `ISBEWR.U8.MAP.O [Ri + 4..9]`: six byte indices per thread,
+  two triangles.
+- Control +0x58..+0x63 of a mesh program: workgroup 32 in the low half of the first word, and in the third the maximum
+  vertices (low half: 0x20 or 0x80) and primitives (high half: 0x20 or 0x40), which fit what the programs write (one
+  or four vertices per thread, two triangles per thread).
+
+A way that needs no mesh-shader support in the translator: run both stages as **compute** programs. ISBERD /
+ISBEWR become loads and stores into storage buffers indexed by the workgroup (the payload and counts of each task
+workgroup, the vertex lines and index map of each mesh workgroup), which the lowering can express like the
+storage-held pointers above (bank-0 words the host fills). A small expansion pass then turns the maps into an index
+buffer (unused slots degenerate), and one ordinary indexed draw reads the vertex lines through a generated
+pass-through vertex shader whose outputs follow the mesh program header's output map, so the materials' pixel
+shaders link unchanged. Lichii instead translates to `VK_EXT_mesh_shader` (its notes, row 89); either way the host
+must also learn which programs NVN2 binds for a mesh draw. Not started.
+
 ## Status (2026-11-07): pointers held in storage buffers; the fog's volume still NaN
 
 A contributor's run on native Windows (RTX 5070 Ti, driver 621.01, no WSL), from `d84bf5d`, on the fog of
