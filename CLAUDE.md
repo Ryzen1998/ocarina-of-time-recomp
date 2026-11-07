@@ -47,18 +47,18 @@ plays on screen, upscaled to 2560x1440 by the game's neural network through the 
 (HMMA, LDSM, MOVM); HMMA runs on the host's tensor cores (VK_KHR_cooperative_matrix, translator patch 0016) and
 the title plays at 60 fps. The shader cache keys carry the translator identity and `KEY_VERSION`
 (`gfx_shader.c`): bump the latter after a lowering change. The first run after a translator or lowering change spends
-a minute building the kernels' pipelines (the driver's disk cache keeps them); about one run in two dies right after
-the first frame (an SDK abort in MultiWait, see the docs). Pool-indexed (bindless) textures are bound through a persistent pool set with GPU sampling
-feedback (`docs/bindless.md`, Status of 2026-11-06 afternoon); the level's geometry is still black with them; the likelier
-cause is the 64 level programs whose SM86 lowering fails (their draws and dispatches are skipped). Since 2026-11-07
-(`docs/phase3.md`, its last Status section) compute kernels that load a pointer from a storage buffer and read through
-it get the pointer from bank 0 + 0x700, filled by the host (`OOT_SM86_PTR=0` off), and depth maps sampled as R32F get
-the depth texels; the fog's volume is still NaN for another cause.
+a minute building the kernels' pipelines (the driver's disk cache keeps them). The start-up crash that killed
+about one run in two right after the first frame is fixed (`docs/phase3.md`, "the start-up crash"). Pool-indexed
+(bindless) textures are bound through a persistent pool set with GPU sampling feedback (`docs/bindless.md`). Since
+2026-11-07 (`docs/phase3.md`, its last Status sections) compute kernels that load a pointer from a storage buffer and
+read through it get the pointer from bank 0 + 0x700, filled by the host (`OOT_SM86_PTR=0` off), and depth maps sampled
+as R32F get the depth texels; the fog's volume is still NaN for another cause. The scene's ground goes through the
+stubbed mesh draws (`DrawMeshTasks*`).
 
 ## Running and checking
 
 - Run the game with `python3 tools/run.py` (`--seconds`, `--shot`, `--press-a`, `--env OOT_X=V`, `--fresh-cache`,
-  `--dump`, `--expect REGEX`), never by hand: it names every `OOT_*` variable in WSLENV, retries the start-up crash,
+  `--dump`, `--expect REGEX`), never by hand: it names every `OOT_*` variable in WSLENV, retries a crash in the first 25 s,
   numbers the log (`build/logs/run-<n>.log`), kills `oot.exe` and `oot_xlate.exe` afterwards and refuses to overlap
   runs. `--expect` checks the log for a line proving a diagnostic switch applied.
 - After a change to the lowering, the translator or anything a shader computes, follow the project skill
