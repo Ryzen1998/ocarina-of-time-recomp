@@ -279,6 +279,8 @@ static struct {
     int ready;
     VkBuffer zbuf;
     VmaAllocation zalloc;
+    VkBuffer dbuf;          // the discard buffer: written storage bindings with no backing (ssbo_info), so their
+    VmaAllocation dalloc;   // stores never reach the zero buffer every unresolved read shares
     VkBufferView zview;
     VkSampler samp, samp_shadow;
     struct { VkImage image; VmaAllocation alloc; VkImageView view, sview; } img[DV_COUNT];
@@ -368,6 +370,11 @@ static void dummies_init(void) {
     VmaAllocationInfo info;
     if (vmaCreateBuffer(c->vma, &bi, &ai, &Z.zbuf, &Z.zalloc, &info) != VK_SUCCESS) rt_fatal("vk: zero buffer failed");
     memset(info.pMappedData, 0, ZERO_BYTES);
+    {
+        VkBufferCreateInfo db = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = ZERO_BYTES, .usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+        VmaAllocationCreateInfo da = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateBuffer(c->vma, &db, &da, &Z.dbuf, &Z.dalloc, NULL) != VK_SUCCESS) rt_fatal("vk: discard buffer failed");
+    }
     VkBufferViewCreateInfo bv = {.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = Z.zbuf,
                                  .format = VK_FORMAT_R32G32B32A32_SFLOAT, .range = ZERO_BYTES};
     if (vkCreateBufferView(c->device, &bv, NULL, &Z.zview) != VK_SUCCESS) rt_fatal("vk: zero buffer view failed");
@@ -415,6 +422,7 @@ void vk_exec_draw_shutdown(void) {
     vk_usnap_shutdown();
     vkDestroyBufferView(c->device, Z.zview, NULL);
     vmaDestroyBuffer(c->vma, Z.zbuf, Z.zalloc);
+    vmaDestroyBuffer(c->vma, Z.dbuf, Z.dalloc);
     memset(&Z, 0, sizeof Z);
 }
 
@@ -1253,7 +1261,15 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     else if ((pi = ptr_res(ex, st, r)) >= 0) up.addr = ptr_value(ex, st, (uint32_t)pi), b = &up;   // the same
     else if (r->cbuf_slot == 0 && nvn2_cs(ex, st)) {                  // NVN2: the slot the bank-0 entry belongs to
         int kind, s2 = nvn2_c0_slot(ex, (uint32_t)r->handle * 4, &kind);
+        uint32_t off = (uint32_t)r->handle * 4, base, ns, nt, ni;
         if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
+        else if (off >= 0x10 && off + 8 <= 0x10 + ex->push_cc_len && nvn2_cs_layout(ex, &base, &ns, &nt, &ni) && off + 8 <= base) {
+            // a pointer the game pushed with the constants (PushComputeConstants), before the tables: the buffer at it,
+            // to the end of its backing (2026-11-07: ace1cec0 loops over a list at the pointer in its push at 0x60;
+            // bound to the zero buffer before)
+            memcpy(&up.addr, ex->push_cc + off - 0x10, 8);
+            b = &up;
+        }
     }
     if (b) {
         // vk_caps.c: shaders translated for sbuf_align address the buffer from its address rounded down to it.
@@ -1269,6 +1285,9 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         warn_once(W_SSBO_SLOT, "a storage buffer whose address is at c%d+%#x (stage %d) is not replayed: a zero buffer is bound",
                   r->cbuf_slot, r->handle * 4, st);
     }
+    // A written binding with no backing stores into the discard buffer: the zero buffer every unresolved read shares
+    // must stay zero (a store into it made counts and list lengths garbage for every other unresolved reader).
+    if (written) return (VkDescriptorBufferInfo){Z.dbuf, 0, max < ZERO_BYTES ? max : ZERO_BYTES};
     return zero_info(max);
 }
 
@@ -3298,7 +3317,9 @@ static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
             c0_dim[0] = groups, c0_dim[1] = c0_dim[2] = 1;
             B.c0_valid[2] = 0;
             bind_resources(ex, info);
+            int tp = cst_begin(ex);   // OOT_CS_TIME: the task and mesh stages' GPU time, with the kernels'
             vkCmdDispatch(ex->cb, groups, 1, 1);
+            cst_end(ex, tp, cs, (const uint32_t[3]){groups, 1, 1});
             ex->recorded++;
             ok = 1;
         }
