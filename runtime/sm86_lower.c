@@ -90,6 +90,8 @@ typedef struct {
                                                    // 2 an immediate, 3 several definitions or a computed one
     const uint8_t *control, *c1;                   // the control section and jump tables (BRX successors)
     uint32_t ctl_size, c1_len;
+    int has_brx;                                   // a BRX was lowered: c1 may hold jump tables
+    int c1_plain;                                  // the program has no BRX: c1 holds only constants (c1_imm)
     uint8_t *leader;                               // [n]: the instruction starts a basic block
     uint64_t (*live_out)[4];                       // [n]: registers live after the instruction (liveness mode)
     int liveness;                                  // scratch comes from the registers dead at each instruction
@@ -250,10 +252,23 @@ static uint32_t ur(L *l, uint32_t n) {
 
 // Uniform register n as an operand: a constant word or an immediate when its only definition loads one (no
 // register needed), else its register.
+// A word of a program's own constant bank 1 as an immediate, when the program has no jump table there (c1_plain).
+// The translator traces a storage address to the constant-buffer word it adds: an address built as c1 constant +
+// c0 pointer (the culling kernels' indirect-argument counters at pointer + 12) was traced to c1, which holds no
+// address, and the store went to the discard buffer (2026-11-07). As an immediate, the trace reaches the c0 pointer.
+static int c1_imm(const L *l, uint32_t bank, uint32_t off, uint32_t *v) {
+    if (bank != 1 || !l->c1_plain || off % 4 || (uint64_t)off + 4 > l->c1_len) return 0;
+    memcpy(v, l->c1 + off, 4);
+    return 1;
+}
+
 static Src ur_src(L *l, uint32_t n) {
     Src s = {0};
+    uint32_t v;
+    if (n < 63 && l->ur_def[n].kind == 1 && c1_imm(l, l->ur_def[n].bank, l->ur_def[n].value, &v)) { s.kind = 1, s.imm = v; return s; }
     if (n < 63 && l->ur_def[n].kind == 1) { s.kind = 2, s.cb_bank = l->ur_def[n].bank, s.cb_off = l->ur_def[n].value; return s; }
     if (n < 63 && l->ur_def[n].kind == 2) { s.kind = 1, s.imm = l->ur_def[n].value; return s; }
+    if (n < 63 && l->cur_def[n].kind == 1 && c1_imm(l, l->cur_def[n].bank, l->cur_def[n].value, &v)) { s.kind = 1, s.imm = v; return s; }
     if (n < 63 && l->cur_def[n].kind == 1) { s.kind = 2, s.cb_bank = l->cur_def[n].bank, s.cb_off = l->cur_def[n].value; return s; }
     if (n < 63 && l->cur_def[n].kind == 2) { s.kind = 1, s.imm = l->cur_def[n].value; return s; }
     return reg_src(ur(l, n));
@@ -1488,6 +1503,12 @@ static void lower_uldc(L *l, const Insn *x, uint32_t op) {
     if (dst < 63 && !ur_has_reg(l, dst) && (width == 4 || width == 5) && (dst + 1 >= 63 || width == 4 || !ur_has_reg(l, dst + 1)))
         return;                                               // every use forwards the constant
     uint32_t target = ur_dst(l, dst);
+    uint32_t v0, v1;
+    if (op == 0xab9 && (width == 4 || width == 5) && c1_imm(l, bank, off, &v0) && (width == 4 || c1_imm(l, bank, off + 4, &v1))) {
+        if (target != RZ) mov_imm(l, target, v0);   // a constant of the program's own bank 1 (c1_imm)
+        if (width == 5 && dst + 1 < 63 && ur_dst(l, dst + 1) != RZ) mov_imm(l, ur_dst(l, dst + 1), v1);
+        return;
+    }
     uint32_t index = op == 0xabb ? ur_in(l, bits(x, 24, 8), 5) : RZ;
     if (target == RZ) return;
     if (width == 4 && index == RZ) {
@@ -2891,6 +2912,7 @@ static void lower_brx(L *l, const Insn *x, uint32_t op) {
     uint32_t src = op == 0x958 ? ur(l, bits(x, 24, 8)) : bits(x, 24, 8);
     int64_t offset = -(int64_t)addr_of(l, l->nout) - 8;
     if (offset < -0x800000) return (void)fail(l, "BRX range");
+    l->has_brx = 1;
     emit(l, 0xe25000000000000full | l->pred | ((uint64_t)src << 8) | (((uint64_t)offset & 0xffffff) << 20));
 }
 
@@ -3317,6 +3339,11 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
     l.in = (const Insn *)(code + header);
     l.n = (c.code_end - header) / 16;
     if (l.n == 0 || l.n > 65536) { snprintf(out->error, sizeof out->error, "program size"); return 0; }
+    l.c1_plain = 1;
+    for (uint32_t i = 0; i < l.n && l.c1_plain; i++) {
+        uint32_t op = l.in[i].w[0] & 0xfff;
+        if (op == 0x949 || op == 0x958) l.c1_plain = 0;   // BRX: c1 holds its jump table
+    }
     l.first_out = calloc(l.n + 1, sizeof *l.first_out);
     if (!l.first_out) { snprintf(out->error, sizeof out->error, "out of memory"); return 0; }
     probe_init(code, code_size);
@@ -3387,8 +3414,11 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
                     memcpy(out->c1 + at + e * 4, &v, 4);
                 }
             }
-            if (count == 0 && c.c1_len) {
-                // Without records (not seen in the archives), move every word that could be an entry.
+            if (count == 0 && c.c1_len && l.has_brx) {
+                // Without records (not seen in the archives), move every word that could be an entry. Only with a
+                // BRX: c1 also holds plain constants, and a program without one has no table (2026-11-07: the
+                // culling kernels add the 64-bit constant 12 in c1 to their indirect-argument pointer; the zero high
+                // word was moved to 8, so their counters were written 32 GiB past the buffer, into the discard buffer).
                 for (uint32_t e = 0; e * 4 + 4 <= c.c1_len; e++) {
                     uint32_t v;
                     memcpy(&v, out->c1 + e * 4, 4);
