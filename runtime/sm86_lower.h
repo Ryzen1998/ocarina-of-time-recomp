@@ -59,6 +59,16 @@ void sm86_lower_free(Sm86Lowered *out);
 #define SM86_TASK_TABLE    0x670u
 #define SM86_MESH_TABLE    0x770u
 #define SM86_PTR_C0_MESH   0x480u
+// The pass-through vertex program of a mesh program (sm86_lower.c mesh_vs): the host hands the lowering the mesh
+// program's code with a copy of its control section whose stage byte (+0x56) is 0 and whose u32 at +0x48 (zero in
+// every program of the game) is SM86_MESH_VS_MAGIC. The lowering then writes a Maxwell vertex program for an
+// instanced draw of 3 * max-primitives vertices per mesh workgroup (instance = workgroup): it reads the workgroup's
+// index map and vertex lines from the mesh records, whose {address, size} the host puts at bank 0 +
+// SM86_MESH_VS_TABLE (vertex storage slot 15), and stores each line to the output attribute the mesh header's map
+// names; a primitive past the count gives a degenerate triangle (all outputs 0).
+#define SM86_MESH_VS_MAGIC 0x5356534du   // "MSVS"
+#define SM86_MESH_VS_TABLE 0x200u
+#define SM86_MESH_VS_SLOT  15
 #define SM86_TASK_STRIDE   0x100u
 #define SM86_MESH_STRIDE   0x8000u
 #define SM86_MESH_STRIDE_LOG2 15u

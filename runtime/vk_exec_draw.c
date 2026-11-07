@@ -956,6 +956,7 @@ static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *ns, uint32
 #define MESH_FAKE_MESH 0x7f0000000000ull
 static struct {
     int on;
+    int drawing;      // the pass-through draw: vertex storage slot 15 is the mesh records
     uint32_t table;   // SM86_TASK_TABLE or SM86_MESH_TABLE: the running stage's storage table in bank 0
     uint32_t shift;
     VkBuffer buf;
@@ -1240,6 +1241,8 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
     int pi;
+    if (M.drawing && st == NVN_STAGE_VS && r->cbuf_slot == 0 && (uint32_t)r->handle * 4 == SM86_MESH_VS_TABLE)
+        return (VkDescriptorBufferInfo){M.buf, M.task_size, M.mesh_size};   // mesh_draw: the mesh records
     if (M.on && st == NVN_STAGE_CS && r->cbuf_slot == 0) {   // op_draw_mesh: the records
         uint32_t off = (uint32_t)r->handle * 4;
         if (off == SM86_MESH_C0_TASK) return (VkDescriptorBufferInfo){M.buf, 0, M.task_size};
@@ -3307,8 +3310,54 @@ static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
     return ok;
 }
 
-static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {
-    // OOT_MESH=1 (default off): run the stages. The first run with them lost the device on the first direct mesh draws
+// Step 3: the records drawn. A stand-in program per mesh program: the pass-through vertex program (sm86_lower.c
+// mesh_vs, from a copy of the mesh stage's control section marked SM86_MESH_VS_MAGIC) and the game's fragment stage of
+// the same program; one instanced draw of 3 * max-primitives vertices per mesh workgroup, with the replay's current
+// state (targets, blend, depth) as the game set it for the mesh draw.
+static struct { const void *ctl_src; uint64_t data, fs; uint8_t ctl[0x400]; prog_t prog; } MVS[64];
+static uint32_t mvs_next;
+static const prog_t *mesh_vs_prog(const prog_t *mesh) {
+    const NVNshaderData *me = stage_entry(mesh, 7), *fe = stage_entry(mesh, 1);
+    if (!me || !fe) return NULL;
+    for (int i = 0; i < 64; i++)
+        if (MVS[i].ctl_src == me->control && MVS[i].data == me->data && MVS[i].fs == fe->data) return &MVS[i].prog;
+    typeof(MVS[0]) *e = &MVS[mvs_next++ % 64];
+    memcpy(e->ctl, me->control, sizeof e->ctl);   // gfx_shader reads CONTROL_BOUND (0x400) bytes behind a control
+    uint32_t magic = SM86_MESH_VS_MAGIC;
+    e->ctl[0x56] = 0;
+    memcpy(e->ctl + 0x48, &magic, 4);
+    e->ctl_src = me->control, e->data = me->data, e->fs = fe->data;
+    memset(&e->prog, 0, sizeof e->prog);
+    e->prog.magic = NVN_PROG_MAGIC, e->prog.nstage = 2;
+    e->prog.sd[0] = (NVNshaderData){me->data, e->ctl};
+    e->prog.sd[1] = *fe;
+    e->prog.serial = nvn_new_serial();
+    return &e->prog;
+}
+
+static void op_draw(VkExec *ex, const p_draw *d);
+static void mesh_draw(VkExec *ex, const prog_t *mesh, uint32_t groups) {
+    const prog_t *vp = mesh_vs_prog(mesh);
+    if (!vp) return warn_once(W_MESH, "a mesh program without a fragment stage is not drawn");
+    uint32_t prims;
+    memcpy(&prims, (const uint8_t *)stage_entry(mesh, 7)->control + 0x60, 4);
+    prims >>= 16;
+    if (!prims || prims > 256) return;
+    static uint64_t n;
+    const prog_t *sprog = ex->prog;
+    p_bind_buf ss = ex->ssbo[NVN_STAGE_VS][SM86_MESH_VS_SLOT];
+    // a stand-in address that differs per draw, so the bind signature never reuses another draw's records
+    ex->ssbo[NVN_STAGE_VS][SM86_MESH_VS_SLOT] = (p_bind_buf){NVN_STAGE_VS, SM86_MESH_VS_SLOT, MESH_FAKE_MESH + (++n << 24), M.mesh_size};
+    ex->prog = vp, bind_gen++;
+    M.drawing = 1;
+    p_draw d = {4, 0, (int32_t)(3 * prims), 0, (int32_t)groups};   // NVN triangles
+    op_draw(ex, &d);
+    M.drawing = 0;
+    ex->prog = sprog, bind_gen++;
+    ex->ssbo[NVN_STAGE_VS][SM86_MESH_VS_SLOT] = ss;
+}
+
+static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    // OOT_MESH=1 (default off): run the stages. The first run with them lost the device on the first direct mesh draws
     // of the title (2026-11-07, run-68, cause not known yet), so they stay off until that is understood.
     static int on = -1;
     if (on < 0) on = rt_knob("MESH", "0");
@@ -3375,6 +3424,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {
     }
     M.on = 0;
     vk_exec_barrier(ex);
+    if (ok && !getenv("OOT_MESH_NODRAW")) mesh_draw(ex, mesh, groups);
     int slot = ok ? mesh_rb_slot() : -1;
     if (slot >= 0) {
         VkBufferCopy cp[13];

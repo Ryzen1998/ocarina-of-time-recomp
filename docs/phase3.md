@@ -441,6 +441,17 @@ workgroups, and the mesh workgroups emit 30 to 99 triangles each with plausible 
 reset. Odd, to check: some draws whose first task record reads a count of 0 still show triangles in their first
 mesh records (the prologue should have zeroed them). Next is step 3, drawing the records.
 
+**Step 3 (2026-11-07, run-73/74):** the records are drawn. sm86_lower.c mesh_vs generates a Maxwell vertex program per
+mesh program (the host passes the mesh code with a copy of its control section marked SM86_MESH_VS_MAGIC, stage 0):
+vertex id / 3 is the primitive, the instance the mesh workgroup; it loads the primitive count and index byte from the
+record's map and the vertex's lines, and stores line k to the output attribute of the k-th set bit of the mesh
+header's output map (bitfield from header byte 0x34, bit b = attribute 0x40 + 4 b; checked on all 26 mesh programs).
+k_exec_draw.c mesh_draw pairs it with the game's fragment stage of the same program and draws 3 * max-primitives
+vertices x workgroups instanced, the records at vertex storage slot 15 (bank 0 + 0x200). All 26 translate; no device
+loss, no driver reset. The direct mesh draws are the depth pre-pass (colour mask 0) and 128x128 shadow layers: with
+them the scene's depth buffer gets the ground where it had holes (uild/logs/mesh-depth-keep.png). The colour of
+the ground comes from the indirect mesh draws, still only read back. OOT_MESH_NODRAW=1 skips step 3.
+
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
 the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that

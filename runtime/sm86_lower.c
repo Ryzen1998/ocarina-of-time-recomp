@@ -3224,6 +3224,69 @@ static void probe_emit(L *l, int init) {
     l->pred = saved;   // the program goes on; its own stores into the probed image are dropped (lower_sust)
 }
 
+// ---- the pass-through vertex program of a mesh program (sm86_lower.h SM86_MESH_VS_*)
+// The mesh header's output map is one bitfield from header byte 0x34 (Maxwell's OmapSystemValuesA, then the generic
+// vectors): set bit b is the output attribute at 0x40 + 4 b (position 0x70..0x7c is bits 12-15), and the mesh program
+// writes the lines of its vertex records in the order of the set bits (checked against all 26 mesh programs met: 4 to
+// 23 lines, as many as set bits). A vertex v's line k is at (v >> 5) * lines * 0x80 + k * 0x80 + (v & 31) * 4.
+#define ALD_R(rd, addr) (0xefd8000000000000ull | (rd) | ((uint64_t)RZ << 8) | ((uint64_t)(addr) << 20) | ((uint64_t)RZ << 39))
+#define AST_R(rv, addr) (0xeff0000000000000ull | (rv) | ((uint64_t)RZ << 8) | ((uint64_t)(addr) << 20) | ((uint64_t)RZ << 39))
+#define IMAD_I(rd, ra, imm, rc) (0x3400000000000000ull | (rd) | ((uint64_t)(ra) << 8) | iimm20(imm) | ((uint64_t)(rc) << 39))
+#define LDG_E(rd, ra, off, size) (0xeed0000000000000ull | (rd) | ((uint64_t)(ra) << 8) | ((uint64_t)(off) << 20) | \
+                                  ((uint64_t)1 << 45) | ((uint64_t)(size) << 48))
+
+static int mesh_vs_marked(const uint8_t *control) {
+    uint32_t m;
+    memcpy(&m, control + 0x48, 4);
+    return m == SM86_MESH_VS_MAGIC && control[0x56] == 0;
+}
+
+// lo:lo+1 = the records' address from bank 0 + off32 (registers 4, 5)
+static void mesh_vs_addr(L *l, uint32_t off32) {
+    Src s = {0};
+    s.kind = 2, s.cb_bank = 0, s.cb_off = SM86_MESH_VS_TABLE;
+    mov_cbuf(l, 4, &s);
+    s.cb_off += 4;
+    mov_cbuf(l, 5, &s);
+    emit(l, IADD_R(4, 4, off32) | l->pred | ((uint64_t)1 << 47));
+    emit(l, IADD_R(5, 5, RZ) | l->pred | ((uint64_t)1 << 43));
+}
+
+static void mesh_vs(L *l, const uint8_t *code, const uint8_t *control) {
+    uint32_t prims, lines = 0, attr[64];
+    memcpy(&prims, control + 0x60, 4);
+    prims >>= 16;
+    for (uint32_t b = 0; b < 0x18 * 8 && lines < 64; b++)
+        if (code[0x34 + b / 8] >> (b % 8) & 1) attr[lines++] = 0x40 + 4 * b;
+    if (!prims || prims > 256 || !lines || lines > 40) return (void)fail(l, "mesh pass-through: header");
+    l->pred = (uint64_t)PT << 16;
+    emit(l, ALD_R(0, 0x2fc));                                  // R0 vertex id: primitive * 3 + corner
+    emit(l, ALD_R(1, 0x2f8));                                  // R1 instance id: the mesh workgroup
+    emit(l, SHL_IMM(2, 1, SM86_MESH_STRIDE_LOG2));             // R2 its record
+    emit(l, IMAD_I(3, 0, 0xaaab, RZ));                         // R3 primitive = vertex id / 3 (exact below 2^15)
+    emit(l, SHR_IMM(3, 3, 17));
+    mesh_vs_addr(l, 2);
+    emit(l, LDG_E(6, 4, SM86_MESH_MAP, 4));                    // R6 primitive count
+    // P0 = primitive >= count (unsigned)
+    emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)0 << 3) | ((uint64_t)3 << 8) | ((uint64_t)6 << 20) |
+                ((uint64_t)PT << 39) | ((uint64_t)6 << 49));
+    emit(l, IADD_R(7, 2, 0) | l->pred);                        // R7 record + vertex id: its index byte - MAP - 4
+    mesh_vs_addr(l, 7);
+    emit(l, LDG_E(8, 4, SM86_MESH_MAP + 4, 0));                // R8 the vertex (a byte)
+    emit(l, SHR_IMM(9, 8, 5));                                 // R9 record + (v >> 5) * lines * 0x80 + (v & 31) * 4
+    emit(l, IMAD_I(9, 9, lines * 0x80, 2));
+    lop_imm(l, 10, 8, 31, 0);
+    emit(l, SHL_IMM(10, 10, 2));
+    emit(l, IADD_R(9, 9, 10) | l->pred);
+    mesh_vs_addr(l, 9);
+    for (uint32_t k = 0; k < lines; k++) emit(l, LDG_E(12 + k, 4, 0x80 * k, 4));
+    l->pred = 0;                                               // @P0: a primitive past the count, all outputs 0
+    for (uint32_t k = 0; k < lines; k++) mov_imm(l, 12 + k, 0);
+    l->pred = (uint64_t)PT << 16;
+    for (uint32_t k = 0; k < lines; k++) emit(l, AST_R(12 + k, attr[k]));
+    emit(l, 0xe30000000007000full);                            // EXIT
+}
+
 // ---- the program
 
 void sm86_lower_free(Sm86Lowered *out) {
@@ -3258,16 +3321,23 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
     if (!l.first_out) { snprintf(out->error, sizeof out->error, "out of memory"); return 0; }
     probe_init(code, code_size);
     if (probe.on) for (int i = 0; i < 3; i++) probe_local[i] = c.local[i] ? c.local[i] : 1;
-    scan_registers(&l);
-    int blocks = build_blocks(&l);
+    int pass_vs = mesh_vs_marked(control);
+    if (pass_vs) {   // a mesh program's pass-through vertex program: generated, the mesh code only lends its header
+        l.mesh = 0, l.graphics = 1;
+        mesh_vs(&l, code, control);
+        for (uint32_t i = 0; i <= l.n; i++) l.first_out[i] = l.nout;
+        l.index = l.n;
+    }
+    if (!pass_vs) scan_registers(&l);
+    int blocks = pass_vs ? 0 : build_blocks(&l);
     if (!blocks) free(l.leader), l.leader = NULL;              // a jump table without its record: no local forwarding
-    scan_uniform(&l);
+    if (!pass_vs) scan_uniform(&l);
     if (l.scratch_base + NSCRATCH > 255 && blocks && !l.failed) {
         // No room above the program's registers: scratch comes from the registers dead at each instruction.
         l.liveness = compute_liveness(&l);
         if (!l.liveness) free(l.live_out), l.live_out = NULL;
     }
-    for (l.index = 0; l.index < l.n && !l.failed; l.index++) {
+    for (l.index = pass_vs ? l.n : 0; l.index < l.n && !l.failed; l.index++) {
         l.first_out[l.index] = l.nout;
         if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
         if (l.liveness) scratch_at(&l, l.index);
@@ -3346,6 +3416,12 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         if (!out->code) fail(&l, "out of memory");
         else {
             if (l.graphics) memcpy(out->code, code, 0x50);
+            if (pass_vs) {   // the mesh header as a vertex program's: shader type 1 (bits 10-13; the mesh's is 3)
+                uint32_t w0;
+                memcpy(&w0, out->code, 4);
+                w0 = (w0 & ~(0xfu << 10)) | (1u << 10);
+                memcpy(out->code, &w0, 4);
+            }
             for (uint32_t k = 0; k < l.nout; k++) memcpy(out->code + addr_of(&l, k), &l.out[k], 8);
             out->code_size = size;
         }
