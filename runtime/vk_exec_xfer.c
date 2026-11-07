@@ -204,6 +204,22 @@ void vk_exec_xfer_shutdown(void) {
     memset((void *)oq_busy, 0, sizeof oq_busy);
 }
 
+// OOT_OQ_VISIBLE: 2 (default since 2026-11-09) "visible" written when the report is recorded, the real count when the
+// GPU is done: a result that is not ready counts as visible (totk-pc-recomp docs/architecture.md states the same
+// rule). The game reads its occlusion reports before this replay's GPU work is done; with only the late write (0) it
+// read the stale word, mostly 0, and skipped the colour draws of objects the depth pre-pass drew: the level's large
+// white areas. 1: every report says visible; 0: the real counts only, when the GPU is done (the old behaviour).
+static int oq_mode(void) {
+    static int mode = -1;
+    if (mode < 0) {
+        const char *e = getenv("OOT_OQ_VISIBLE");
+        mode = e && *e ? atoi(e) : 2;
+        rt_log("vk: samples-passed reports: %s (OOT_OQ_VISIBLE=%d)", mode == 1 ? "say visible" : mode == 2 ?
+               "visible until the GPU is done, then the real count" : "carry the real counts", mode);
+    }
+    return mode;
+}
+
 static void oq_cb(void *arg) {
     OqSegment *s = arg;
     VkDevice dev = vk_ctx()->device;
@@ -234,20 +250,13 @@ static void oq_cb(void *arg) {
     else {
         oq_count += sum;
         if (s->lost && !oq_count) oq_count = 1;
-        // Every samples-passed report says visible (OOT_OQ_VISIBLE, default on since 2026-11-09; =0 writes the real
-        // counts). The level tests each object's proxy box against a coarse occluder depth (a 256x144 pass that the
-        // compute kernel aea924bf builds from the previous frame's depth) and colours only what counted samples: 61% of
-        // the reports came back 0, the depth pre-pass still drew those objects, and the colour pass skipped them, so the
-        // sky showed through as the level's large white areas (docs/phase3.md, 2026-11-09). Whether the occluder or the
-        // results' timing is wrong is not known yet; reporting visible costs no measurable frame rate (48 fps either
-        // way), and an object drawn behind another still fails the depth test. OOT_OQ_LOG=1: zero and non-zero reports.
-        static int vis = -1, lg = -1;
+        // The level tests each object's proxy box against a coarse occluder depth (a 256x144 pass that the compute
+        // kernel aea924bf builds from the previous frame's depth) and colours only what counted samples (oq_mode for
+        // what the game reads before this write). OOT_OQ_LOG=1: zero and non-zero reports, every 2000.
+        static int lg = -1;
         static uint64_t nz, nn, nq;
-        if (vis < 0) {
-            const char *e = getenv("OOT_OQ_VISIBLE");
-            vis = !(e && !strcmp(e, "0")), lg = getenv("OOT_OQ_LOG") != NULL;
-            rt_log("vk: samples-passed reports %s (OOT_OQ_VISIBLE)", vis ? "say visible" : "carry the real counts");
-        }
+        if (lg < 0) lg = getenv("OOT_OQ_LOG") != NULL;
+        int vis = oq_mode() == 1;
         if (s->addr) write_counter(s->addr, vis && oq_count < (1u << 20) ? 1u << 20 : oq_count);
         if (lg && s->addr) {
             nq += s->n;
@@ -306,6 +315,7 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
     if (!vk_mem_resolve(p->addr, sizeof(NVNcounterData), &m))
         rt_fatal("vk: counter report at %#llx is in no memory pool", (unsigned long long)p->addr);
     vk_mem_count(m.cls, VK_MUSE_GPU_WRITE, sizeof(NVNcounterData));
+    if (samples && oq_mode() == 2) write_counter(p->addr, 1u << 20);   // not ready yet: visible
     if (samples) oq_report(ex, p->addr);
     else {
         uint64_t *a = malloc(sizeof *a);

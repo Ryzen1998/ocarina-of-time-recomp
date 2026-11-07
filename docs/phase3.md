@@ -187,7 +187,13 @@ object costs only its draws; the depth test still hides it. Still to find: why t
 minimum depth is 0.188 against ~0.77 in the scene, but pass 115 uses a projection of its own with near 0.6; or the
 results reach guest memory too late, on the completion thread, after the CPU read them; or the camera cuts of the
 cutscene, where the previous frame's depth is another shot). Turning the workaround off (`OOT_OQ_VISIBLE=0`) and
-logging the counts per proxy against what the colour pass then draws is the way in. New diagnostics:
+logging the counts per proxy against what the colour pass then draws is the way in. **Root cause, the same day**: timing, not the occluder. Mode `OOT_OQ_VISIBLE=2` writes "visible" when a report is
+recorded and the real count when the GPU is done; it shows no white either (trigger silent from 4500 to 6970,
+`build/logs/oq-pending.png`, `oq-default2.png`, noise 0.38). The only difference from mode 0 (real counts, white) is
+what the report word holds before the GPU finishes, so the game reads its reports before this replay's work is done
+and saw the stale word (mostly 0). TotK's port states the same rule ("a result that is not ready counts as visible",
+refs/totk-pc-recomp docs/architecture.md); TotK makes ~4 reports a frame, OoT ~580. Mode 2 is now the default (real
+counts still apply when the game reads after the GPU is done); 1 = always visible, 0 = the old behaviour. New diagnostics:
 `OOT_XFB_POSITION=1` (the transform feedback probe captures gl_Position, `vk_pipeline.c spirv_add_xfb_position`),
 `OOT_XFB_COUNT=<n>` (probe every indexed draw of the dump frame with n indices, any pass), `OOT_OQ_LOG=1`.
 
