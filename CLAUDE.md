@@ -52,8 +52,24 @@ about one run in two right after the first frame is fixed (`docs/phase3.md`, "th
 (bindless) textures are bound through a persistent pool set with GPU sampling feedback (`docs/bindless.md`). Since
 2026-11-07 (`docs/phase3.md`, its last Status sections) compute kernels that load a pointer from a storage buffer and
 read through it get the pointer from bank 0 + 0x700, filled by the host (`OOT_SM86_PTR=0` off), and depth maps sampled
-as R32F get the depth texels; the fog's volume is still NaN for another cause. The scene's ground goes through the
-stubbed mesh draws (`DrawMeshTasks*`).
+as R32F get the depth texels; the fog's volume is still NaN for another cause (`OOT_SKIP_CS=1a62084a` leaves it out).
+Storage pointers a kernel gets in its pushed constants are bound, and written storage bindings without backing go to a
+discard buffer, not the shared zero buffer: the level now runs at about 50 fps (was 1-2) and renders lit and textured.
+Mesh draws (`DrawMeshTasks*`) are implemented behind `OOT_MESH=1` (off by default): the task and mesh programs run as
+compute programs on per-workgroup records and a generated pass-through vertex program draws the records with the
+game's fragment stage; the direct draws (depth pre-pass, shadows) work, the indirect ones (most of the ground's colour)
+are not run yet, their arguments read 0. `docs/phase3.md`, the Status sections of 2026-11-07, has the details and the
+order of what is left.
+
+## GPU safety (learned 2026-11-07)
+
+A run that loses the device resets the NVIDIA driver (Windows System log, nvlddmkm event 153); eight resets in an hour
+took Windows down once (bugcheck 0x10E). After every GPU run, count the resets since its start
+(`Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nvlddmkm'; StartTime=$t0}`); on one, stop, do not
+retry, find the cause offline first, and reboot before the next GPU run. `--probe-cs` prints "fence reached" even when
+the device was lost: check the event log, not its output. A probe that writes into a resource a later kernel loops on
+can hang that kernel. Never translate everything from an empty shader cache during a run (`--fresh-cache`): copy the
+warm cache and delete only the entries to redo.
 
 ## Running and checking
 
@@ -91,6 +107,9 @@ is lost). `tools/kernel.py` and `tools/run.py` also run under native Windows Pyt
 
 ## Environment notes
 
+- Native Windows works too (checked 2026-11-07 on a second machine): `.venv-win\Scripts\python.exe tools\run.py ...`,
+  `tools\build_game.py` and `tools\kernel.py` run unchanged with MSYS2 UCRT64 at `C:\msys64`; redirect `oot.exe`'s
+  output through `cmd /c "... > file 2>&1"`, as PowerShell wraps long native stderr lines.
 - The user works in WSL (Linux), where the interpreter is `python3`. Builds run with Windows Python and MSYS2 UCRT64
   Clang through interop, as in MP4 (`.venv-win/Scripts/python.exe tools/build_game.py`); make the venvs from
   `tools/requirements.txt`.
