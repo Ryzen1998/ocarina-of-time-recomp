@@ -413,6 +413,25 @@ Runs run-225 to run-229, 0 driver resets.
   0x2a00..0x31f0 (`=r<n>` on the instruction after each load), then where those loads' base (R14:R15, an
   `IMAD.WIDE` base) comes from: likely a storage-held pointer (bank 0 + 0x60 table) whose buffer the host binds wrong.
 
+### Status (2026-11-10): the fog works; every FSEL with a float constant was wrong
+
+Runs run-234 to run-236, 0 driver resets.
+
+- **Cause** (`OOT_SM86_COUNT` sums on fog kernel 1a62084a, d72101b788a2e492): R91 is not a bank-4 value but the
+  constant 1e-5 (`MOV` at 0x2290, checked: the sum is the thread count times 0x3727c5ac). Each probe weight is its
+  trilinear fraction times two `FSEL valid ? 1.0 : 1e-5`, so it cannot be 0. The fractions were nonzero, but the products
+  after the selects were 0 in every thread. Solving the sums for one value per thread gave 0x0003f800 for each select:
+  `lower_sel` turned FSEL into Maxwell SEL, which moves bits and takes an *integer* imm20, but encoded the constant as a
+  float20. So 1.0 became the denormal 0x3f800, which FMUL flushes to 0. The weight sum was then 0 and 1/0 * 0 = NaN.
+- **Fix** (`sm86_lower.c` lower_sel): the immediate goes in as an integer, or through a register when it does not fit.
+  Programs with such an FSEL get their own cache key (`sm86_probe_tag`, "fselimm1", no KEY_VERSION bump). That is
+  **556 of the 1,161 stored programs** (2,352 of the constants are 1.0, 234 are -1.0, then 2.0, 100.0, 0.5, ...), so
+  the fix reaches well beyond the fog. The first run translates them again: about 13 fps for its first minute.
+- Result (run-236, fog on, no `OOT_SKIP_CS`): the weight sums are nonzero. The cutscene frame is lit and hazy, with
+  light shafts (`build/logs/fselfix-fog.png`, noise 1.07, a picture; with the fog on it was black before). The far
+  background is overexposed: white, with banded edges. That is the next item (the fog's density or the exposure).
+  Test runs no longer need `OOT_SKIP_CS=1a62084a`.
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count
