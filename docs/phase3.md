@@ -578,6 +578,24 @@ chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a 
   the first time (`build/logs/ground-all.png`; too bright and speckled, much of the scene still white). Level fps
   44 against 56 without them. Left: the colour itself (brightness, speckle), the 12 programs that do not lower, the
   title-screen draws (`OOT_MESH_IND_FROM` still set), the bound (16 vs real counts), then default-on.
+- **What the white is (2026-11-08, frame dumps at 5500 and 7000, run-138..145).** Not the mesh path: the default run is
+  white at frame 7000 too (`dump-141`; the clean default screenshots were taken later, in a dark spot). The frame
+  fills its HDR target with the sky first (one full-screen draw, 24..34), then lights the geometry over it; the lit
+  scene (`dump-143/pass_0172..._tm.png`) shows the sky wherever no geometry was drawn: the ground, tree trunks, at
+  times Link. Lit sky is far above 1, so the tone-mapped picture is white there. So the white is undrawn geometry:
+  the indirect mesh draws (off by default, bounded, 12 programs not lowered) and whatever else is missing.
+- **Fixed on the way: R32 storage views.** The frame's anti-aliasing kernel (SPIR-V hash 1cb856c3) packs R11G11B10
+  itself and stores the word through an R32UI view (`view-nvn-fmt 0xb`) of the R11G11B10F scene target; the host made
+  every storage view in the image's own format, so each word was converted as a float (the 65024 maxima). Now an R32
+  game view of another 32-bit colour format is an R32_SFLOAT view (the translator declares such images float with
+  no format) or R32UI/R32I (`get_view`); 32-bit colour formats without storage support (RGB9E5 here) get STORAGE
+  through such views (`storage_r32`, EXTENDED_USAGE); and when the slot's texture is another descriptor over the
+  same bytes (RGB9E5 over the R11G11B10F target, seen at times), the store goes to the live GPU-written image there
+  (`vk_texture_r32_sibling_locked`). No visible change in the white (it is upstream), no regression (59.7 fps).
+- **Game crash with `OOT_GW=1` (3 of about 12 runs: run-119, run-134, run-145):** main+0xc938d0 reads +0x150 of a
+  null table entry; the index comes from an object record at 0x29bc10a88, in the culling buffers the window lets the
+  GPU write. Likely GPU-written bytes reaching what the CPU reads (write-back of a range a window entry also
+  covers, or a kernel's wrong store). Open; the window stays off by default.
 - 12 task/mesh programs used only by the indirect draws do not lower (11 mesh, 1 task: register pressure at the
   start, "no general register dead over a uniform register's span" and similar, and two "uniform datapath opcode");
   the same with the lowering before the task prologue. Their draws are skipped, so even with the crash fixed, part

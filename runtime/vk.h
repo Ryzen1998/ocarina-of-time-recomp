@@ -299,7 +299,12 @@ typedef struct {
     uint8_t fb_learned;            // a draw sampled it while it was a written attachment of the open pass: its passes
                                    // attach it in ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT (vk_exec.c vk_exec_pass_begin)
     VkFormat storage_format;       // sRGB image stored into through a view of its UNORM sibling (EXTENDED_USAGE); 0: none
+    uint8_t storage_r32;           // 32-bit colour format without storage support: STORAGE through R32 views only
+                                   // (EXTENDED_USAGE; vk_exec_draw.c get_view)
 } VkTexImage;
+// The live image at img's storage address that a game R32 storage view writes for its readers: same shape, 32-bit
+// texels, GPU-written, another descriptor (vk_texture.c); img itself when there is none. Texture lock held.
+const VkTexImage *vk_texture_r32_sibling_locked(const VkTexImage *img);
 VkFormat vk_unorm_of_srgb(VkFormat f);   // vk_texture.c: the UNORM sibling of an sRGB colour format, 0 for the rest
 const VkTexImage *vk_texture_get(const tex_t *t);   // created and made current; NULL for BUFFER or unmapped formats
 // A texture slot; a slot whose texture was finalized follows the live texture at the same storage (hle_nvn.c).

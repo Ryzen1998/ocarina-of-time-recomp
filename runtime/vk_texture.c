@@ -341,6 +341,15 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
         if (u && (features_of(u) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
             storage_format = u, usage |= VK_IMAGE_USAGE_STORAGE_BIT, flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     }
+    // A 32-bit colour format without storage support (RGB9E5 on this GPU): the game stores packed texels into it
+    // through R32UI views (2026-11-08: the frame's last colour kernel; with the dummy bound the upscaler enlarged the
+    // raw HDR scene and every lit surface came out white). STORAGE through R32 views (get_view).
+    int storage_r32 = 0;
+    if (!(usage & VK_IMAGE_USAGE_STORAGE_BIT) && samples == 1 && !ds && !format_compressed(f.vk) &&
+        (f.vk == VK_FORMAT_E5B9G9R9_UFLOAT_PACK32 || f.vk == VK_FORMAT_B10G11R11_UFLOAT_PACK32 ||
+         f.vk == VK_FORMAT_A2B10G10R10_UNORM_PACK32 || f.vk == VK_FORMAT_R16G16_SFLOAT || f.vk == VK_FORMAT_R8G8B8A8_SNORM) &&
+        (features_of(VK_FORMAT_R32_SFLOAT) & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))
+        storage_r32 = 1, usage |= VK_IMAGE_USAGE_STORAGE_BIT, flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     // Cube compatible only for cube targets: the replay makes cube views of nothing else (vk_exec_draw.c get_view checks
     // the image's own view type). The flag on every square array of 6+ layers changed how AMD's Windows driver lays such
     // an image out, and terrain material arrays sampled through it came out in rainbow blocks that moved with the mip
@@ -411,6 +420,7 @@ static Tex *create_tex(const tex_t *t, const TexKey *k, int defer_init) {
     p->type = type;
     p->usage = usage;
     p->storage_format = storage_format;
+    p->storage_r32 = (uint8_t)storage_r32;
     p->aspect = aspect_of(&f);
     p->width = w, p->height = h, p->depth = depth, p->levels = levels, p->layers = layers, p->samples = samples;
     p->view_type = type == VK_IMAGE_TYPE_1D ? (d->target == NVN_TEXTURE_TARGET_1D_ARRAY ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D)
@@ -978,6 +988,22 @@ static Tex *entry_of(const tex_t *t) {
     if (e->released) e->released = 0, nreleased--, rel_unlink(e), tex_gen_bump(k.addr);
     e->t = *t;
     return e;
+}
+
+const VkTexImage *vk_texture_r32_sibling_locked(const VkTexImage *img) {
+    const Tex *self = (const Tex *)img, *best = NULL;
+    for (const Tex *p = nvn_hm_get(&by_addr, &img->addr); p; p = p->next_at) {
+        const VkTexImage *q = &p->pub;
+        if (p == self || p->released || p->f.depth || p->f.stencil || q->samples > 1 || q->type != img->type ||
+            q->width != img->width || q->height != img->height || q->depth != img->depth || q->layers < img->layers ||
+            !(q->usage & VK_IMAGE_USAGE_STORAGE_BIT) || p->t.L.size != self->t.L.size)
+            continue;
+        int bw, bh;
+        if (img_block(p, &bw, &bh) != 4 || bw != 1 || bh != 1) continue;
+        if (!best || (q->gpu_owned && !best->pub.gpu_owned) || (q->gpu_owned == best->pub.gpu_owned && p->wr_fence > best->wr_fence))
+            best = p;
+    }
+    return best && best->pub.gpu_owned ? &best->pub : img;
 }
 
 // vk_dump: upload bookkeeping of an image vk_texture_get / vk_texture_by_id returned. pages_written: whether its

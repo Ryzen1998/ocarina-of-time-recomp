@@ -497,6 +497,18 @@ static nvn_hmap views_by_image;          // VkImage -> its first ViewNode
 
 // An image view of a registered texture for a shader resource of type `rtype` (GfxShaderRes.type); VK_NULL_HANDLE when
 // the image cannot serve it (the caller binds a stand-in). Texture lock held.
+// 32-bit-per-texel colour formats an R32 storage view may alias (MUTABLE_FORMAT images: vk_texture.c).
+static int colour32(VkFormat f) {
+    switch (f) {
+    case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SNORM:
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2B10G10R10_UINT_PACK32: case VK_FORMAT_R16G16_SFLOAT:
+    case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT:
+    case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32_SFLOAT:
+        return 1;
+    default: return 0;
+    }
+}
 static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, int hv, uint16_t rtype, int storage) {
     VkImageViewType vt = res_view_type(rtype);
     int ms = (rtype & 0x200) != 0;
@@ -552,6 +564,19 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
     VkFormat vf = storage && img->storage_format ? img->storage_format : img->format;   // sRGB stored through UNORM
+    // A storage view the game makes as R32UI / R32I / R32F of a texture of another 32-bit format: the kernel stores
+    // texels it packed itself (2026-11-08: the frame's last colour kernel 1cb856c3 packs R11G11B10 into one word and
+    // stores it through an R32UI view of the R11G11B10F scene target). Bound in the image's own format, each packed
+    // word was converted as a float and the scene came out as clamped junk (the white screen). The translator declares
+    // such images as float with an unknown format (storage = 2 here: GfxShaderRes.format 0), so an R32_SFLOAT view
+    // carries the word unchanged; a declared integer format gets the integer view.
+    if (storage && hv && v->set_format && (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) &&
+        (v->format == NVN_FORMAT_R32UI || v->format == NVN_FORMAT_R32F || v->format == NVN_FORMAT_R32I)) {
+        if (colour32(img->format) && img->format != VK_FORMAT_R32_UINT && img->format != VK_FORMAT_R32_SINT && img->format != VK_FORMAT_R32_SFLOAT)
+            vf = storage == 2 || v->format == NVN_FORMAT_R32F ? VK_FORMAT_R32_SFLOAT
+                 : v->format == NVN_FORMAT_R32UI           ? VK_FORMAT_R32_UINT
+                                                           : VK_FORMAT_R32_SINT;
+    }
     ViewKey k = {img->image, vf, vt, aspect, l0, nl, y0, ny, swz};
     if (!view_of.klen) nvn_hm_init(&view_of, sizeof(ViewKey)), nvn_hm_init(&views_by_image, sizeof(VkImage));
     VkImageView found = (VkImageView)nvn_hm_get(&view_of, &k);
@@ -562,7 +587,7 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
                                 .subresourceRange = {aspect, l0, nl, y0, ny}};
     VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                       .usage = storage ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (img->block_views || img->storage_format) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views'
+    if (img->block_views || img->storage_format || img->storage_r32) ci.pNext = &use;   // the image's COLOR_ATTACHMENT usage is its block views'
                                                                      // (vk_texture.c); an sRGB image's STORAGE usage is its UNORM view's
     VkImageView view;
     if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS) return VK_NULL_HANDLE;
@@ -589,7 +614,8 @@ VkImageView vk_exec_target_view(const VkTexImage *img, VkFormat format, VkImageV
                                     .viewType = type, .format = format, .subresourceRange = {aspect, level, 1, base, layers}};
         VkImageViewUsageCreateInfo use = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
                                           .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT};
-        if (blocks) ci.pNext = &use;   // not the BC image's sampling and transfer usages
+        if (blocks || img->storage_r32 || img->storage_format) ci.pNext = &use;   // not the BC image's sampling and transfer
+                                                                               // usages, nor a storage usage by extension
         if (vkCreateImageView(vk_ctx()->device, &ci, NULL, &view) != VK_SUCCESS)
             rt_fatal("vk: render target view (format %d) could not be created", (int)format);
         ViewNode *n = malloc(sizeof *n);
@@ -2048,7 +2074,21 @@ static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int sto
         view_t v;
         int hv;
         const VkTexImage *img = vk_texture_by_id_locked((int)(h & 0xfffff), &v, &hv);
-        if (img) view = get_view(ex, img, &v, hv, r->type, storage), *image = img->image;
+        // A game R32 storage view writes the bytes the image of another descriptor at the same address is read
+        // through (the scene target): store into that image (vk_texture_r32_sibling_locked).
+        if (img && storage && hv && v.set_format &&
+            (v.format == NVN_FORMAT_R32UI || v.format == NVN_FORMAT_R32F || v.format == NVN_FORMAT_R32I) && colour32(img->format))
+        {
+            const VkTexImage *was = img;
+            img = vk_texture_r32_sibling_locked(img);
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 12)
+                rt_log("vk_exec: R32 storage view of tex %d at %#llx (%ux%u vk fmt %d usage %#x owned %d) -> %s image (vk fmt %d usage %#x owned %d)",
+                       (int)(h & 0xfffff), (unsigned long long)was->addr, was->width, was->height, (int)was->format,
+                       (unsigned)was->usage, was->gpu_owned, img == was ? "the same" : "sibling", (int)img->format,
+                       (unsigned)img->usage, img->gpu_owned);
+        }
+        if (img) view = get_view(ex, img, &v, hv, r->type, storage ? (r->format ? 1 : 2) : 0), *image = img->image;
         if (img && storage) vk_texture_storage_bound_locked(img);
         if (img && !storage && ex->nfbl && in_fbl(ex, img->image)) layout = VK_IMAGE_LAYOUT_ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT;
         if (!storage && !separate) {
