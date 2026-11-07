@@ -363,6 +363,7 @@ static const char *copy_out(VkExec *ex, VkImage image, VkFormat vf, VkImageAspec
 // bufs.txt gets the changed bytes' extent plus, with the grid arguments, one map per dword of the w x h records of
 // `stride` bytes at `off` (each record a letter: its value's index in the table under the map).
 
+static uint64_t frame_now(void);
 static uint64_t bd_addr, bd_size, bd_off, bd_stride;
 static uint32_t bd_w, bd_h;
 static uint8_t *bd_prev;
@@ -428,7 +429,17 @@ static void buf_done(void *arg) {
 static void buf_snap(VkExec *ex, int pass) {
     if (!bd_size) return;
     VkMemSpan s;
-    if (!vk_mem_resolve(bd_addr, bd_size, &s) || s.avail < bd_size) return;
+    if (!vk_mem_resolve(bd_addr, bd_size, &s) || s.avail < bd_size) {
+        static int said;   // why nothing is snapshot: how the start resolves (2026-11-09: a range that is in no pool)
+        if (!said++) {
+            VkMemSpan s1;
+            int r1 = vk_mem_resolve(bd_addr, 1, &s1);
+            rt_log("vk_dump: OOT_DUMP_BUF %#llx+%#llx is not one backed span: its first byte is %s (%#llx contiguous, class %d)",
+                   (unsigned long long)bd_addr, (unsigned long long)bd_size, r1 ? "backed" : "in no pool",
+                   (unsigned long long)s1.avail, s1.cls);
+        }
+        return;
+    }
     VK_MEM_PICK(s);   // the GPU's view of the buffer
     BufJob *j = calloc(1, sizeof *j);
     if (!j) rt_fatal("vk_dump: out of memory");
@@ -442,6 +453,17 @@ static void buf_snap(VkExec *ex, int pass) {
         return;
     }
     j->map = info.pMappedData, j->pass = pass;
+    // Once, at the first snapshot of the dump frame: the CPU's view of the range (guest memory as the game's code sees
+    // it while this pass is recorded) as cpu_<pass>.bin, to compare with the GPU's copies (2026-11-09: per-object
+    // counters the shadow culling reads as 0).
+    static int cpu_saved;
+    if (!cpu_saved && frame_now() == dump_frame && !nvn_gpu_only(bd_addr)) {
+        char path[600];
+        snprintf(path, sizeof path, "%s/cpu_%04d.bin", dir, pass);
+        FILE *f = fopen(path, "wb");
+        if (f) fwrite((const void *)(uintptr_t)bd_addr, 1, bd_size, f), fclose(f);
+        cpu_saved = 1;
+    }
     VkMemoryBarrier2 mb[2] = {
         {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
          .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,

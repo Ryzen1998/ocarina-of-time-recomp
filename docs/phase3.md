@@ -376,6 +376,28 @@ Runs run-220 to run-224, 0 driver resets. The shadows are still empty; the cause
 - Lichii (nx2 branch, GPL, read for behaviour only): its NX2 notes cover mesh-shader emulation and sparse textures for
   another title, nothing on shadows, culling or fog in this game.
 
+### Status (2026-11-09, night 4): the culling kernels that had no window; the first shadow geometry
+
+Runs run-225 to run-229, 0 driver resets.
+
+- **`OOT_GW_SKIP` was the blocker.** Since 2026-11-08 the two jump-table culling kernels 374126bf and 358beb27 got no
+  global window by default (their stores, traced to floats in c3, seemed to corrupt the culling buffers; 3 crashes in
+  12 runs then). Without the window every pointer access of theirs reads 0 and every such store is dropped, and they
+  are the ones that write the per-object records (374126bf: counter 1 when it appends an object, 0x4570). With
+  translator patch 0021 those stores go to the wrong candidate first and then to the window, so the skip list is now
+  empty by default (`OOT_GW_SKIP=374126bf,358beb27` restores it). Result (run-228, frame 4900): 68e84b77 gets 1 group
+  instead of 0, and the far cascade holds real shadow-casting geometry for the first time (pass 0164: 24,637 distinct
+  depths, small props and a curved surface; `build/logs/gwskip-none.png` noise 0.64, a picture). The terrain is not in
+  the cascades yet and e6d5432f's counters are still 0 (its own append path still never runs), so the shadows are
+  far from complete. Two runs with the new default, no crash (run-229 ran 200 s; its last screenshot is black, a
+  loading/fade moment at 1% low 3.9 fps; frame 4900 of run-228 is a normal picture).
+- Correction to "night 3": c4[type] is not the record table but a pointer cell (`LD R2, [R2]` at 0x550 follows it);
+  the cells are in a pool (the log's storage-held pointers read them: 0x29bb2b940 -> 0x2a19e9000), so the records are
+  at those addresses. `OOT_DUMP_BUF` now logs why it snapshots nothing (a range in no pool) and also saves the CPU's
+  view of the range once (`cpu_<pass>.bin`) next to the GPU's copies.
+- Next for the shadows: why e6d5432f's own append path (counter == 0xff) never runs; with the records now written,
+  count R13 again and look at what 358beb27 writes.
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count

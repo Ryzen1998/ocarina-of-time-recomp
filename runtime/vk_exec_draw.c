@@ -1305,16 +1305,17 @@ static void gw_select_mesh(VkExec *ex, const VkPipeInfo *info) {
     mwatch_gw(ex);
 }
 
-// OOT_GW_SKIP=<input id prefixes> (default 374126bf,358beb27; "none" for none): programs that get no window. These two
-// (jump-table programs) trace stores to bank-3 words that hold floats, not pointers (docs/phase3.md), so through the
-// window their stores could land in the culling buffers; with them in, the game crashed on a bad object index in 3
-// of 12 runs (2026-11-08).
+// OOT_GW_SKIP=<input id prefixes> (default none since 2026-11-09): programs that get no window. 374126bf and
+// 358beb27 were skipped from 2026-11-08: their stores were traced to bank-3 words that hold floats (docs/phase3.md),
+// and with the window the game crashed on a bad object index in 3 of 12 runs. Translator patch 0021 sends such stores
+// to the window after the wrong candidate, and without the window these kernels never write their per-object state,
+// so the shadow culling got no work (2026-11-09). OOT_GW_SKIP=374126bf,358beb27 restores the old default.
 static int gw_skipped(void) {
     static char list[256];
     static int init;
     if (!init) {
         const char *e = getenv("OOT_GW_SKIP");
-        snprintf(list, sizeof list, "%s", e ? e : "374126bf,358beb27");
+        snprintf(list, sizeof list, "%s", e ? e : "none");
         init = 1;
     }
     char hx[17];
