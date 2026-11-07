@@ -938,8 +938,8 @@ static int mesh_log_on(void) {
     return on;
 }
 static void mesh_log_draw(const Cpu *c, const char *what, uint64_t a, uint64_t b) {
-    static volatile LONG n;
-    if (!mesh_log_on() || InterlockedIncrement(&n) > 40) return;
+    static volatile LONG n[2];   // direct, indirect
+    if (!mesh_log_on() || InterlockedIncrement(&n[strstr(what, "Indirect") != NULL]) > 40) return;
     char stages[200] = "";
     size_t o = 0;
     const prog_t *p = bound_prog;

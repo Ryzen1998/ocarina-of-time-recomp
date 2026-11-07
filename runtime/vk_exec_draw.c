@@ -3181,7 +3181,7 @@ static void mesh_read(void *arg) {
     MeshRead *r = arg;
     const uint32_t *v = MRB.map + 16 * r->slot;
     if (r->kind)
-        rt_log("meshlog: indirect mesh draw (%u): args %#x %#x %#x %#x", r->a, v[0], v[1], v[2], v[3]);
+        rt_log("meshlog: indirect mesh draw (%u, task %u): args %#x %#x %#x %#x", r->a & 0xff, r->a >> 8, v[0], v[1], v[2], v[3]);
     else
         rt_log("meshlog: mesh draw of %u tasks, %u mesh groups: task 0 words %#x %#x %#x %#x; primitive counts of groups "
                "0-7: %u %u %u %u %u %u %u %u; group 0 vertex 0: %g %g %g %g", r->a, r->b, v[0], v[1], v[2], v[3], v[4],
@@ -3377,7 +3377,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
         vkCmdCopyBuffer(ex->cb, ip.buffer, MRB.buf, 1, &cp);
         ex->recorded++;
         vk_exec_barrier(ex);
-        mesh_rb_done(ex, slot, 1, (uint32_t)d->count, 0);
+        mesh_rb_done(ex, slot, 1, (uint32_t)d->count | (has_task ? 0x100u : 0), 0);
         return;
     }
     if (d->first != 0 || d->count <= 0 || (uint32_t)d->count > MESH_MAX_TASKS)

@@ -452,6 +452,14 @@ loss, no driver reset. The direct mesh draws are the depth pre-pass (colour mask
 them the scene's depth buffer gets the ground where it had holes (uild/logs/mesh-depth-keep.png). The colour of
 the ground comes from the indirect mesh draws, still only read back. OOT_MESH_NODRAW=1 skips step 3.
 
+**Indirect mesh draws and an intermittent timeout (run-75/76):** the indirect draws come from about ten call sites
+(main+0x2be2dbc, +0x2be2710, +0x186xxx, +0x184xxx, +0x6fb70), argument buffers such as 0x29bc62000, second argument 1 or 2;
+their first 16 bytes still read 0 at the draw. Run-76 (OOT_MESH=1, nothing else new) lost the device at 86 s with 37
+shader instruction pointers, the pattern of a shader that runs too long; runs 72-75 with the same code were clean
+over 110-150 s. Suspect: a loop in the culling task program (c72ef95d) or a mesh program driven by a count read
+from storage. Keep OOT_MESH off until that is found; next, find the timed-out shader offline (the fault addresses
+against the pipelines built in that run) before any further run.
+
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
 the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that
