@@ -18,6 +18,8 @@ The sm86_lower tool is built into build/tools/ with gcc when its sources are new
 import argparse
 import collections
 import json
+import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -25,9 +27,21 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE = ROOT / "build" / "v131072" / "shader-cache"
-TOOL = ROOT / "build" / "tools" / "sm86_lower"
+WINDOWS = os.name == "nt"   # native Windows Python, not WSL: no wslpath, the tools are .exe
+TOOL = ROOT / "build" / "tools" / ("sm86_lower.exe" if WINDOWS else "sm86_lower")
 XLATE = ROOT / "build" / "xlate" / "oot_xlate.exe"
-VKSDK = Path("/mnt/c/VulkanSDK")
+VKSDK = Path(os.environ.get("VULKAN_SDK_ROOT", "C:/VulkanSDK" if WINDOWS else "/mnt/c/VulkanSDK"))
+
+
+def cc() -> str:
+    """The C compiler for the sm86_lower tool: gcc on PATH, else MSYS2 UCRT64's on Windows."""
+    found = shutil.which("gcc")
+    if found:
+        return found
+    msys = Path("C:/msys64/ucrt64/bin/gcc.exe")
+    if WINDOWS and msys.exists():
+        return str(msys)
+    sys.exit("kernel: no gcc (on Windows install MSYS2 UCRT64 gcc, or put gcc on PATH)")
 NAMES = {0x23c: "HMMA", 0x83b: "LDSM", 0x23a: "MOVM", 0x389: "SHFL", 0x223: "FFMA", 0x231: "HFMA2", 0x235: "HADD2",
          0x981: "LDG", 0x986: "STG", 0x984: "LDS", 0x388: "STS", 0x918: "NOP", 0x824: "IMAD", 0x810: "IADD3",
          0x812: "LOP3", 0x819: "SHF", 0xb1d: "BAR", 0x94d: "EXIT", 0x947: "BRA", 0xb60: "TEX", 0x290: "UIADD3",
@@ -35,6 +49,8 @@ NAMES = {0x23c: "HMMA", 0x83b: "LDSM", 0x23a: "MOVM", 0x389: "SHFL", 0x223: "FFM
 
 
 def wpath(p: Path) -> str:
+    if WINDOWS:
+        return str(p)
     return subprocess.check_output(["wslpath", "-w", str(p)], text=True).strip()
 
 
@@ -79,8 +95,12 @@ def build_tool() -> Path:
     srcs = [ROOT / "tools" / "sm86_lower_main.c", ROOT / "runtime" / "sm86_lower.c", ROOT / "runtime" / "sm86_lower.h"]
     if not TOOL.exists() or any(s.stat().st_mtime > TOOL.stat().st_mtime for s in srcs):
         TOOL.parent.mkdir(parents=True, exist_ok=True)
-        subprocess.run(["gcc", "-O1", "-w", "-I", str(ROOT / "runtime"), "-DSM86_TOOL", str(srcs[0]), str(srcs[1]),
-                        "-o", str(TOOL)], check=True)
+        gcc = cc()
+        env = dict(os.environ)
+        if WINDOWS:   # MSYS2's gcc needs its own bin directory on PATH for its helper programs and DLLs
+            env["PATH"] = str(Path(gcc).parent) + os.pathsep + env.get("PATH", "")
+        subprocess.run([gcc, "-O1", "-w", "-I", str(ROOT / "runtime"), "-DSM86_TOOL", str(srcs[0]), str(srcs[1]),
+                        "-o", str(TOOL)], check=True, env=env)
     return TOOL
 
 
@@ -93,7 +113,11 @@ def extract(k: dict, out: Path) -> None:
 def lower(k: dict, out: Path, tensor: bool) -> tuple[Path, Path]:
     extract(k, out)
     low, c1 = out / f"{k['id'][:16]}.low", out / f"{k['id'][:16]}.c1"
-    env = {"SM86_TENSOR": "1" if tensor else "0", "PATH": "/usr/bin:/bin"}
+    if WINDOWS:   # keep the system variables a Windows program needs; MSYS2's bin for its runtime DLLs
+        env = dict(os.environ, SM86_TENSOR="1" if tensor else "0")
+        env["PATH"] = str(Path(cc()).parent) + os.pathsep + env.get("PATH", "")
+    else:
+        env = {"SM86_TENSOR": "1" if tensor else "0", "PATH": "/usr/bin:/bin"}
     r = subprocess.run([str(build_tool()), str(out / "ctl"), str(out / "code"), str(low), str(c1)], env=env,
                        capture_output=True, text=True)
     print((r.stdout + r.stderr).strip())

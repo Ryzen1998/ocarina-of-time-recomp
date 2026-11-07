@@ -50,7 +50,10 @@ the title plays at 60 fps. The shader cache keys carry the translator identity a
 a minute building the kernels' pipelines (the driver's disk cache keeps them); about one run in two dies right after
 the first frame (an SDK abort in MultiWait, see the docs). Pool-indexed (bindless) textures are bound through a persistent pool set with GPU sampling
 feedback (`docs/bindless.md`, Status of 2026-11-06 afternoon); the level's geometry is still black with them; the likelier
-cause is the 64 level programs whose SM86 lowering fails (their draws and dispatches are skipped).
+cause is the 64 level programs whose SM86 lowering fails (their draws and dispatches are skipped). Since 2026-11-07
+(`docs/phase3.md`, its last Status section) compute kernels that load a pointer from a storage buffer and read through
+it get the pointer from bank 0 + 0x700, filled by the host (`OOT_SM86_PTR=0` off), and depth maps sampled as R32F get
+the depth texels; the fog's volume is still NaN for another cause.
 
 ## Running and checking
 
@@ -81,7 +84,10 @@ cause is the 64 level programs whose SM86 lowering fails (their draws and dispat
   - `OOT_CS_TIME=1` logs the GPU time per compute shader; `OOT_TRACE=perf` the GPU time per frame and what bounds it. Discovery tools that paid off: `OOT_BREAK_AT`/`OOT_BREAK_BRIEF`/`OOT_BREAK_WATCH`, the
 crash dump's memory and TLS peeks (`OOT_CRASH_PEEK`), the NVN2 logging stubs (`nvn_procs_stub.inc`),
 `build/logs/nvn-proc-got.json` (GOT slot -> proc name, from the loader at `main+0x129e290`), `--probe-tensor` and
-`--probe-cs` (a kernel in isolation), `OOT_DUMP=dispatch`, `OOT_SKIP_DISPATCH_FROM`, `OOT_MQ_LOG`, `OOT_THREAD_DUMP`.
+`--probe-cs` (a kernel in isolation), `OOT_DUMP=dispatch`, `OOT_SKIP_DISPATCH_FROM`, `OOT_MQ_LOG`, `OOT_THREAD_DUMP`,
+`OOT_SM86_PROBE=<code hash>:<offset>:<register>` (one register's NaN / sign per thread into a compute program's storage
+image; read its comment in `sm86_lower.c` first: run it with a warm cache that lacks only that program, or the device
+is lost). `tools/kernel.py` and `tools/run.py` also run under native Windows Python (MSYS2 UCRT64 gcc for the tool).
 
 ## Environment notes
 

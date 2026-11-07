@@ -296,6 +296,43 @@ Open, in order:
   quick route (`tools/run.py --replay build/logs/a-spam.txt --skip-movies`) reaches the level in about 75 s.
   The game has no button to skip the opening (the user).
 
+## Status (2026-11-07): pointers held in storage buffers; the fog's volume still NaN
+
+A contributor's run on native Windows (RTX 5070 Ti, driver 621.01, no WSL), from `d84bf5d`, on the fog of
+2026-11-06 (kernel 1a62084a writes only 0 and NaN):
+
+- **Storage-held pointers (fixed).** The translator logged "Failed to find storage buffer for global memory operation
+  Load" 208 times for 1a62084a (`tools/kernel.py xlate`, the `.res.json` notes). The kernel loads five 64-bit
+  pointers from the 0x40-byte table at bank 0 + 0x60 (NVN storage slot 2, `LDG.E.64 [UR10+0..0x20]` after
+  `ULDC.64 UR10, c[0][0x60]`) and reads its light and froxel data through them; GlobalToStorage cannot trace a pointer
+  that comes from memory, so every such load read zero. The lowering now turns a 64-bit load of that shape, whose
+  pair is used as an address next, into a read of bank 0 + `SM86_PTR_C0` (0x700) + 8 i and appends the table of
+  (descriptor, offset) pairs to the lowered c1 (`sm86_lower.c` `ptr_load`, `sm86_lower.h`); the host fills those
+  words from guest memory at each dispatch and binds the buffer behind each pointer (`vk_exec_draw.c` "storage-held
+  pointers"). The translator then traces all of them: 0 notes for 1a62084a. Nine kernels of the level route are
+  affected (bank 0 + 0x60, 0x100, 0x30). `KEY_VERSION` 15; `OOT_SM86_PTR=0` turns it off. A first version that
+  rewrote every such load, whatever its use, lost the device on the level. Measured with the fog skipped
+  (`OOT_SKIP_CS=1a62084a`, the level route, screenshots at the end): blown-out white areas 20.3% of the frame before,
+  4.1% after; both score as pictures (`shot_diff.py` noise 0.28, 0.36).
+- **Depth maps read as colour (fixed, no visible change yet).** The game renders a 4096x4096 D32F depth map and
+  samples the same storage as an R32F texture (1a62084a's texture at bank 0 + 0x78, and fragment shaders of the
+  frame). The two descriptors were two images and the R32F one was never written. At the end of each pass the depth
+  target's texels are now copied into live R32F / R16 textures over its storage, and a new one takes them when created
+  (`vk_texture.c` `depth_colour_pair`, `vk_texture_depth_rendered`; `OOT_DEPTH_COLOUR=0` turns it off).
+- **The fog volume is still 0 and NaN** with both (frame dump, 64x36x96 volume, about 60% of the voxels NaN), so
+  there is another cause. `OOT_SM86_PROBE` (`sm86_lower.c`) stores, for one register at one instruction of one
+  program, NaN / positive / negative flags per thread into the volume. Results so far: the first channel stored at
+  0x7290 (R12) is 0 or positive, never NaN or negative; the interpolation weight R23 after 0x6bc0, in the same basic
+  block, is exactly 0 in every voxel. The guess
+  to check next: the weights' sum (R19 at 0x6c70) is 0 and the reciprocal at 0x6c90 turns it into the NaN. The
+  kernel uses about ten instruction forms that no other cached program uses (FSETP, ISETP, PLOP3, I2FP and FFMA
+  variants, `forms` from the census), the likeliest place for a lowering defect.
+- **Hazards met.** A probe run must translate the probed program alone (a copy of the warm shader cache with its
+  translation removed): an empty cache translated everything in the background and lost the device on the title
+  screen. Flags of 1.0 in the volume made the next kernel (c82d3cba) loop until the GPU timed out; skipping c82d3cba
+  also loses the device. Eight such losses in an hour took Windows down once (bugcheck 0x10E). The start-up crash came
+  about one run in three on this machine; `tools/run.py` works unchanged under native Windows Python.
+
 ## Where the port stands
 
 `oot.exe --seconds 15` runs the whole start-up of OoT 1.1.1 without a crash: 82 threads, 10,988 IPC messages, 1,485
