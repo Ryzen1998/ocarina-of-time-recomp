@@ -7,7 +7,7 @@ blocks it, what is already measured, and the order to do the work in.
 ## Current state (2026-11-08): read this first
 
 The dated Status sections below are the lab notebook, oldest first; this one is the summary. Branch `visuals` of the
-fork (Ryzen1998), last commit `932a551`.
+fork (Ryzen1998). KEY_VERSION 23.
 
 ### What works
 
@@ -39,7 +39,15 @@ fork (Ryzen1998), last commit `932a551`.
 | `00c4d56` | Task records were 0x100 bytes; the indirect draws' task programs write payload to ~0x898 | records 0x1000 (KEY 22) |
 | `7ed675d` | The global window was never filled for task/mesh stage dispatches | task program c7f0444a read 0 and looped 0x07ffffff times: the device losses of run-126..135 |
 | `0c2f1a0` | Storage views ignored the game's R32 view format (the AA kernel stores packed R11G11B10 through R32UI) | R32 views, STORAGE by extension (`storage_r32`), live image over the same bytes |
+| (this) | Uniform registers: forwarding stopped at every block, and a register' span was every touch of its number; UP2R (0x883) not lowered | 5 of the 12 indirect-only task/mesh programs now lower (task c6f3721f/bbcf8a53, meshes f5d63a4c, b55ba187, d12f99f4; 072eb70d/a11f465b lowers but draws garbage: skipped by default); KEY 23 |
 | `932a551` | Kernels 374126bf / 358beb27 (wrong traces: stores to float words of bank 3) got window entries over the culling results | game crash at main+0xc938d0 in 3/12 `OOT_GW=1` runs; `OOT_GW_SKIP` |
+
+Uniform register changes in detail (`sm86_lower.c`): `ur_flow` is a forward dataflow of the constant each uniform
+register holds; a block leader starts the local forwarding from it, so a register loaded with the same constant on
+every path forwards there too. `ur_liveness` is a backward dataflow over the reads that do not forward; a register
+that needs one gets its span from where it is live, and a definition whose value is dead writes no register
+(`ur_has_reg` per instruction). 421 of 942 cached programs lower differently (mostly dropped dead writes); runs
+show no regression. `SM86_UR=1` (tool build) lists the reads that do not forward.
 
 ### Diagnostics added (keep using them)
 
@@ -58,9 +66,13 @@ fork (Ryzen1998), last commit `932a551`.
 
 ### What to do next, in order
 
-1. **Lower the 12 failing indirect-only programs** (11 mesh, 1 task): "no general register dead over a uniform
-   register's span" / "no register pair..." at +0x80/+0x320 (register pressure at the start), two "uniform datapath
-   opcode" (c6f3721f +0x490, 072eb70d +0x4de0). Their draws are skipped.
+1. **The 7 indirect-only mesh programs that still do not lower** (2026-11-08 evening: ur_flow / ur_liveness / UP2R
+   fixed 5 of 12): four "no ... register dead over a uniform register's span" (6d98affa x3 at +0x320, 9a4accb7 at
+   +0x360: a computed uniform value live across code that uses R0..R251; needs spilling uniform registers to local
+   memory or rematerialising), three "no general register free for scratch" (52ed87ef +0x6c90, fa159bf2 +0x3960,
+   47ebe041 +0x22a0). And **mesh 072eb70d (code hash a11f465b)**: lowers, but its draws turn the frame into black and
+   white blocks (NaN/huge values into the exposure); `OOT_MESH_IND_SKIP` defaults to it. Compare its UP2R / swap
+   path with the task program c6f3721f, which works.
 2. **Indirect draws**: raise `OOT_MESH_IND_MAX` or read the real counts, test from the title (only frame ≥ 4500
    tested since the fixes), then look at the over-bright speckled ground.
 3. **Default on**: when several full runs with `OOT_GW=1 OOT_MESH=1 OOT_MESH_IND=1` stay free of resets and crashes,

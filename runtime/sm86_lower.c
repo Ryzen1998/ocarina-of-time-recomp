@@ -102,6 +102,9 @@ typedef struct {
     uint8_t needs_reg[64];                         // uniform register n has a use no forwarding covers
     uint8_t ur_pair[64];                           // n is half of a 64-bit pair (UIMAD.WIDE, ULDC.64): adjacent registers
     uint32_t ur_first[64], ur_last[64];            // the instructions a uniform register is touched at, first and last
+    struct UrC *ur_in;                             // [n * 63] uniform register constants reaching each instruction
+    uint64_t *ur_live;                             // [n] uniform registers live after each instruction (ur_liveness)
+    uint64_t *ur_rdnf;                             // [n] uniform registers read there without forwarding
     uint8_t ur_whole[64];                          // a use before its first definition: live over the whole program
     int scanned;                                   // needs_reg is final: a read of another register is a scan bug
     uint32_t used_preds;                           // predicates the program touches (bit n = Pn)
@@ -275,7 +278,15 @@ static Src ur_src(L *l, uint32_t n) {
 }
 
 // Does uniform register n have a register at all (false: every use forwards a constant, or there is no use)?
-static int ur_has_reg(const L *l, uint32_t n) { return n < 63 && l->ur_def[n].kind == 3 && l->needs_reg[n]; }
+// With ur_liveness, at a definition: only when the value is live after it (either half of a pair), so a constant
+// load that every later read forwards writes no register outside the register's live range.
+static int ur_has_reg(const L *l, uint32_t n) {
+    if (!(n < 63 && l->ur_def[n].kind == 3 && l->needs_reg[n])) return 0;
+    if (!l->ur_live || l->index >= l->n) return 1;
+    uint64_t m = 1ull << n;
+    if (l->ur_pair[n] && (n ^ 1) < 63) m |= 1ull << (n ^ 1);
+    return (l->ur_live[l->index] & m) != 0;
+}
 
 // The register a definition of uniform register n writes: RZ when it has none (the value is never read as such).
 static uint32_t ur_dst(L *l, uint32_t n) { return ur_has_reg(l, n) ? ur(l, n) : RZ; }
@@ -576,6 +587,104 @@ static uint32_t ur_write(const Insn *x, int *pair, uint8_t *kind, uint8_t *bank,
     return 63;
 }
 
+// Uniform register constants across blocks (2026-11-08): a forward dataflow of what each uniform register holds at
+// each instruction: kind 0 not reached yet, 1 a constant word (bank, offset), 2 an immediate, 3 anything else. At a
+// block leader the local forwarding starts from it instead of from nothing, so a register loaded with the same
+// constant on every path into the block forwards there too. The indirect draws' mesh programs reload UR4 from c0
+// (one constant per region) and use R0..R251: with UR4 needing a register over most of the program, none was dead
+// over its span and 11 of them did not lower.
+typedef struct UrC { uint8_t kind, bank; uint32_t value; } UrC;
+static void urc_apply(UrC st[63], const Insn *x) {
+    int pair;
+    uint8_t kind, bank;
+    uint32_t value;
+    uint32_t w = ur_write(x, &pair, &kind, &bank, &value);
+    if (w >= 63) return;
+    st[w] = (UrC){kind, bank, value};
+    if (pair && w + 1 < 63) st[w + 1] = kind == 1 ? (UrC){1, bank, value + 4} : (UrC){3, 0, 0};
+}
+static int urc_meet(UrC *a, const UrC *b) {   // a = meet(a, b); 1 when a changed
+    if (b->kind == 0 || a->kind == 3) return 0;
+    if (a->kind == 0) { *a = *b; return 1; }
+    if (a->kind == b->kind && a->bank == b->bank && a->value == b->value) return 0;
+    *a = (UrC){3, 0, 0};
+    return 1;
+}
+static void ur_flow(L *l) {
+    free(l->ur_in), l->ur_in = NULL;
+    if (!l->leader || !l->n) return;
+    UrC *in = calloc((size_t)l->n * 63, sizeof *in);
+    if (!in) return;
+    for (int r = 0; r < 63; r++) in[r] = (UrC){3, 0, 0};   // the entry: undefined values are not constants
+    uint32_t succ[72];
+    int changed = 1, rounds = 0;
+    while (changed && rounds++ < 100) {
+        changed = 0;
+        for (uint32_t i = 0; i < l->n; i++) {
+            UrC st[63];
+            memcpy(st, in + (size_t)i * 63, sizeof st);
+            int reached = 0;
+            for (int r = 0; r < 63 && !reached; r++) reached = st[r].kind != 0;
+            if (!reached) continue;
+            urc_apply(st, &l->in[i]);
+            int ns = successors(l, i, succ, 72);
+            if (ns < 0) { free(in); return; }
+            for (int k = 0; k < ns; k++)
+                for (int r = 0; r < 63; r++) changed |= urc_meet(&in[(size_t)succ[k] * 63 + r], &st[r]);
+        }
+    }
+    if (changed) { free(in); return; }   // no fixed point: plain local forwarding
+    l->ur_in = in;
+}
+
+// Uniform register liveness (2026-11-08): backward dataflow over the reads that do not forward. A register that needs
+// one gets its span from the instructions it is live at (ur_first/ur_last), not from every touch of its number: the
+// indirect draws' mesh programs load UR4 with constants all over and compute it in one region; the whole-program span
+// had no dead register in it.
+static void ur_liveness(L *l) {
+    free(l->ur_live), l->ur_live = NULL;
+    if (!l->ur_rdnf || !l->leader) return;
+    uint64_t *in = calloc(l->n, sizeof *in), *out = calloc(l->n, sizeof *out);
+    if (!in || !out) { free(in), free(out); return; }
+    uint32_t succ[72];
+    int changed = 1, rounds = 0;
+    while (changed && rounds++ < 200) {
+        changed = 0;
+        for (uint32_t i = l->n; i-- > 0;) {
+            uint64_t o = 0;
+            int ns = successors(l, i, succ, 72);
+            if (ns < 0) { free(in), free(out); return; }
+            for (int k = 0; k < ns; k++) o |= in[succ[k]];
+            int pair;
+            uint8_t kind, bank;
+            uint32_t value;
+            uint32_t w = ur_write(&l->in[i], &pair, &kind, &bank, &value);
+            uint64_t kill = 0;
+            if (w < 63 && bits(&l->in[i], 12, 4) == 7) {
+                kill |= 1ull << w;
+                if (pair && w + 1 < 63) kill |= 1ull << (w + 1);
+            }
+            uint64_t ni = l->ur_rdnf[i] | (o & ~kill);
+            if (ni != in[i]) in[i] = ni, changed = 1;
+            out[i] = o;
+        }
+    }
+    if (changed) { free(in), free(out); return; }
+    for (uint32_t n = 0; n < 63; n++) {
+        if (!l->needs_reg[n]) continue;
+        uint32_t a = UINT32_MAX, b = 0;
+        for (uint32_t i = 0; i < l->n; i++)
+            if (((out[i] | l->ur_rdnf[i]) >> n) & 1) {
+                if (a == UINT32_MAX) a = i;
+                b = i;
+            }
+        if (a == UINT32_MAX) continue;
+        l->ur_first[n] = a + 1, l->ur_last[n] = b + 1, l->ur_whole[n] = (in[0] >> n) & 1;
+    }
+    free(in);
+    l->ur_live = out;
+}
+
 // Uniform register definitions: a register with one definition that is a direct 32-bit ULDC (or a pair, or a
 // UMOV immediate) is forwarded as that constant; the others get general registers. Predicates: every field
 // that can name one is counted as used (over-marking only shrinks the pool for the uniform predicates).
@@ -618,9 +727,17 @@ static void scan_uniform(L *l) {
     {
         struct { uint8_t kind, bank; uint32_t value; } cur[64];
         memset(cur, 0, sizeof cur);
+        ur_flow(l);
+        free(l->ur_rdnf), l->ur_rdnf = l->leader ? calloc(l->n, sizeof *l->ur_rdnf) : NULL;
         for (uint32_t i = 0; i < l->n; i++) {
             const Insn *x = &l->in[i];
-            if (l->leader && l->leader[i]) memset(cur, 0, sizeof cur);
+            if (l->leader && l->leader[i]) {
+                memset(cur, 0, sizeof cur);
+                for (int r = 0; l->ur_in && r < 63; r++) {
+                    const UrC *c = &l->ur_in[(size_t)i * 63 + r];
+                    if (c->kind == 1 || c->kind == 2) cur[r].kind = c->kind, cur[r].bank = c->bank, cur[r].value = c->value;
+                }
+            }
             uint32_t reads[8][2];
             int nr = ur_reads(x, reads);
             for (int k = 0; k < nr; k++)
@@ -629,6 +746,10 @@ static void scan_uniform(L *l) {
                     if (n >= 63) continue;
                     int forwards = l->ur_def[n].kind == 1 || l->ur_def[n].kind == 2 || cur[n].kind == 1 || cur[n].kind == 2;
                     if (!forwards) l->needs_reg[n] = 1;
+                    if (!forwards && l->ur_rdnf) l->ur_rdnf[i] |= 1ull << n;
+#ifdef SM86_TOOL
+                    if (!forwards && getenv("SM86_UR")) fprintf(stderr, "ur: UR%u read at +%#x (op %03x) does not forward (def kind %d, cur %d)\n", n, 0x80 * !!l->graphics + i * 16, x->w[0] & 0xfff, l->ur_def[n].kind, cur[n].kind);
+#endif
                     if (!l->ur_first[n] && !l->ur_last[n]) l->ur_whole[n] = 1;   // read before any definition
                     if (!l->ur_first[n]) l->ur_first[n] = i + 1;
                     l->ur_last[n] = i + 1;
@@ -648,6 +769,7 @@ static void scan_uniform(L *l) {
             }
         }
     }
+    ur_liveness(l);
     for (uint32_t i = 0; i < l->n; i++) {
         const Insn *x = &l->in[i];
         uint32_t op = x->w[0] & 0xfff, base = op & 0x1ff, g = bits(x, 12, 4);
@@ -706,6 +828,7 @@ static uint32_t up_fields(const Insn *x) {
         case 0x087: fields = 0x10; break;
         case 0x086: fields = 0x04; break;
         case 0x09c: fields = 0x1f; break;
+        case 0x083: if (op == 0x883) m |= x->w[1] & 0x7f; break;   // UP2R: the mask names them
         default: break;
         }
     } else if (op == 0x81c && bits(x, 67, 1)) {
@@ -2494,6 +2617,27 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
                  f[2] << 4 | f[3] << 17 | f[4] << 20;
         return lower_plop3(l, &y);
     }
+    case 0x083: {   // UP2R (0x883, immediate mask): URd = (URa & ~mask) | (uniform predicates & mask), byte 76-77 as P2R.
+        // 2026-11-08: the indirect draws' task program c6f3721f and mesh program 072eb70d pack UP bits this way. Each
+        // mask bit j becomes an OR under the predicate standing for UPj (up()); UPT (bit 7) is a constant 1.
+        uint32_t target = ur_dst(l, bits(x, 16, 8)), mask = x->w[1], by = bits(x, 76, 2);
+        if (op != 0x883 || mask > 0xff || (x->w[2] & ~0x3000u) != 0x08000000u || g != 7) return (void)fail(l, "UP2R mode");
+        if (target == RZ) return;
+        uint32_t a = ur_in(l, bits(x, 24, 8), 5), sh = 8 * by;
+        if (a == RZ) mov_imm(l, target, mask >> 7 & 1 ? 0x80u << sh : 0);
+        else {
+            lop_imm(l, target, a, ~(mask << sh), 0);
+            if (mask >> 7 & 1) lop_imm(l, target, target, 0x80u << sh, 1);
+        }
+        uint64_t saved = l->pred;
+        for (uint32_t j = 0; j < 7; j++) {
+            if (!(mask >> j & 1)) continue;
+            l->pred = (uint64_t)up(l, j) << 16;
+            lop_imm(l, target, target, 1u << (j + sh), 1);
+        }
+        l->pred = saved;
+        return;
+    }
     case 0x082:                                               // UMOV: register (0xc82, UR at 32-37) or immediate (0x882)
         if (bits(x, 16, 8) == 63 || !ur_has_reg(l, bits(x, 16, 8))) return;   // URZ, or every use forwards
         if (op == 0x882) return mov_imm(l, ur(l, bits(x, 16, 8)), x->w[1]);
@@ -3488,7 +3632,13 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
     }
     for (l.index = pass_vs ? l.n : 0; l.index < l.n && !l.failed; l.index++) {
         l.first_out[l.index] = l.nout;
-        if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
+        if (l.leader && l.leader[l.index]) {
+            memset(l.cur_def, 0, sizeof l.cur_def);
+            for (int r = 0; l.ur_in && r < 63; r++) {   // ur_flow: constants on every path into the block
+                const UrC *c = &l.ur_in[(size_t)l.index * 63 + r];
+                if (c->kind == 1 || c->kind == 2) l.cur_def[r].kind = c->kind, l.cur_def[r].bank = c->bank, l.cur_def[r].value = c->value;
+            }
+        }
         if (l.liveness) scratch_at(&l, l.index);
         if (probe.on && !l.graphics && l.index == 0) probe_emit(&l, 1);
         if (l.mesh == 7 && l.index == 0) mesh_prologue(&l);
@@ -3587,7 +3737,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         out->error_offset = header + l.error_index * 16;
         sm86_lower_free(out);
     }
-    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out);
+    free(l.out), free(l.first_out), free(l.reloc), free(l.leader), free(l.live_out), free(l.ur_in), free(l.ur_live), free(l.ur_rdnf);
     return !l.failed;
 }
 

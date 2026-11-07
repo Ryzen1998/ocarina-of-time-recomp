@@ -4113,7 +4113,10 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
             for (uint32_t i = 0; i < len; i++) h = (h ^ ((const uint8_t *)(uintptr_t)e->data)[i]) * 0x100000001b3ull;
             hp[m] = h;
         }
+        // Default a11f465b: the mesh program 072eb70d lowers since UP2R (2026-11-08) but its draws turn the frame into
+        // black and white blocks (NaN or huge values reaching the exposure); "none" runs it.
         const char *skip = getenv("OOT_MESH_IND_SKIP");
+        if (!skip) skip = "a11f465b";
         for (const char *p = skip; p && *p;) {
             size_t k = strcspn(p, ",");
             char hx[2][17];
