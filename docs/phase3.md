@@ -559,6 +559,11 @@ chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a 
   trailing self-branch); the task program 1ddd3643 (a01eebd2) loops over a list but every loop is bounded by clamped
   counts (0x100 >> 5, 0x11, 0x1f) and its exit is a predicated CALL lowered as a branch. Nothing found offline yet.
   Added `OOT_MESH_IND_ONLY=<hash prefixes>` to run a subset (bisection costs one reset per bad half).
+- **run-132** (bisection, after a reboot): only the 4 indirect draws with a task program (1ddd3643, c7f0444a,
+  bbcf8a53) lost the device (fourth reset, `build/logs/fault-run132.bin`). Read offline: those task programs write
+  their payload at 0x18, 0x418 and 0x818 plus 4 * a lane index (to about 0x898), the direct draws' two task programs
+  only to 0x10; the task record stride was 0x100, so tasks overwrote each other's payloads (meshlet lists) and the mesh
+  programs ran on garbage. `SM86_TASK_STRIDE` is now 0x1000 (KEY_VERSION 22). Not yet run.
 - 12 task/mesh programs used only by the indirect draws do not lower (11 mesh, 1 task: register pressure at the
   start, "no general register dead over a uniform register's span" and similar, and two "uniform datapath opcode");
   the same with the lowering before the task prologue. Their draws are skipped, so even with the crash fixed, part

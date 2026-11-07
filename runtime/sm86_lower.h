@@ -71,10 +71,12 @@ void sm86_lower_free(Sm86Lowered *out);
 #define SM86_MESH_VS_MAGIC 0x5356534du   // "MSVS"
 #define SM86_MESH_VS_TABLE 0x200u
 #define SM86_MESH_VS_SLOT  15
-#define SM86_TASK_STRIDE   0x100u
+// 0x1000: the indirect draws' task programs (1ddd3643, c7f0444a, bbcf8a53) write payload arrays at 0x18, 0x418 and
+// 0x818 plus 4 * a lane index (to about 0x898); at 0x100 the tasks overwrote each other's payloads (2026-11-08).
+#define SM86_TASK_STRIDE   0x1000u
 #define SM86_MESH_STRIDE   0x8000u
 #define SM86_MESH_STRIDE_LOG2 15u
-#define SM86_TASK_STRIDE_LOG2 8u
+#define SM86_TASK_STRIDE_LOG2 12u
 #define SM86_MESH_MAP      0x7000u
 
 // OOT_SM86_COUNT=<code hash, hex>:<offset>[=rN|=pN][,...] (diagnostic, sm86_lower.c count_emit): every thread of
