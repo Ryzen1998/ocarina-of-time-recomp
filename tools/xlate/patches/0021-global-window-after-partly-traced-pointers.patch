@@ -1,0 +1,53 @@
+--- a/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
++++ b/src/Ryujinx.Graphics.Shader/Translation/Optimizations/GlobalToStorage.cs
+@@ -600,6 +600,7 @@
+             Queue<PhiNode> phis = new();
+             HashSet<PhiNode> visited = [];
+             List<uint> targetCbs = [];
++            bool untraced = false;   // a source of the address that no constant buffer word was traced to
+ 
+             Operand globalAddress = operation.GetSource(0);
+ 
+@@ -629,6 +630,10 @@
+                 if (result.Found)
+                 {
+                     targetCbs.Add(PackCbSlotAndOffset(result.SbCbSlot, result.SbCbOffset));
++                }
++                else
++                {
++                    untraced = true;
+                 }
+             }
+ 
+@@ -654,12 +659,30 @@
+                     {
+                         phis.Enqueue(phi2);
+                     }
++                    else if (!(phiSource.AsgOp is PhiNode))
++                    {
++                        untraced = true;
++                    }
+                 }
+             }
+ 
+             targetCbs.Sort();
+ 
+-            if (targetCbs.Count == 0 && resourceManager.Stage == ShaderStage.Compute)
++            if (targetCbs.Count != 0 && untraced && resourceManager.Stage == ShaderStage.Compute)
++            {
++                // Some sources of the address were traced and others not (ocarina-of-time-recomp, 2026-11-09: kernel
++                // 374126bf stores an object's counter through a pointer it loads from an indexed constant buffer word,
++                // c4[type * 0x40]; on another path the same register held a float of c3, which the search took for the
++                // base, and the store went only to that buffer, so it was lost). The traced candidates are tried first,
++                // then the global window, so the untraced sources still reach their buffers.
++                for (int k = 0; k < GlobalWindowCount; k++)
++                {
++                    targetCbs.Add(PackCbSlotAndOffset(0, GlobalWindowOffset / 4 + k * 4));
++                }
++
++                gpuAccessor.Log($"Global memory operation \"{operation.Inst}\" tries its traced buffers, then the global window.");
++            }
++            else if (targetCbs.Count == 0 && resourceManager.Stage == ShaderStage.Compute)
+             {
+                 // The global window (ocarina-of-time-recomp, runtime/vk_exec_draw.c "global window"): an address no
+                 // constant buffer word can be traced to (a pointer the program loaded from memory) is checked at run

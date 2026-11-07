@@ -352,6 +352,30 @@ Runs run-213 to run-219, 0 driver resets.
   ground in front; the rest is a picture. `vpool-on.png` was black (a fade; frame 4900 of the same run is a normal
   picture).
 
+### Status (2026-11-09, night 3): the object counters that never start, and stores lost to a wrong pointer trace
+
+Runs run-220 to run-224, 0 driver resets. The shadows are still empty; the cause is one step further back.
+
+- **Why e6d5432f appends nothing** (`OOT_SM86_COUNT`, values quoted): it reads a 64-byte record per object from a
+  table it reaches through c4 (`LDC.64 c[4][type * 0x40]`, then record `(index * 4 + 0x82..0x85) * 16`), and the low
+  byte of the record's last word is a counter: the object goes on the work list only when it is exactly 0xff (0x3440
+  `P5 = R13 == 0xff && !P6`, 0x3450 PLOP3 table 0x80 `P4 = P4 && P5`, decoded by hand: the lowering is right), and
+  the kernel advances a counter that is not 0 (store at 0x3420). Every object's counter is 0, so the shadow culling
+  (2bb46270, and 68e84b77 behind the occlusion kernels) gets 0 groups. Its sibling 374126bf (same layout, the same
+  counter word) writes 1 when it appends an object (0x4570) and R11 + 1 (0x4330). Who sets the first 0xff is open: no
+  GPU writer of the record range does it (`OOT_WATCH_RANGE`, run-222); next suspects are the game's CPU code (a
+  record it fills when an object appears) and the sync of CPU writes into a range the GPU also writes.
+- **Fixed: stores lost to a partly traced pointer** (translator patch 0021,
+  `0021-global-window-after-partly-traced-pointers.patch`). 374126bf's two counter stores take their address through a
+  phi whose real source is the indexed c4 table, which the search cannot trace, and whose other path held a float of
+  c3+0x640 in the same register, which it took for the base: the store went only to "c3+0x640" (two floats, so the
+  zero buffer) and was dropped. Now a compute program's global access whose sources are partly traced tries the traced
+  buffers first and then the global window. e6d5432f has 2 such accesses and 68e84b77 3. Translator identity
+  9123437e...; checked: 374126bf validates; level screenshot `build/logs/x21-on.png` noise 0.23; 0 resets (the first
+  run translates again, slower). The counters stay 0, so the shadows do not change yet.
+- Lichii (nx2 branch, GPL, read for behaviour only): its NX2 notes cover mesh-shader emulation and sparse textures for
+  another title, nothing on shadows, culling or fog in this game.
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count
