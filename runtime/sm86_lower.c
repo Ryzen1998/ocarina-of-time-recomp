@@ -1583,7 +1583,7 @@ static int ptr_load(L *l, uint32_t urn, uint32_t offset, uint32_t rd) {
         l->ptr_desc[i] = desc, l->ptr_off[i] = offset, l->nptr++;
     }
     Src s = {0};
-    s.kind = 2, s.cb_bank = 0, s.cb_off = SM86_PTR_C0 + 8 * i;
+    s.kind = 2, s.cb_bank = 0, s.cb_off = (l->mesh ? SM86_PTR_C0_MESH : SM86_PTR_C0) + 8 * i;
     mov_cbuf(l, rd, &s);
     s.cb_off += 4;
     mov_cbuf(l, rd + 1, &s);

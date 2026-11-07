@@ -48,11 +48,17 @@ void sm86_lower_free(Sm86Lowered *out);
 // task draw is mesh i = g & MASK of task t = g >> SHIFT; one whose i is not below its task's count stores a primitive
 // count of 0 and exits at once. Without a task program the host gives SHIFT 31, MASK ~0 and a task record with count
 // ~0.
-#define SM86_MESH_C0_MESH  0x6c0u   // {u64 address, u32 size} of the mesh records, as a storage table entry
-#define SM86_MESH_C0_TASK  0x6d0u   // {u64 address, u32 size} of the task records
-#define SM86_MESH_C0_MASK  0x6e0u   // u32
-#define SM86_MESH_C0_SHIFT 0x6e4u   // u32
-#define SM86_MESH_C0_END   0x6f0u
+#define SM86_MESH_C0_MESH  0x600u   // {u64 address, u32 size} of the mesh records, as a storage table entry
+#define SM86_MESH_C0_TASK  0x610u   // {u64 address, u32 size} of the task records
+#define SM86_MESH_C0_MASK  0x620u   // u32
+#define SM86_MESH_C0_SHIFT 0x624u   // u32
+#define SM86_MESH_C0_END   0x630u
+// The stages' own storage buffer tables in bank 0 ({u64 address, u32 size} per slot), as the game's programs read them
+// (a census of their bank-0 operands: vertex 0x110, fragment 0x510, task 0x670, mesh 0x770); the mesh table ends with
+// the bank at 0x800 (9 slots). Storage-held pointers of these stages go to SM86_PTR_C0_MESH, below both.
+#define SM86_TASK_TABLE    0x670u
+#define SM86_MESH_TABLE    0x770u
+#define SM86_PTR_C0_MESH   0x480u
 #define SM86_TASK_STRIDE   0x100u
 #define SM86_MESH_STRIDE   0x8000u
 #define SM86_MESH_STRIDE_LOG2 15u

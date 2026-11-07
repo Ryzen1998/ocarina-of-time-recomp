@@ -430,6 +430,17 @@ has no device loss and no driver reset over 69 direct mesh draws. But every task
 of 0, and every indirect mesh draw's arguments read 0: both likely come from the frame's culling compute passes,
 whose outputs are empty. Next: find which dispatches write the indirect arguments and the task programs' inputs.
 
+**The task programs' inputs (2026-11-07, run-72):** the level's task program is not one of the archive's three but a
+culling program built at run time (c72ef95d, 1059 instructions), which reads its object list from storage buffers
+through bank 0 + 0x670. A census of the programs' bank-0 operands gives each stage's storage table: vertex 0x110,
+fragment 0x510 (the Maxwell layout the replay already serves), task 0x670, mesh 0x770, which nothing filled, so the
+culling read zeros and asked for no meshes. mesh_c0 now fills the running stage's table from its storage binds
+(SM86_TASK_TABLE, SM86_MESH_TABLE), ssbo_slot maps them, the record entries moved to 0x600 and these stages'
+storage-held pointers to 0x480 (KEY_VERSION 18). Result: 58 of 69 logged draws' first task asks for 7 to 32 mesh
+workgroups, and the mesh workgroups emit 30 to 99 triangles each with plausible positions; no device loss, no driver
+reset. Odd, to check: some draws whose first task record reads a count of 0 still show triangles in their first
+mesh records (the prologue should have zeroed them). Next is step 3, drawing the records.
+
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
 the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that

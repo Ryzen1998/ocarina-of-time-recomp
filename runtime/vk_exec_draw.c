@@ -956,13 +956,25 @@ static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *ns, uint32
 #define MESH_FAKE_MESH 0x7f0000000000ull
 static struct {
     int on;
+    uint32_t table;   // SM86_TASK_TABLE or SM86_MESH_TABLE: the running stage's storage table in bank 0
     uint32_t shift;
     VkBuffer buf;
     VmaAllocation mem;
     VkDeviceSize cap, task_size, mesh_size;   // the mesh records follow the task records
 } M;
 
-static void mesh_c0(uint8_t bank[VK_C0_BYTES]) {
+static uint32_t ptr_count(int st);
+static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
+static void mesh_c0(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
+    for (uint32_t k = 0; k < 16 && M.table + 16 * k + 16 <= VK_C0_BYTES; k++) {   // the stage's storage slots
+        uint64_t a = ex->ssbo[NVN_STAGE_CS][k].addr;
+        uint32_t n = (uint32_t)ex->ssbo[NVN_STAGE_CS][k].size;
+        memcpy(bank + M.table + 16 * k, &a, 8), memcpy(bank + M.table + 16 * k + 8, &n, 4);
+    }
+    for (uint32_t i = 0, np = ptr_count(NVN_STAGE_CS); i < np && i < 32; i++) {
+        uint64_t p = ptr_value(ex, NVN_STAGE_CS, i);
+        memcpy(bank + SM86_PTR_C0_MESH + 8 * i, &p, 8);
+    }
     uint64_t a = MESH_FAKE_MESH;
     uint32_t sz = (uint32_t)M.mesh_size, shift = M.shift, mask = shift >= 31 ? ~0u : (1u << shift) - 1;
     memcpy(bank + SM86_MESH_C0_MESH, &a, 8), memcpy(bank + SM86_MESH_C0_MESH + 8, &sz, 4);
@@ -1038,7 +1050,7 @@ static VkDescriptorBufferInfo c0_info(VkExec *ex, int st) {
     uint8_t tmp[VK_C0_BYTES];
     if (nvn2) nvn2_c0_fill_cs(ex, tmp);
     else vk_c0_fill(tmp, st, ex->ssbo[st], ex->ubo[st], c0_dim, c0_binst);
-    if (M.on && st == NVN_STAGE_CS) mesh_c0(tmp);   // op_draw_mesh clears c0_valid, so no stale bank is reused
+    if (M.on && st == NVN_STAGE_CS) mesh_c0(ex, tmp);   // op_draw_mesh clears c0_valid, so no stale bank is reused
     if (!B.c0_valid[k] || memcmp(tmp, B.c0[k], VK_C0_BYTES)) {
         memcpy(scratch(ex, VK_C0_BYTES, &B.c0_buf[k], &B.c0_off[k]), tmp, VK_C0_BYTES);
         memcpy(B.c0[k], tmp, VK_C0_BYTES);
@@ -1098,6 +1110,10 @@ static VkDescriptorBufferInfo ubo_info(VkExec *ex, int st, int slot) {
 static int ssbo_slot(const GfxShaderRes *r, int st, int *ubo) {
     *ubo = 0;
     if (r->cbuf_slot != 0) return -1;
+    if (M.on && st == NVN_STAGE_CS) {   // op_draw_mesh: the task or mesh stage's own table
+        uint32_t o = (uint32_t)r->handle * 4;
+        if (o >= M.table && o < M.table + 0x100 && (o - M.table) % 16 == 0 && o + 16 <= VK_C0_BYTES) return (int)((o - M.table) / 16);
+    }
     int off = r->handle * 4, base = st == NVN_STAGE_VS ? 0x110 : st == NVN_STAGE_FS ? 0x510 : st == NVN_STAGE_CS ? 0x310 : -1;
     if (st == NVN_STAGE_CS && off >= 0x210 && off < 0x310 && (off - 0x210) % 16 == 0) {
         *ubo = 1;
@@ -1183,7 +1199,10 @@ static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i) {
     const uint8_t *t = ptr_table(st, &n);
     if (!t || i >= n) return 0;
     memcpy(e, t + 8 * i, 8);
-    int kind = -1, s = nvn2_c0_slot(ex, e[0], &kind);
+    int kind = -1, s;
+    if (M.on && st == NVN_STAGE_CS)   // op_draw_mesh: the stage's own table
+        s = e[0] >= M.table && (e[0] - M.table) % 16 == 0 ? (int)((e[0] - M.table) / 16) : -1, kind = 0;
+    else s = nvn2_c0_slot(ex, e[0], &kind);
     if (s < 0 || kind != 0 || s >= 16) return 0;
     const p_bind_buf *b = &ex->ssbo[st][s];
     uint64_t a = b->addr + e[1], v = 0;
@@ -1208,9 +1227,9 @@ static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i) {
 
 // The pointer entry a bank-0 storage binding of an NVN2 compute program names; -1 for the others.
 static int ptr_res(const VkExec *ex, int st, const GfxShaderRes *r) {
-    uint32_t off = (uint32_t)r->handle * 4;
-    if (r->cbuf_slot != 0 || off < SM86_PTR_C0 || off >= SM86_PTR_C0 + 8 * SM86_PTR_MAX || (off - SM86_PTR_C0) % 8) return -1;
-    return (int)((off - SM86_PTR_C0) / 8) < (int)ptr_count(st) && nvn2_cs(ex, st) ? (int)((off - SM86_PTR_C0) / 8) : -1;
+    uint32_t off = (uint32_t)r->handle * 4, pb = M.on && st == NVN_STAGE_CS ? SM86_PTR_C0_MESH : SM86_PTR_C0;
+    if (r->cbuf_slot != 0 || off < pb || off >= pb + 8 * SM86_PTR_MAX || (off - pb) % 8) return -1;
+    return (int)((off - pb) / 8) < (int)ptr_count(st) && (M.on || nvn2_cs(ex, st)) ? (int)((off - pb) / 8) : -1;
 }
 
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
@@ -3253,6 +3272,7 @@ static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
     memcpy(ex->tex[cs_st], ex->mtex[m], sizeof stx), memcpy(ex->samp[cs_st], ex->msamp[m], sizeof ssp);
     memcpy(ex->img[cs_st], ex->mimg[m], sizeof sim);
     ex->prog = ex->mesh_prog[m], ex->push_cc_len = 0, ex->tex_serial++, bind_gen++;
+    M.table = m ? SM86_MESH_TABLE : SM86_TASK_TABLE;
     int ok = 0;
     const NVNshaderData *e = stage_entry(ex->prog, 6 + m);
     const GfxShader *cs = NULL;
@@ -3329,8 +3349,30 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {
         ex->recorded++;
     }
     M.on = 1, M.shift = shift;
-    int ok = !has_task || mesh_dispatch(ex, 0, tasks);
-    if (ok) ok = mesh_dispatch(ex, 1, groups);
+    int okt = !has_task || mesh_dispatch(ex, 0, tasks);
+    int ok = okt && mesh_dispatch(ex, 1, groups);
+    if (getenv("OOT_MESH_LOG")) {   // which programs ran, and the task stage's uniform slot 0 as the game left it
+        static volatile LONG n;
+        if (InterlockedIncrement(&n) <= 12) {
+            uint64_t ht = 0, hm = 0;
+            for (int m = 0; m < 2; m++) {
+                const NVNshaderData *e = stage_entry(ex->mesh_prog[m], 6 + m);
+                if (!e) continue;
+                uint32_t len;
+                memcpy(&len, (const uint8_t *)e->control + 0x44, 4);
+                uint64_t h = 0xcbf29ce484222325ull;
+                for (uint32_t i = 0; i < len; i++) h = (h ^ ((const uint8_t *)(uintptr_t)e->data)[i]) * 0x100000001b3ull;
+                if (m) hm = h; else ht = h;
+            }
+            const p_bind_buf *u = &ex->mubo[0][0];
+            uint32_t w[8] = {0};
+            VkMemSpan sp;
+            if (u->addr && u->size >= 32 && vk_mem_resolve(u->addr, 32, &sp)) memcpy(w, (const void *)(uintptr_t)u->addr, 32);
+            rt_log("meshlog: draw of %d: task %016llx ran %d, mesh %016llx ran %d; task ubo0 %#llx+%#llx: %#x %#x %#x %#x %#x %#x",
+                   d->count, (unsigned long long)ht, okt, (unsigned long long)hm, ok, (unsigned long long)u->addr,
+                   (unsigned long long)u->size, w[0], w[1], w[2], w[3], w[4], w[5]);
+        }
+    }
     M.on = 0;
     vk_exec_barrier(ex);
     int slot = ok ? mesh_rb_slot() : -1;
