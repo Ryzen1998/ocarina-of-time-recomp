@@ -571,7 +571,13 @@ chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a 
   (R9 = R6 = 0), so its loop bound `(min(R9 - R6, 256) - 1) >> 5` became 0x07ffffff and one warp looped 361 million
   times. Those reads are 8 loads the translator sends through the global window, which the host never filled for task
   and mesh stages. Now `gw_select_mesh` fills it for them (`OOT_GW=1`; not when the stage has storage-held pointers,
-  whose table at 0x480 overlaps the window). Not yet run.
+  whose table at 0x480 overlaps the window).
+- **Working (run-136, run-137, after a reboot):** c7f0444a alone: its list words are real, its loop runs a few times
+  per thread, every thread reaches its exit, no reset. All indirect draws (`OOT_MESH=1 OOT_GW=1 OOT_MESH_IND=1`,
+  bound 16, from frame 4500): no reset, and the ground under Link in Kokiri Forest is drawn coloured and textured for
+  the first time (`build/logs/ground-all.png`; too bright and speckled, much of the scene still white). Level fps
+  44 against 56 without them. Left: the colour itself (brightness, speckle), the 12 programs that do not lower, the
+  title-screen draws (`OOT_MESH_IND_FROM` still set), the bound (16 vs real counts), then default-on.
 - 12 task/mesh programs used only by the indirect draws do not lower (11 mesh, 1 task: register pressure at the
   start, "no general register dead over a uniform register's span" and similar, and two "uniform datapath opcode");
   the same with the lowering before the task prologue. Their draws are skipped, so even with the crash fixed, part
