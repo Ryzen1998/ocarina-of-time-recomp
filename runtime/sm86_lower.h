@@ -30,6 +30,16 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
                   int tensor);
 void sm86_lower_free(Sm86Lowered *out);
 
+// Pointers held in storage buffers (sm86_lower.c lower_ldg). A compute program that loads a 64-bit pointer from a
+// storage buffer whose address is a bank-0 constant (c0[desc]), at a constant offset, and then loads through it,
+// cannot have the second load traced to a bound buffer by the translator (it read zero). Such a pointer load reads
+// c0[SM86_PTR_C0 + 8 i] instead; the host fills those words with the pointers from guest memory at each dispatch and
+// binds the buffer each points into (vk_exec_draw.c, "storage-held pointers"). The lowered c1 ends with the table:
+// {u32 desc, u32 offset} for i = 0..count-1, then u32 count, u32 SM86_PTR_MAGIC. OOT_SM86_PTR=0: off.
+#define SM86_PTR_C0 0x700u
+#define SM86_PTR_MAX 32u
+#define SM86_PTR_MAGIC 0x52545050u   // "PPTR"
+
 // The control section's fields the host needs (offsets measured over the game's archives, tools/shader_census.py).
 typedef struct {
     uint32_t size;             // the control section's own size (+0xd4; the archives repeat it at +0x30)

@@ -110,6 +110,7 @@ typedef struct {
     int tensor;                                    // HMMA to the MMA marker (sm86_lower_tensor_cores, compute)
     int hmma_count;                                // HMMAs lowered so far (OOT_TENSOR_HMMA_MASK)
     uint32_t index;                                // the current native instruction
+    uint32_t nptr, ptr_desc[SM86_PTR_MAX], ptr_off[SM86_PTR_MAX];   // storage-held pointers (lower_ldg)
     int failed;
     char error[96];
     uint32_t error_index;
@@ -1490,6 +1491,69 @@ static void lower_cs2r(L *l, const Insn *x) {
     if (bits(x, 80, 1)) mov_imm(l, rd + 1, 0);
 }
 
+// A 64-bit load into rd..rd+1 from [uniform pair urn + offset], where urn..urn+1 hold a storage buffer's address as
+// a bank-0 constant (ULDC.64 c0[desc] earlier in the block): a pointer the program loads through next (sm86_lower.h
+// SM86_PTR_C0). 2026-11-07: the volumetric fog's in-scattering kernel (1a62084a) reads five pointers from the
+// 0x40-byte table at c0+0x60 and its light and froxel data through them; the translator could trace none of those
+// 208 loads to a buffer and returned zero for each ("Failed to find storage buffer"). Eight more of the level's
+// kernels read pointers the same way (from c0+0x100, c0+0x30). Lowered to a read of c0[SM86_PTR_C0 + 8 i], which the
+// host fills with the pointer: the translator then sees a bank-0 base and binds the buffer behind it. Only a load
+// whose pair is used as an address next (used_as_address) is rewritten.
+static int ptr_loads_on(void) {
+    const char *e = getenv("OOT_SM86_PTR");
+    return !e || strcmp(e, "0") != 0;
+}
+
+// Registers an instruction writes from its destination field (16-23): wide loads, texture fetches and IMAD.WIDE
+// several, the rest one. Instructions without a destination there hold R0 or RZ in the field; the caller skips both.
+static uint32_t dest_count(const Insn *y) {
+    uint32_t op = y->w[0] & 0xfff, base_op = op & 0x1ff;
+    if (base_op == 0x181 || base_op == 0x183 || base_op == 0x184 || base_op == 0x182) {
+        uint32_t size = bits(y, 73, 3);
+        return size == 6 ? 4 : size == 5 ? 2 : 1;
+    }
+    if (base_op == 0x160 || base_op == 0x161 || base_op == 0x163 || base_op == 0x166 || base_op == 0x197) return 4;
+    if (base_op == 0x025 || base_op == 0x0a5) return 2;   // IMAD.WIDE
+    return 1;
+}
+
+// The pair rd..rd+1 loaded at instruction `at` is used as an address before either half is written again: the base
+// of an IMAD.WIDE (the third source) or the address register of a global load, store or atomic. In program order,
+// which is how the compiler laid the pointer's live range out here; a plain 64-bit value (a count, an offset the
+// GPU may write) keeps its storage load.
+static int used_as_address(const L *l, uint32_t at, uint32_t rd) {
+    for (uint32_t j = at + 1; j < l->n && j < at + 4096; j++) {
+        const Insn *y = &l->in[j];
+        uint32_t op = y->w[0] & 0xfff;
+        if (bits(y, 12, 4) == 15) continue;
+        if ((op == 0x225 || op == 0x825) && bits(y, 64, 8) == rd) return 1;
+        if ((op == 0x381 || op == 0x386 || op == 0x3a8 || op == 0x38e) && bits(y, 24, 8) == rd) return 1;
+        uint32_t d = bits(y, 16, 8), n = dest_count(y);
+        if (d != RZ && d != 0 && d <= rd + 1 && d + n > rd) return 0;
+    }
+    return 0;
+}
+
+static int ptr_load(L *l, uint32_t urn, uint32_t offset, uint32_t rd) {
+    if (l->graphics || urn >= 62 || rd == RZ || rd == 0 || (rd & 1) || !ptr_loads_on()) return 0;
+    if (!used_as_address(l, l->index, rd)) return 0;
+    if (l->cur_def[urn].kind != 1 || l->cur_def[urn].bank != 0 || l->cur_def[urn + 1].kind != 1 ||
+        l->cur_def[urn + 1].bank != 0 || l->cur_def[urn + 1].value != l->cur_def[urn].value + 4)
+        return 0;
+    uint32_t desc = l->cur_def[urn].value, i = 0;
+    while (i < l->nptr && (l->ptr_desc[i] != desc || l->ptr_off[i] != offset)) i++;
+    if (i == l->nptr) {
+        if (l->nptr == SM86_PTR_MAX) return 0;
+        l->ptr_desc[i] = desc, l->ptr_off[i] = offset, l->nptr++;
+    }
+    Src s = {0};
+    s.kind = 2, s.cb_bank = 0, s.cb_off = SM86_PTR_C0 + 8 * i;
+    mov_cbuf(l, rd, &s);
+    s.cb_off += 4;
+    mov_cbuf(l, rd + 1, &s);
+    return 1;
+}
+
 // LDG (0x181 register address, 0x981 with a uniform base at 32-37 or none): size 73-75 (Maxwell's), 24-bit
 // offset at 40-63, address register pair at 24-31 (.E).
 static void lower_ldg(L *l, const Insn *x, uint32_t op) {
@@ -1506,6 +1570,7 @@ static void lower_ldg(L *l, const Insn *x, uint32_t op) {
         if (descriptor) {
             if (address & 1) return (void)fail(l, "LDG descriptor address");
         } else if (address == RZ) {
+            if (size == 5 && ptr_load(l, bits(x, 32, 6), offset, rd)) return;
             address = ubase;
         } else {
             // 64-bit add of the uniform pair and the register (pair with bit 90, else zero-extended).
@@ -1554,11 +1619,13 @@ static void lower_stg(L *l, const Insn *x, uint32_t op) {
 // NVN's order 1D, buffer, 1D array, 2D, 2D array, 3D), data at 32-39, channel mask 72-75. Maxwell SUST.B (bindless, Ryujinx InstSustB):
 // data 0-7, coordinates 8-15, mask 20-23, dimension 33-35, handle register 39-46; the handle is loaded from the
 // constant word as TEX.B's is, and the translator's bindless elimination turns it back into the constant's slot.
+static int probe_drops(uint32_t cb_bank, uint32_t cb_off);
 static void lower_sust(L *l, const Insn *x) {
     uint32_t coord = bits(x, 24, 8), data = bits(x, 32, 8), dim = bits(x, 61, 3), mask = bits(x, 72, 4);
     if (bits(x, 76, 5) || dim > 5 || bits(x, 81, 3) != 0) return (void)fail(l, "SUST mode");
     Src h = {0};
     h.kind = 2, h.cb_off = bits(x, 40, 14) * 4, h.cb_bank = bits(x, 54, 5);
+    if (probe_drops(h.cb_bank, h.cb_off)) return;   // OOT_SM86_PROBE owns that image
     if (!cbuf_ok(&h)) return (void)fail(l, "SUST handle");
     uint32_t hr = to_reg(l, h, 4, 0, 0);
     emit(l, 0xeb20000000000000ull | l->pred | data | ((uint64_t)coord << 8) | ((uint64_t)mask << 20) | ((uint64_t)dim << 33) |
@@ -2808,6 +2875,73 @@ static void lower_one_inner(L *l, const Insn *x) {
     }
 }
 
+// ---- OOT_SM86_PROBE (diagnostic): a register's value at one instruction of one compute program
+// OOT_SM86_PROBE=<code hash, hex>:<instruction offset, hex>:<register>[:<image handle offset, hex>]: after the
+// instruction at that offset, every thread stores the flags (isnan v, v > 0, v < 0) scaled to 2^-14, and 1, of the
+// register read as a float, into the storage image whose handle is the constant c0[handle] (default 0x98) at its
+// global invocation id, and goes on; at the program's start each thread stores (0, 0, 0, 1) there, and the program's
+// own stores into that image are dropped. A frame dump (OOT_DUMP=cs:<id>) then shows in that image's channel maxima
+// whether any thread saw v NaN (R), positive (G) or negative (B). Compute programs only.
+// Translate the probed program alone: a copy of the warm shader cache with that program's translation removed
+// (OOT_SHADER_CACHE). An empty cache (run.py --fresh-cache) translated every shader in the background and lost the
+// device on the title screen, and repeated device losses took Windows down once (bugcheck 0x10E, 2026-11-07).
+static struct { int on; uint32_t at, reg, handle; } probe;
+static uint32_t probe_local[3];
+
+// The program is named by the FNV-1a 64 of its code (tools/kernel.py prints it as "hash"; OOT_TENSOR_ONLY matches the
+// same): a code size alone matched another compute program on the title screen and hung the GPU there.
+static void probe_init(const uint8_t *code, uint32_t code_size) {
+    const char *e = getenv("OOT_SM86_PROBE");
+    probe.on = 0;
+    if (!e || !*e) return;
+    unsigned long long want = 0;
+    unsigned at = 0, reg = 0, handle = 0x98;
+    if (sscanf(e, "%llx:%x:%u:%x", &want, &at, &reg, &handle) < 3 || reg > 254) return;
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < code_size; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+    if (h != want) return;
+    probe.on = 1, probe.at = at, probe.reg = reg, probe.handle = handle;
+}
+
+static uint32_t log2u(uint32_t v) { uint32_t s = 0; while ((1u << s) < v) s++; return s; }
+static int probe_drops(uint32_t cb_bank, uint32_t cb_off) { return probe.on && cb_bank == 0 && cb_off == probe.handle; }
+
+// init: at the program's start, (0, 0, 0, 1) into the thread's voxel, so that a voxel the probe point never reaches
+// holds a bounded value for the kernels that read the image next (left unwritten, the image's old contents hung the
+// GPU there, 2026-11-07).
+static void probe_emit(L *l, int init) {
+    uint64_t saved = l->pred;
+    l->pred = (uint64_t)PT << 16;
+    uint32_t d = S(l, 0), c = S(l, 4), t = S(l, 8);
+    S(l, 3), S(l, 6);   // reserve d..d+3 and c..c+2
+    if (l->failed) return;
+    uint32_t v = probe.reg;
+    if (init) {
+        mov_imm(l, d, 0), mov_imm(l, d + 1, 0), mov_imm(l, d + 2, 0);
+    } else {
+        // FSET.BF (Maxwell R form): 1.0 or 0.0 from v cmp b; NaN 8 (v against itself), GT 4 and LT 1 (against zero).
+        emit(l, base(l, 0x5800000000000000ull, d, v) | ((uint64_t)v << 20) | ((uint64_t)PT << 39) | ((uint64_t)8 << 48) | ((uint64_t)1 << 52));
+        emit(l, base(l, 0x5800000000000000ull, d + 1, v) | ((uint64_t)RZ << 20) | ((uint64_t)PT << 39) | ((uint64_t)4 << 48) | ((uint64_t)1 << 52));
+        emit(l, base(l, 0x5800000000000000ull, d + 2, v) | ((uint64_t)RZ << 20) | ((uint64_t)PT << 39) | ((uint64_t)1 << 48) | ((uint64_t)1 << 52));
+        // Scaled to 2^-14, the smallest normal of the volume's R11G11B10 format: the next kernel (c82d3cba) loops on
+        // the in-scattering it reads, and flags of 1.0 there hung the GPU (zeros and NaN do not, 2026-11-07).
+        for (uint32_t k = 0; k < 3; k++) emit(l, 0x1e00000000000000ull | l->pred | (d + k) | ((uint64_t)(d + k) << 8) | ((uint64_t)0x38800000u << 20));
+    }
+    mov_imm(l, d + 3, 0x3f800000);
+    for (uint32_t i = 0; i < 3; i++) {   // c + i = ctaid.i * local.i + tid.i
+        emit(l, 0xf0c8000000000000ull | l->pred | (c + i) | ((uint64_t)(33 + i) << 20));   // SR_TID.X+i
+        emit(l, 0xf0c8000000000000ull | l->pred | t | ((uint64_t)(37 + i) << 20));         // SR_CTAID.X+i
+        emit(l, base(l, SHL_IMM(0, 0, 0), t, t) | ((uint64_t)log2u(probe_local[i]) << 20));
+        emit(l, base(l, 0x5c10000000000000ull, c + i, c + i) | ((uint64_t)t << 20));       // IADD
+    }
+    Src h = {0};
+    h.kind = 2, h.cb_off = probe.handle, h.cb_bank = 0;
+    uint32_t hr = to_reg(l, h, 7, 0, 0);
+    emit(l, 0xeb20000000000000ull | l->pred | d | ((uint64_t)c << 8) | ((uint64_t)0xf << 20) | ((uint64_t)5 << 33) |
+                ((uint64_t)hr << 39));
+    l->pred = saved;   // the program goes on; its own stores into the probed image are dropped (lower_sust)
+}
+
 // ---- the program
 
 void sm86_lower_free(Sm86Lowered *out) {
@@ -2838,6 +2972,8 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
     if (l.n == 0 || l.n > 65536) { snprintf(out->error, sizeof out->error, "program size"); return 0; }
     l.first_out = calloc(l.n + 1, sizeof *l.first_out);
     if (!l.first_out) { snprintf(out->error, sizeof out->error, "out of memory"); return 0; }
+    probe_init(code, code_size);
+    if (probe.on) for (int i = 0; i < 3; i++) probe_local[i] = c.local[i] ? c.local[i] : 1;
     scan_registers(&l);
     int blocks = build_blocks(&l);
     if (!blocks) free(l.leader), l.leader = NULL;              // a jump table without its record: no local forwarding
@@ -2851,7 +2987,9 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
         l.first_out[l.index] = l.nout;
         if (l.leader && l.leader[l.index]) memset(l.cur_def, 0, sizeof l.cur_def);
         if (l.liveness) scratch_at(&l, l.index);
+        if (probe.on && !l.graphics && l.index == 0) probe_emit(&l, 1);
         lower_one(&l, &l.in[l.index]);
+        if (probe.on && !l.graphics && header + l.index * 16 == probe.at) probe_emit(&l, 0);
         int pair;
         uint8_t kind, bank;
         uint32_t value;
@@ -2902,6 +3040,18 @@ int sm86_lower_ex(const uint8_t *code, uint32_t code_size, const uint8_t *contro
                     if (v % 16 == 0 && v / 16 < l.n) v = addr_of(&l, l.first_out[v / 16]), memcpy(out->c1 + e * 4, &v, 4);
                 }
             }
+        }
+    }
+    if (!l.failed && l.nptr && out->c1) {
+        // The storage-held pointer table at the end of c1 (sm86_lower.h SM86_PTR_MAGIC), read by the host.
+        uint32_t extra = l.nptr * 8 + 8, at = out->c1_len;
+        uint8_t *grown = realloc(out->c1, (size_t)at + extra);
+        if (!grown) fail(&l, "out of memory");
+        else {
+            out->c1 = grown, out->c1_len = at + extra;
+            for (uint32_t i = 0; i < l.nptr; i++) memcpy(grown + at + 8 * i, &l.ptr_desc[i], 4), memcpy(grown + at + 8 * i + 4, &l.ptr_off[i], 4);
+            uint32_t tail[2] = {l.nptr, SM86_PTR_MAGIC};
+            memcpy(grown + at + 8 * l.nptr, tail, 8);
         }
     }
     if (!l.failed) {

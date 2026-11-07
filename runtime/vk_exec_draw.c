@@ -29,6 +29,7 @@
 #include "nvn_api.h"
 #include "tex.h"
 #include "nvn_hmap.h"
+#include "sm86_lower.h"
 #include "vk.h"
 #include "vk_exec.h"
 
@@ -936,12 +937,22 @@ static int nvn2_cs_layout(const VkExec *ex, uint32_t *base, uint32_t *ns, uint32
     return 1;
 }
 
+static uint32_t ptr_count(int st);
+static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
+
 static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     memset(bank, 0, VK_C0_BYTES);
     memcpy(bank, c0_dim, 12);
     memcpy(bank + 0x10, ex->push_cc, ex->push_cc_len);
     uint32_t base, ns, nt, ni;
     if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni)) return;
+    // The storage-held pointers the lowering moved to c0 (sm86_lower.h SM86_PTR_C0), unless the tables reach there.
+    uint32_t np = ptr_count(NVN_STAGE_CS);
+    if (np && base + 16 * ns + 8 * nt + 8 * ni <= SM86_PTR_C0)
+        for (uint32_t i = 0; i < np; i++) {
+            uint64_t p = ptr_value(ex, NVN_STAGE_CS, i);
+            memcpy(bank + SM86_PTR_C0 + 8 * i, &p, 8);
+        }
     uint32_t o = base;
     for (uint32_t k = 0; k < ns && k < 16 && o + 16 <= VK_C0_BYTES; k++, o += 16) {
         uint32_t size = (uint32_t)ex->ssbo[NVN_STAGE_CS][k].size;
@@ -1108,6 +1119,65 @@ static uint64_t ubo_ptr(const VkExec *ex, int st, const GfxShaderRes *r) {
     return a;
 }
 
+// ---- storage-held pointers (sm86_lower.h SM86_PTR_C0)
+// The lowered program's table at the end of its c1: entry i names the bank-0 offset of a storage buffer's address
+// (desc) and an offset into that buffer, where the program reads a 64-bit pointer it then loads through. The
+// pointer goes into c0[SM86_PTR_C0 + 8 i] (nvn2_c0_fill_cs), and a storage binding whose address the translator
+// traced to that word is bound at the pointer, up to the end of its backing (ssbo_info), as ubo_ptr does for
+// pointers in uniform blocks. The pointer is read as the submission left it (an inline update) or from memory.
+static const uint8_t *ptr_table(int st, uint32_t *count) {
+    const GfxShader *s = st >= 0 && st < 6 ? C1CUR[st] : NULL;
+    uint32_t n = 0, tail[2];
+    const uint8_t *c1 = s ? gfx_shader_c1(s, &n) : NULL;
+    *count = 0;
+    if (!c1 || n < 8) return NULL;
+    memcpy(tail, c1 + n - 8, 8);
+    if (tail[1] != SM86_PTR_MAGIC || tail[0] == 0 || tail[0] > SM86_PTR_MAX || 8 + 8 * tail[0] > n) return NULL;
+    *count = tail[0];
+    return c1 + n - 8 - 8 * tail[0];
+}
+
+static uint32_t ptr_count(int st) {
+    uint32_t n;
+    ptr_table(st, &n);
+    return n;
+}
+
+static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i) {
+    uint32_t n, e[2];
+    const uint8_t *t = ptr_table(st, &n);
+    if (!t || i >= n) return 0;
+    memcpy(e, t + 8 * i, 8);
+    int kind = -1, s = nvn2_c0_slot(ex, e[0], &kind);
+    if (s < 0 || kind != 0 || s >= 16) return 0;
+    const p_bind_buf *b = &ex->ssbo[st][s];
+    uint64_t a = b->addr + e[1], v = 0;
+    VkMemSpan sp;
+    int how = 0;
+    if (!b->addr || (b->size && b->size < (uint64_t)e[1] + 8)) how = 3;
+    else if (upd_read(ex, a, &v, 8)) how = 1;
+    else if (vk_mem_resolve(a, 8, &sp)) memcpy(&v, (const void *)(uintptr_t)a, 8), how = 2;
+    static uint64_t seen[64];   // log each distinct (place, pointer) once
+    static int nseen;
+    uint64_t key = (a * 0x9E3779B97F4A7C15ull) ^ v;
+    int known = 0;
+    for (int k = 0; k < nseen && !known; k++) known = seen[k] == key;
+    if (!known && nseen < 64) {
+        seen[nseen++] = key;
+        rt_log("vk_exec: storage-held pointer %u: c0+%#x slot %d (%#llx+%#llx) at +%#x -> %#llx (%s)", i, e[0], s,
+               (unsigned long long)b->addr, (unsigned long long)b->size, e[1], (unsigned long long)v,
+               how == 1 ? "inline update" : how == 2 ? "memory" : how == 3 ? "out of the buffer" : "unmapped");
+    }
+    return v;
+}
+
+// The pointer entry a bank-0 storage binding of an NVN2 compute program names; -1 for the others.
+static int ptr_res(const VkExec *ex, int st, const GfxShaderRes *r) {
+    uint32_t off = (uint32_t)r->handle * 4;
+    if (r->cbuf_slot != 0 || off < SM86_PTR_C0 || off >= SM86_PTR_C0 + 8 * SM86_PTR_MAX || (off - SM86_PTR_C0) % 8) return -1;
+    return (int)((off - SM86_PTR_C0) / 8) < (int)ptr_count(st) && nvn2_cs(ex, st) ? (int)((off - SM86_PTR_C0) / 8) : -1;
+}
+
 static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *r, int written) {
     if (!__atomic_load_n(&LIM.ubo_max, __ATOMIC_ACQUIRE)) limits_init();
     uint64_t max = LIM.sbo_max, align = LIM.sbo_align;
@@ -1115,8 +1185,10 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
     int ubo, slot = ssbo_slot(r, st, &ubo);
     p_bind_buf up = {0};
     const p_bind_buf *b = NULL;
+    int pi;
     if (slot >= 0 && slot < 16) b = ubo ? &ex->ubo[st][slot] : &ex->ssbo[st][slot];
     else if (ubo_ptr_res(r)) up.addr = ubo_ptr(ex, st, r), b = &up;   // size 0: up to the end of the backing
+    else if ((pi = ptr_res(ex, st, r)) >= 0) up.addr = ptr_value(ex, st, (uint32_t)pi), b = &up;   // the same
     else if (r->cbuf_slot == 0 && nvn2_cs(ex, st)) {                  // NVN2: the slot the bank-0 entry belongs to
         int kind, s2 = nvn2_c0_slot(ex, (uint32_t)r->handle * 4, &kind);
         if (s2 >= 0 && kind == 0 && s2 < 16) b = &ex->ssbo[st][s2];
