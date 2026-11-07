@@ -4,6 +4,78 @@ Hand-off written 2026-11-05 at commit `b46d663`, for a fresh session. Read `CLAU
 history is in `docs/plan.md` (Phases 0 to 2 and the NVN2 survey). This file says where the port stands, exactly what
 blocks it, what is already measured, and the order to do the work in.
 
+## Current state (2026-11-08): read this first
+
+The dated Status sections below are the lab notebook, oldest first; this one is the summary. Branch `visuals` of the
+fork (Ryzen1998), last commit `932a551`.
+
+### What works
+
+- Boot, title, menus and the opening run; the replay (`build/logs/a-spam.txt`, presses A) reaches Kokiri Forest /
+  the Deku Tree area about 75 s in (frame ~4500). The level runs at ~59 fps by default, no driver reset, no crash.
+- Much of the scene renders lit and textured: Navi, Link, rocks, moss, roots, the stone path, dialogue text.
+- With `OOT_GW=1 OOT_MESH=1 OOT_MESH_IND=1` (off by default) the frame's GPU culling counts and the indirect mesh
+  draws run: the ground under Link is drawn for the first time (`build/logs/gwskip-ground.png`), ~45 fps.
+
+### What is still wrong
+
+1. **White areas.** Found with frame dumps (2026-11-08): each frame fills its HDR target with the sky first (values
+   24..34), then draws the scene over it; where no geometry is drawn the lit sky shows and tone-maps to white. So the
+   white is missing geometry, in default runs too (the clean default screenshots were taken in dark spots). Sources:
+   the indirect mesh draws (off by default, bounded), 12 task/mesh programs that do not lower, possibly more.
+2. **The picture is dark/over-bright in places** with the ground draws on (yellow, speckled ground); not studied yet.
+3. **Fog** kernel 1a62084a: ~60% NaN volume, skipped (`OOT_SKIP_CS=1a62084a` in every test run).
+4. Untested: controller play, other areas, scene loads, combat, saving, the movies (skipped in tests).
+
+### What was found and fixed (2026-11-07 / 11-08, in order)
+
+| Commit | Bug | Effect |
+|---|---|---|
+| `4669605` | The lowering's record-less jump-table fix-up rewrote constant bank 1 in programs without a BRX (the culling's 64-bit offset 12 became 8 << 32 + 12) | culling counters were written 32 GiB away |
+| `0804b09` | Accesses through pointers loaded at run time had no storage buffer (49 in culling kernel e6d5432f) | global window: translator patch 0019 + `gw_select`, `OOT_GW=1` |
+| `c8441d1` | PLOP3 was lowered to PSETP with its first and third operands swapped (asymmetric tables wrong; 231 of 902 programs change, KEY_VERSION 20) | every culling thread exited before its atomics |
+| `c8441d1` | Ryujinx's `Red` reads RED's 20-bit offset unsigned (`Atom` sign-extends) | `RED [p - 12]` went 1 MiB off; translator patch 0020 |
+| `c8441d1` | Indirect mesh draws were never run | `op_draw_mesh` runs them: bound of task workgroups, count copied on the GPU to bank 0 + 0x628, `task_prologue` (KEY 21) |
+| `00c4d56` | Task records were 0x100 bytes; the indirect draws' task programs write payload to ~0x898 | records 0x1000 (KEY 22) |
+| `7ed675d` | The global window was never filled for task/mesh stage dispatches | task program c7f0444a read 0 and looped 0x07ffffff times: the device losses of run-126..135 |
+| `0c2f1a0` | Storage views ignored the game's R32 view format (the AA kernel stores packed R11G11B10 through R32UI) | R32 views, STORAGE by extension (`storage_r32`), live image over the same bytes |
+| `932a551` | Kernels 374126bf / 358beb27 (wrong traces: stores to float words of bank 3) got window entries over the culling results | game crash at main+0xc938d0 in 3/12 `OOT_GW=1` runs; `OOT_GW_SKIP` |
+
+### Diagnostics added (keep using them)
+
+- `OOT_SM86_COUNT=<code hash>:<off>[=rN|=pN],...`: per instruction, how many threads arrive (or the sum of a register,
+  or of a predicate bit), for any compute/task/mesh program; logged every 120 frames and **at a device loss** (the
+  counters live in host memory). It found both the PLOP3 bug and the hang. The code hash is `kernel.py`'s "hash".
+- `OOT_IND_LOG=<frame>` (indirect dispatch group counts + counter word), `OOT_MESH_LOG=1` + `OOT_MESH_LOG_FROM`
+  (indirect mesh draw arguments), `OOT_MESH_WATCH[=<frame>]` (who writes the arguments; a frame's dispatch list),
+  `OOT_GW_TRACE=<id prefix>` (a kernel's pointer chains), `OOT_WATCH_RANGE=<lo>:<hi>[,...]` (every GPU write that may
+  land in a range), `meshind:` lines (each new task/mesh pair of an indirect draw, logged before it is recorded).
+- Indirect draw knobs: `OOT_MESH_IND_MAX` (bound, default 64), `OOT_MESH_IND_FROM=<frame>`, `OOT_MESH_IND_ONLY` /
+  `OOT_MESH_IND_SKIP=<hash prefixes>`. Window: `OOT_GW_SKIP=<id prefixes>` (default `374126bf,358beb27`).
+- Frame dumps (`run.py --dump <frame>`, `OOT_DUMP_SKIP_RUNS=1`): `images.txt` has per-target min/max/NaN; float
+  targets are saved clipped (`_tm.png` is tone-mapped). Dispatches are named by a hash of their **SPIR-V**, not the
+  input id: hash the cache's `.spv` files to find one.
+
+### What to do next, in order
+
+1. **Lower the 12 failing indirect-only programs** (11 mesh, 1 task): "no general register dead over a uniform
+   register's span" / "no register pair..." at +0x80/+0x320 (register pressure at the start), two "uniform datapath
+   opcode" (c6f3721f +0x490, 072eb70d +0x4de0). Their draws are skipped.
+2. **Indirect draws**: raise `OOT_MESH_IND_MAX` or read the real counts, test from the title (only frame ≥ 4500
+   tested since the fixes), then look at the over-bright speckled ground.
+3. **Default on**: when several full runs with `OOT_GW=1 OOT_MESH=1 OOT_MESH_IND=1` stay free of resets and crashes,
+   make them the defaults (cost: ~45 vs ~59 fps; profile `gw_select` with `OOT_TRACE=perf`).
+4. Find the remaining missing geometry (a frame dump with everything on: which draws leave sky).
+5. The fog kernel's NaN; the wrong traces of 374126bf / 358beb27 (fix them rather than skip them).
+6. A controller play session to see what blocks real play.
+
+### Safety (learned the hard way)
+
+Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`. After every GPU run count nvlddmkm
+events; after any reset stop and reboot before the next run (check `LastBootUpTime`). Bisect a hang by halves with
+`OOT_MESH_IND_ONLY` / `OOT_SKIP_CS` and put `OOT_SM86_COUNT` points in the suspect: its dump at the device loss
+shows the loop. Run one game at a time (`run.py` refuses overlaps).
+
 ## Status (2026-11-05, later the same day)
 
 Steps 1 to 3 of the order of work below are done; step 4 is at 86% of the corpus; step 5 is where the work is.
@@ -654,7 +726,7 @@ A contributor's run on native Windows (RTX 5070 Ti, driver 621.01, no WSL), from
 - **Hazards met.** A probe run must translate the probed program alone (a copy of the warm shader cache with its
   translation removed): an empty cache translated everything in the background and lost the device on the title
   screen. Flags of 1.0 in the volume made the next kernel (c82d3cba) loop until the GPU timed out; skipping c82d3cba
-  also loses the device. Eight such losses in an hour took Windows down once (bugcheck 0x10E). The start-up crash came\n  about one run in three on this machine before the fiber fix above; `tools/run.py` works unchanged under native Windows Python.
+  also loses the device. Eight such losses in an hour took Windows down once (bugcheck 0x10E). The start-up crash came about one run in three on this machine before the fiber fix above; `tools/run.py` works unchanged under native Windows Python.
 
 ## Where the port stands
 

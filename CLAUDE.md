@@ -58,12 +58,13 @@ discard buffer, not the shared zero buffer: the level now runs at about 50 fps (
 Mesh draws (`DrawMeshTasks*`) are implemented behind `OOT_MESH=1` (off by default): the task and mesh programs run as
 compute programs on per-workgroup records and a generated pass-through vertex program draws the records with the
 game's fragment stage; the direct draws (depth pre-pass, shadows) work, the indirect ones (most of the ground's colour)
-are not run by default. 2026-11-08: the culling that feeds them counts now (PLOP3 lowering fixed, KEY_VERSION 20;
-translator patch 0020 for RED's signed offset) when the global window is on (`OOT_GW=1`, translator patch 0019); the
-indirect mesh draws run behind `OOT_MESH_IND=1` (with `OOT_MESH=1`), not yet seen working: the first run with them lost
-the device (cause not isolated). `OOT_SM86_COUNT` counts threads (and sums registers or predicates) at instructions of
-one compute program, for bisecting a kernel. `docs/phase3.md`, the Status sections of 2026-11-07 and 11-08, has the
-details and the order of what is left.
+are not run by default. 2026-11-08: with `OOT_GW=1 OOT_MESH=1 OOT_MESH_IND=1` (all off by default) the frame's GPU
+culling counts and the indirect mesh draws run without device loss: the Kokiri Forest ground is drawn (PLOP3 lowering,
+translator patches 0019/0020, task records of 0x1000, the window for task/mesh stages; KEY_VERSION 22). The white
+areas are the sky the frame draws first, showing where geometry is still missing (12 task/mesh programs do not lower).
+`OOT_SM86_COUNT` counts threads at instructions of one program and dumps its counters at a device loss: the tool for
+any GPU hang. **`docs/phase3.md` "Current state (2026-11-08)" is the summary: what works, what was fixed, the
+diagnostics, and the order of what is left.**
 
 ## GPU safety (learned 2026-11-07)
 
