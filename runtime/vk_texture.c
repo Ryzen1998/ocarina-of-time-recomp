@@ -835,10 +835,30 @@ static int img_block(const Tex *e, int *bw, int *bh) {
     return e->f.vk == e->f.ideal ? b : 0;
 }
 
+// A single-channel colour entry over the storage of a depth entry with the same bits: Maxwell reads a depth target's
+// storage through an R32_FLOAT (D32F) or R16_UNORM (D16) descriptor as plain texels, while here they are two images.
+// OoT renders a 4096x4096 D32F depth map and samples its storage as R32F in the volumetric fog's in-scattering kernel
+// (1a62084a) and in fragment shaders of the level frame; that image was never written, and they sampled undefined
+// texels (2026-11-07; the fog's NaN has another cause, docs/phase3.md). Same shape, one sample, the same storage size
+// and layout.
+static int depth_colour_on(void);
+static int depth_colour_pair(const Tex *colour, const Tex *depth) {
+    const VkTexImage *c = &colour->pub, *d = &depth->pub;
+    if (!depth_colour_on() || !depth->f.depth || colour->f.depth || colour->f.stencil) return 0;
+    if (!((d->format == VK_FORMAT_D32_SFLOAT && c->format == VK_FORMAT_R32_SFLOAT) ||
+          (d->format == VK_FORMAT_D16_UNORM && c->format == VK_FORMAT_R16_UNORM)))
+        return 0;
+    if (c->samples > 1 || d->samples > 1 || c->type != d->type || c->width != d->width || c->height != d->height ||
+        c->depth != d->depth || c->layers != d->layers)
+        return 0;
+    return colour->t.L.size == depth->t.L.size && nvn_tex_is_linear(&colour->t.d) == nvn_tex_is_linear(&depth->t.d);
+}
+
 // The new entry e can take src's content texel for texel: colour, one sample, the same shape and storage layout, and
-// image formats of one block size.
+// image formats of one block size; or a colour entry over a depth entry of the same bits (depth_colour_pair).
 static int alias_compatible(const Tex *e, const Tex *src) {
     const VkTexImage *p = &e->pub, *q = &src->pub;
+    if (depth_colour_pair(e, src)) return 1;
     if (e->f.depth || e->f.stencil || src->f.depth || src->f.stencil || p->samples > 1 || q->samples > 1) return 0;
     if (p->type != q->type || p->width != q->width || p->height != q->height || p->depth != q->depth) return 0;
     if (e->t.L.size != src->t.L.size || nvn_tex_is_linear(&e->t.d) != nvn_tex_is_linear(&src->t.d)) return 0;
@@ -883,7 +903,13 @@ static int alias_copy(Tex *e, const Tex *src) {
         return 0;
     }
     barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
-    vkCmdCopyImageToBuffer(cb, src->pub.image, VK_IMAGE_LAYOUT_GENERAL, buf, n, rg);
+    if (src->f.depth) {   // depth_colour_pair: the depth aspect's texels have the colour format's bytes
+        for (uint32_t i = 0; i < n; i++) rg[i].imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        vkCmdCopyImageToBuffer(cb, src->pub.image, VK_IMAGE_LAYOUT_GENERAL, buf, n, rg);
+        for (uint32_t i = 0; i < n; i++) rg[i].imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    } else {
+        vkCmdCopyImageToBuffer(cb, src->pub.image, VK_IMAGE_LAYOUT_GENERAL, buf, n, rg);
+    }
     VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
                            .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_COPY_BIT,
                            .dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT};
@@ -1015,6 +1041,38 @@ void vk_texture_gpu_written(const tex_t *t) {
     lock();
     Tex *e = entry_of(t);
     if (e) written_locked(e);
+    unlock();
+}
+
+// A render pass with depth target t ended (vk_exec.c vk_exec_pass_end, outside the pass): the live colour entries over
+// its storage that read it as plain texels (depth_colour_pair) get its new content, as Maxwell would show them through
+// their descriptors. Entries made after this take it when they are created (entry_of, alias_copy). Off with
+// OOT_TEX_ALIAS=0 or OOT_DEPTH_COLOUR=0 (the latter keeps the colour aliases).
+static uint64_t n_depth_copied;
+static int depth_colour_on(void) {
+    static int on = -1;
+    if (on < 0) on = rt_knob("DEPTH_COLOUR", "1");
+    return on;
+}
+void vk_texture_depth_rendered(const tex_t *t) {
+    if (!t || !t->mem || !tex_alias || !depth_colour_on()) return;
+    TexKey k;
+    make_key(t, &k);
+    lock();
+    Tex *d = nvn_hm_get(&by_key, &k);
+    if (d && !d->released && d->f.depth) {
+        for (Tex *p = nvn_hm_get(&by_addr, &k.addr); p; p = p->next_at) {
+            if (p == d || p->released || !depth_colour_pair(p, d) || !alias_copy(p, d)) continue;
+            // the image now holds GPU content newer than its storage bytes, as after alias_copy in entry_of
+            if (p->pub.mirrored) vk_mem_changed(p->pub.addr, p->t.L.size, 0, &p->wgen), p->uploaded = 1;
+            p->pub.gpu_owned = 1;
+            uint64_t f = vk_exec_recording_fence();
+            if (f > p->wr_fence) p->wr_fence = f;
+            if (n_depth_copied++ < 4)
+                rt_log("vk: depth target %ux%u (VkFormat %d) copied into the %s texture over its storage", d->pub.width,
+                       d->pub.height, (int)d->pub.format, p->pub.format == VK_FORMAT_R32_SFLOAT ? "R32_SFLOAT" : "R16_UNORM");
+        }
+    }
     unlock();
 }
 

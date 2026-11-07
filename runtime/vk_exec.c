@@ -672,7 +672,10 @@ void vk_exec_pass_end(VkExec *ex) {
     uint64_t stamp = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED) + 1;
     for (int i = 0; i < 8; i++)
         if (ex->color[i].image) vk_texture_gpu_written(ex->color[i].tex), tfr_note(&ex->color[i], stamp);
-    if (ex->depth.image) vk_texture_gpu_written(ex->depth.tex), tfr_note(&ex->depth, stamp);
+    if (ex->depth.image) {
+        vk_texture_gpu_written(ex->depth.tex), tfr_note(&ex->depth, stamp);
+        if (ex->pass_depth) vk_texture_depth_rendered(ex->depth.tex);   // R32F views of a depth map (vk_texture.c)
+    }
 }
 
 VkCommandBuffer vk_exec_inline_begin(int *reopen) {
