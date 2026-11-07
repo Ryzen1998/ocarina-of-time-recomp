@@ -1909,9 +1909,12 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
             if (InterlockedIncrement(&said) <= 8) {
                 char hx[17];
                 shader_hex(C1CUR[st], hx);
+                VkMemSpan s1;   // what its first byte resolves to: contiguous bytes from there, and the class
+                int r1 = vk_mem_resolve(b->addr, 1, &s1);
                 rt_log("vk: storage buffer %#llx+%#llx (stage %d, c%d+%#x, program %s) is not backed or not aligned: a zero "
-                       "buffer is bound", (unsigned long long)b->addr, (unsigned long long)b->size, st, r->cbuf_slot,
-                       (uint32_t)r->handle * 4, hx);
+                       "buffer is bound (first byte: %s, %#llx contiguous, class %d)", (unsigned long long)b->addr,
+                       (unsigned long long)b->size, st, r->cbuf_slot, (uint32_t)r->handle * 4, hx, r1 ? "backed" : "not backed",
+                       (unsigned long long)s1.avail, s1.cls);
             }
         }
     } else {

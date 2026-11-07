@@ -325,6 +325,33 @@ now, but still writes NaN in ~69% of its volume, and the frame goes black with i
   0x3f12864e3e51b3a4 (two floats read as a pointer) is kernel 374126bf's c3+0x640, and 0x1501194600+0xfd200 (render
   target memory used as storage) is programs 745220f3 and 3f15911a, c0+0x110/0x1c0. Both are leads of their own.
 
+### Status (2026-11-09, night 2): the shadow culling chain, and a virtual pool the GPU could not see
+
+Runs run-213 to run-219, 0 driver resets.
+
+- **Who writes the shadow draws' counts** (`OOT_MESH_WATCH=1` with `OOT_MESH_LOG`): each mesh-only object has a
+  0xf33080-byte buffer whose head holds the indirect arguments, +0x00 the main view and +0x10/+0x20/+0x30 the
+  cascades; kernels 027a50b7, 68e84b77 and 75dc8d60 write them (vote, popc, one ATOMG per view; per cascade a
+  six-plane frustum test against c3[0x520..0x5dc]). All three translate cleanly.
+- **The chain** (`OOT_IND_LOG=4800`, every frame the same): c8b82584 1, 7f05518a 1, e6c023a5 7, 44e1015c 10, 3076c0a9
+  1, 032f18b8 1-6, 3360a3c0 26-59, 75dc8d60 1, **68e84b77 0**, **2bb46270 0**, d295f592 1, 3f15911a ~60 groups.
+  `OOT_SM86_COUNT` on 68e84b77 confirms no thread of it ever runs. 2bb46270's size is written by e6d5432f (into
+  0x29bb4c020, the third slot of a window buffer); 68e84b77's (0x29f9aa000) by the occlusion kernels 959ef9bb /
+  fac1644d / d1bf02dd. e6d5432f picks a draw distance per object type (a 3-entry jump table at 0x1380, c3 limits)
+  and exits objects beyond it; counted over 120 frames: 2.6 M threads start, 0.2 M reach 0x3150, none reach the
+  store at 0x3420 or the atomic at 0x3530. Next: what decides that branch (and quote the `OOT_SM86_COUNT` value in
+  PowerShell: unquoted, `17e0` and `6e70` are read as numbers, 17 and 6E+70).
+- **The virtual pool's physical pages (found on the way, opt-in for now).** The game maps its 305 MiB physical
+  (GPU-only) pool into a virtual pool and places render targets and transient buffers there (0x15xxxxxxxx). The NVN
+  front end only shadow-copied mappings from CPU-visible pools and dropped the physical ones, so every storage buffer
+  there was bound to the zero buffer (0x1501194600+0xfd200, read by 745220f3 and 3f15911a). `OOT_VPOOL_PHYS=1`
+  (`nvn_api_core.c` nvnMemoryPoolMapVirtual) forwards them to `vk_pool_map_virtual`: the warnings go away, two runs
+  without a reset, but the culling counts did not change and the shadows stay empty, so it stays off until it is
+  shown to help. The unbacked-buffer log line now also says how the first byte resolves.
+- Screenshot `build/logs/vpool-on2.png` (Mido, `OOT_VPOOL_PHYS=1`): noise 1.22 from the known over-bright, speckled
+  ground in front; the rest is a picture. `vpool-on.png` was black (a fade; frame 4900 of the same run is a normal
+  picture).
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count

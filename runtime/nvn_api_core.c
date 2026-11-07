@@ -448,16 +448,45 @@ NVN_API(nvnMemoryPoolMapVirtual) {
     if (n < 0 || (n && !r)) { rt_log("nvn: MapVirtual with %d requests at %p", n, (const void *)r); ret_x(c, 0); return; }
     for (int i = 0; i < n; i++)
         if (!check_request(v, &r[i], i)) { ret_x(c, 0); return; }
-    int nshadow = 0;
+    // Mappings from a PHYSICAL pool (GPU-only memory: the level's render targets and the culling's transient buffers,
+    // e.g. its depth pyramid, share a 305 MiB virtual pool over one physical pool) go to the back end's page table
+    // (vk_pool_map_virtual), so GPU addresses there resolve to the physical pool's memory as on hardware and images
+    // there alias it (vk_texture.c bind_pool_memory). Dropped, every storage buffer in that range is bound to the zero
+    // buffer (2026-11-09: 0x1501194600+0xfd200, read by the culling kernels 745220f3 and 3f15911a).
+    // Shadowed pages (and unmaps) go to the back end as unmaps: the GPU reads those through the shadow storage's
+    // textures, not through the page table. OOT_VPOOL_PHYS=1 turns it on; off by default until it is shown to help
+    // (2026-11-09: the buffers resolve, 0 driver resets in two runs, but the shadow culling's counts did not change).
+    static int phys_on = -1;
+    if (phys_on < 0) { const char *e = getenv("OOT_VPOOL_PHYS"); phys_on = e && *e == '1'; }
+    int nshadow = 0, nphys = 0;
+    nvn_mapping_t *be = n ? malloc((size_t)n * sizeof *be) : NULL;
     for (int i = 0; i < n; i++) {
         const pool_t *src = (const pool_t *)(const void *)r[i].physical_pool;
-        if (!src || shadow_source(src)) { shadow_map(v, &r[i]); nshadow++; continue; }
-        static volatile LONG said;
-        if (InterlockedIncrement(&said) <= 3)
-            rt_log("nvn: MapVirtual: a physical pool mapped into a virtual pool, which has shadow storage here: not supported, "
-                   "the pages stay zero");
+        if (be) be[i] = r[i];
+        if (!src || shadow_source(src)) {
+            shadow_map(v, &r[i]);
+            nshadow++;
+            if (be) be[i].physical_pool = 0;
+            continue;
+        }
+        nphys++;
+        if (!phys_on) {
+            if (be) be[i].physical_pool = 0;
+            static volatile LONG said;
+            if (InterlockedIncrement(&said) <= 3)
+                rt_log("nvn: MapVirtual: a physical pool mapped into a virtual pool: dropped, the pages stay zero (OOT_VPOOL_PHYS=1 maps them)");
+        }
     }
-    NVN_LOG("MapVirtual pool %p, %d requests (%d shadowed)", (void *)v->mem, n, nshadow);
+    // Pools that ever got a physical mapping hear every later request too (their unmaps and shadowed pages).
+    static const pool_t *physv[32];
+    static int nphysv;
+    int known = 0;
+    for (int i = 0; i < nphysv && !known; i++) known = physv[i] == v;
+    if (nphys && phys_on && !known && nphysv < 32) physv[nphysv++] = v, known = 1;
+    if (phys_on && known && be && !gfx_backend()->pool_map_virtual(v, n, be))
+        rt_log("nvn: MapVirtual: the %s back end refused %d physical-pool mappings", gfx_backend()->name, nphys);
+    free(be);
+    NVN_LOG("MapVirtual pool %p, %d requests (%d shadowed, %d physical)", (void *)v->mem, n, nshadow, nphys);
     ret_x(c, 1);
 }
 // NVNbufferAddress nvnMemoryPoolGetBufferAddress(const NVNmemoryPool *p)
