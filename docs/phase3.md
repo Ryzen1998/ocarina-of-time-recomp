@@ -432,6 +432,54 @@ Runs run-234 to run-236, 0 driver resets.
   background is overexposed: white, with banded edges. That is the next item (the fog's density or the exposure).
   Test runs no longer need `OOT_SKIP_CS=1a62084a`.
 
+### Status (2026-11-10, later): tone mapping reaches the screen; the game crash at main+0xc938d0 is back
+
+Runs run-237 to run-273. **run-273 reset the driver (nvlddmkm 153, 32 s into the run, the game hung): stopped there,
+reboot before the next GPU run.**
+
+- **Why the picture was too dark in dark scenes and white with stepped edges in bright ones.** The frame ends with
+  the tone mapper (render pass, R11G11B10F into 0x...2670c00, values in 0..1), the anti-aliasing (ceea6f19, the
+  indirect 2a9fe9a8, then 1cb856c3, which writes the finished picture over the scene target 0x...0870200), and the
+  neural upscaler (eb41de8d), which reads that target. 1cb856c3 wrote nothing: the scene target after it was
+  byte-identical to the scene before tone mapping, so the screen showed raw HDR clipped at 1.0 (28% of the pixels
+  above it). Its stores are guarded by `x <= c0[0x68] && y <= c0[0x6c]` (1919, 1079), constants of a 116-byte
+  `PushComputeConstants` the game makes once before ceea6f19 and uses for all three dispatches; since 56eac50 the
+  replay dropped a push after each dispatch (a guess), so 1cb856c3 read zeros. Now pushes stay until pushed over
+  (`push_after_dispatch`, `OOT_PUSH_KEEP=0` = old). Many programs run several dispatches off one push (the frame dump
+  now prints each dispatch's pushed constants).
+- **Then the picture was garbage**: 1cb856c3 packs sqrt(colour) as RGB9E5 and stores it through an R32UI view of the
+  R11G11B10F target; the upscaler samples it through an RGB9E5 descriptor (the dump now prints `desc-nvn-fmt`: 0x40),
+  which `vk_texture.c` slot_resolve resolved to the live R11G11B10F image at that storage, read in that image's format.
+  Now a slot that follows another descriptor's image passes its own format on as a view format, and `get_view`
+  makes a view in it when both are 32-bit colour formats (MUTABLE_FORMAT images), as Maxwell reinterprets the bytes
+  (`OOT_VIEW_REFORMAT=0` = old). Result: `build/logs/reformat-f4600.png` (frame 4600, the Deku Tree cutscene with the
+  fog on): smooth mist and light shafts, no white halos or bands, noise 0.83; the screen now equals the tone mapper's
+  output (fitted exponent 1.01, so the upscaler squares the sqrt back). Still very bright: that is now the game's own
+  tone mapping and exposure of this foggy scene, not a replay error found so far.
+- **The game crash at main+0xc938d0** (reads +0x150 of a null table entry, index from an object record at
+  0x29bc0xxxx; docs "Game crash with OOT_GW=1" above) came back: 0 in run-220..240 (21 runs to frames 4,535-7,883),
+  then in 19 of 21 plain runs from run-241, at frames 743-5,474. Controls (2 runs each unless noted):
+  | setting | result |
+  |---|---|
+  | `OOT_PUSH_KEEP=0` / `OOT_VIEW_REFORMAT=0` / both | crash / crash / crash |
+  | fog skipped (`OOT_SKIP_CS=1a62084a`) | crash |
+  | `OOT_FSEL_FLOAT20=1` (the FSEL bug back, diagnostic) | 1 of 2 crash |
+  | all three back to before 2026-11-10, fog skipped | **clean** |
+  | `OOT_GW=0` (no global window), everything else new | **clean** |
+  | `OOT_GW_SKIP` for 374126bf,358beb27 / e6d5432f,68e84b77 / d22b0e01,dfc7a190 | crash / crash / crash |
+  | `OOT_GW_SKIP` for the 18 window users first seen from frame 813 (list below) | **clean** |
+  | `OOT_GW_SKIP` for the first 9 of those 18 | **GPU hang, driver reset (run-273)** |
+  So each fix makes some kernel compute real values where it used to get zeros, and a store of one of the 18 that
+  goes through the global window lands in what the CPU reads (the 2026-11-08 mechanism, now frequent). The 18
+  (`OOT_GW_USERS=1` logs each window user once; these are the ids `OOT_GW_SKIP` matches, not the OOT_IND_LOG ones,
+  so the skip tests above by IND_LOG ids may have matched nothing): af7a80ff 9ab7c483 81789336 7088715b b2c273a2 289f0e4f
+  227f330b 1b4d7f5f 6372b7bd b3aaf027 0bb96198 745220f3 ac939523 164d634a c685ba55 d0bb3a4c fdaa71ac fadd8d26.
+  Skipping a part of a chain can hang the GPU (a later kernel loops on a count the skipped one never wrote), so do
+  not bisect by skips again. Next, after the reboot: find the writer instead, with `OOT_WATCH_RANGE` over the object
+  records (0x29bc00000..0x29bd00000) with the window on (the 2026-11-08 watch ran with the window off for the two
+  culling kernels), and fix that kernel's address trace. Until then the defaults (window on, pushes kept, views
+  reformatted) give the right picture but crash in most runs past frame ~4,000; `OOT_GW_SKIP=<the 18>` ran clean.
+
 ### Safety (learned the hard way)
 
 Six driver resets on 2026-11-08, all from the indirect draws before `7ed675d`; none since. After every GPU run count

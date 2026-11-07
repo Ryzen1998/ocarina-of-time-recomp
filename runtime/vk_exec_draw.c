@@ -564,6 +564,17 @@ static VkImageView get_view(VkExec *ex, const VkTexImage *img, const view_t *v, 
     }
     uint32_t swz = (uint32_t)sw[0] | (uint32_t)sw[1] << 8 | (uint32_t)sw[2] << 16 | (uint32_t)sw[3] << 24;
     VkFormat vf = storage && img->storage_format ? img->storage_format : img->format;   // sRGB stored through UNORM
+    // A sampled view whose format (the game's view, or the descriptor's when it follows another descriptor's image at
+    // the same storage: vk_texture.c slot_resolve) is another 32-bit colour format reads the image's bytes in that
+    // format, as Maxwell does. The upscaler samples the anti-aliasing's RGB9E5 texels in the R11G11B10F scene target
+    // (2026-11-10). Both formats in the 32-bit class, so the MUTABLE_FORMAT image allows the view. OOT_VIEW_REFORMAT=0: off.
+    if (!storage && hv && v->set_format && (img->aspect & VK_IMAGE_ASPECT_COLOR_BIT) && colour32(img->format)) {
+        static int on = -1;
+        if (on < 0) { const char *e = getenv("OOT_VIEW_REFORMAT"); on = !(e && e[0] == '0'); }
+        TexVkFormat tf;
+        if (on && tex_vk_format(v->format, &tf) && tf.vk != VK_FORMAT_UNDEFINED && tf.vk != img->format && colour32(tf.vk))
+            vf = tf.vk;
+    }
     // A storage view the game makes as R32UI / R32I / R32F of a texture of another 32-bit format: the kernel stores
     // texels it packed itself (2026-11-08: the frame's last colour kernel 1cb856c3 packs R11G11B10 into one word and
     // stores it through an R32UI view of the R11G11B10F scene target). Bound in the image's own format, each packed
@@ -1049,7 +1060,7 @@ static int cnt_on(void);
 static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     memset(bank, 0, VK_C0_BYTES);
     memcpy(bank, c0_dim, 12);
-    memcpy(bank + 0x10, ex->push_cc, ex->push_cc_len);
+    memcpy(bank + 0x10, ex->push_cc, ex->push_cc_len < VK_C0_BYTES - 0x10 ? ex->push_cc_len : VK_C0_BYTES - 0x10);
     uint32_t base, ns, nt, ni;
     if (!nvn2_cs_layout(ex, &base, &ns, &nt, &ni)) return;
     // The storage-held pointers the lowering moved to c0 (sm86_lower.h SM86_PTR_C0), unless the tables reach there.
@@ -1240,6 +1251,23 @@ static void gw_select(VkExec *ex, const VkPipeInfo *info) {
     static int on = -1;
     if (on < 0) on = rt_knob("GW", "1");
     if (!on) return;
+    static int log_users = -1;   // OOT_GW_USERS=1 (diagnostic): each program that gets window entries, once
+    if (log_users < 0) log_users = rt_knob("GW_USERS", "0");
+    if (log_users) {
+        gw_select_inner(ex, info);
+        static char seen[256][17];
+        static int nseen;
+        char hx[17];
+        shader_hex(C1CUR[NVN_STAGE_CS], hx);
+        int known = 0;
+        for (int i = 0; i < nseen && !known; i++) known = !strcmp(seen[i], hx);
+        if (gw_n && !known && nseen < 256) {
+            strcpy(seen[nseen++], hx);
+            rt_log("vk_exec: OOT_GW_USERS: %s gets %u window entries (first at frame %llu)", hx, gw_n,
+                   (unsigned long long)gfx_stats().frames);
+        }
+        return;
+    }
     if (!(rt_trace & RT_TRACE_PERF)) return gw_select_inner(ex, info);
     static LARGE_INTEGER f;   // OOT_TRACE=perf: its CPU time, logged every 600 frames
     static double acc;
@@ -3734,6 +3762,51 @@ static int skip_cs(const GfxShader *cs) {
     return skip;
 }
 
+static int push_fresh;   // a push came since the last dispatch (op_push_cc sets it, push_after_dispatch clears it)
+static uint32_t push_hidden;   // OOT_PUSH_NOINHERIT: the push length + 1 while one dispatch sees none
+static void push_hide(VkExec *ex, const GfxShader *cs, int indirect);
+// OOT_PUSH_NOINHERIT (diagnostic): dispatches that see an empty push unless the game pushed right before them:
+// "direct", "indirect", "all", or a comma list of shader hash prefixes (the frame dump's "cs" hashes). To find which
+// programs go wrong with a push they inherit (2026-11-10, the game crash at main+0xc938d0).
+static int push_inherit_blocked(const GfxShader *cs, int indirect) {
+    static char spec[512];
+    static int init;
+    if (!init) { const char *e = getenv("OOT_PUSH_NOINHERIT"); snprintf(spec, sizeof spec, "%s", e ? e : ""); init = 1; }
+    if (!spec[0] || push_fresh) return 0;
+    if (!strcmp(spec, "all")) return 1;
+    if (!strcmp(spec, "direct")) return !indirect;
+    if (!strcmp(spec, "indirect")) return indirect;
+    uint64_t words = 0, h = 0xcbf29ce484222325ull;   // vk_dump.c shader_hash
+    const uint8_t *b = (const uint8_t *)gfx_shader_spirv(cs, &words);
+    for (uint64_t i = 0; b && i < words * 4; i++) h = (h ^ b[i]) * 0x100000001b3ull;
+    char hex[17];
+    snprintf(hex, sizeof hex, "%016llx", (unsigned long long)h);
+    for (const char *p = spec; *p;) {
+        size_t n = strcspn(p, ",");
+        if (n && n <= 16 && !strncmp(hex, p, n)) return 1;
+        p += n;
+        if (*p) p++;
+    }
+    return 0;
+}
+static void push_hide(VkExec *ex, const GfxShader *cs, int indirect) {
+    if (!push_hidden && ex->push_cc_len && push_inherit_blocked(cs, indirect))
+        push_hidden = ex->push_cc_len + 1, ex->push_cc_len = 0;
+}
+
+// Frame dump: the constants the dispatch got pushed (bank 0 from 0x10), up to 0x80 bytes as words, for passes.txt.
+static void dump_push(const VkExec *ex) {
+    char line[0x80 / 4 * 9 + 1], *o = line;
+    uint32_t n = ex->push_cc_len < 0x80 ? ex->push_cc_len : 0x80;
+    for (uint32_t i = 0; i + 4 <= n; i += 4) {
+        uint32_t w;
+        memcpy(&w, ex->push_cc + i, 4);
+        o += sprintf(o, " %08x", w);
+    }
+    *o = 0;
+    vk_dump_note("    pushed constants: %u bytes:%s", ex->push_cc_len, line);
+}
+
 static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     if (d->x <= 0 || d->y <= 0 || d->z <= 0) return;
     if (!ex->prog) return warn_once(W_PROGRAM, "a dispatch without a bound program is skipped");
@@ -3759,6 +3832,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
         return;
     }
     if (skip_cs(cs)) return;
+    push_hide(ex, cs, 0);
     if (mwatch_on()) {
         char dims[48];
         snprintf(dims, sizeof dims, "%dx%dx%d", d->x, d->y, d->z);
@@ -3779,7 +3853,7 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
     cst_end(ex, tp, cs, (const uint32_t[3]){(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z});
     ex->recorded++;
-    if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d);
+    if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d), dump_push(ex);
 }
 
 // OOT_IND_LOG=1 (diagnostic): the group counts each indirect dispatch reads, copied on the GPU into a host-visible
@@ -3851,6 +3925,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     const GfxShader *cs = shader_for(ex, NVN_STAGE_CS, &present, NULL, 0);
     if (!cs) return;
     if (skip_cs(cs)) return;
+    push_hide(ex, cs, 1);
     if (mwatch_on()) {
         char dims[48];
         snprintf(dims, sizeof dims, "indirect@%#llx", (unsigned long long)d->ind);
@@ -3883,7 +3958,7 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     ex->recorded++;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
     VK_MEM_BOUND(ip);
-    if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller});
+    if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, &(p_dispatch){0, 0, 0, d->caller}), dump_push(ex);
 }
 
 // ---- OP_DRAW_MESH / OP_DRAW_MESH_IND (nvn_api_cmd.c DrawMeshTasks*): step 2 of docs/phase3.md "the mesh stages":
@@ -4283,7 +4358,21 @@ static void op_push_cc(VkExec *ex, const p_update_ub *u) {
     if (!u->size || u->dst + u->size > VK_C0_BYTES) return;
     memcpy(ex->push_cc + u->dst, u->data, u->size);
     if (ex->push_cc_len < u->dst + u->size) ex->push_cc_len = (uint32_t)(u->dst + u->size);
+    push_fresh = 1;
     B.c0_valid[2] = 0;
+}
+
+// After a dispatch the pushed constants stay for the next ones until the game pushes over them. Measured 2026-11-10:
+// the frame's anti-aliasing pushes 116 bytes once, then dispatches ceea6f19, 2a9fe9a8 (indirect) and 1cb856c3, and
+// 1cb856c3 takes its last pixel (1919, 1079) and offset from that push. With the push dropped after each dispatch (a
+// guess since 56eac50) it read zeros, stored no pixel, and the screen got the scene before tone mapping: too dark in
+// dark scenes, white in bright ones. OOT_PUSH_KEEP=0 drops it after each dispatch again (diagnostic).
+static void push_after_dispatch(VkExec *ex) {
+    static int keep = -1;
+    if (keep < 0) { const char *e = getenv("OOT_PUSH_KEEP"); keep = !(e && e[0] == '0'); }
+    if (push_hidden) ex->push_cc_len = push_hidden - 1, push_hidden = 0;   // OOT_PUSH_NOINHERIT hid it from one dispatch
+    if (!keep) ex->push_cc_len = 0;
+    push_fresh = 0;
 }
 
 static void op_update_ub(VkExec *ex, const p_update_ub *u) {
@@ -4471,10 +4560,10 @@ void vk_exec_op_draw(VkExec *ex, uint32_t op, const void *payload) {
     case OP_PUSH_CC: op_push_cc(ex, payload); break;
     case OP_DRAW: op_draw(ex, payload); break;
     case OP_DRAW_IDX: op_draw_idx(ex, payload); break;
-    case OP_DISPATCH: op_dispatch(ex, payload); ex->push_cc_len = 0; break;   // the push is consumed (NVN2)
+    case OP_DISPATCH: op_dispatch(ex, payload); push_after_dispatch(ex); break;
     case OP_DRAW_IDX_IND: op_draw_idx_ind(ex, payload); break;
     case OP_DRAW_IND: op_draw_ind(ex, payload); break;
-    case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); ex->push_cc_len = 0; break;
+    case OP_DISPATCH_IND: op_dispatch_ind(ex, payload); push_after_dispatch(ex); break;
     case OP_DRAW_MESH: case OP_DRAW_MESH_IND: op_draw_mesh(ex, payload, op == OP_DRAW_MESH_IND); break;
     default: rt_fatal("vk: op %s is not a draw op", nvn_op_name(op));
     }

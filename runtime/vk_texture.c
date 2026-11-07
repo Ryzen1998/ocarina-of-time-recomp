@@ -1197,6 +1197,18 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
         if (!e) e = any ? any : own;
     }
     if (!e) e = s->t.mem ? entry_of(&s->t) : NULL;
+    // A followed texture of another format: Maxwell reads the same bytes in the slot descriptor's format. OoT's
+    // anti-aliasing stores RGB9E5 texels into the R11G11B10F scene target and the upscaler samples them through an
+    // RGB9E5 descriptor at that storage (2026-11-10); the slot passes its format on as a view format, which get_view
+    // (vk_exec_draw.c) applies when both are 32-bit colour formats.
+    static int reformat = -1;   // OOT_VIEW_REFORMAT=0: off (and in get_view)
+    if (reformat < 0) { const char *rf = getenv("OOT_VIEW_REFORMAT"); reformat = !(rf && rf[0] == '0'); }
+    if (reformat && e && !e->f.depth && !e->f.stencil && e->t.d.format != s->t.d.format && !(s->has_view && s->v.set_format)) {
+        if (!*has_view) memset(view, 0, sizeof *view);
+        view->set_format = 1;
+        view->format = (uint16_t)s->t.d.format;
+        *has_view = 1;
+    }
     // A followed texture is another descriptor at the same storage: its image holds the content, but sampling takes the
     // slot descriptor's swizzle. The UI renders text into RGBA8 and samples it through a (A,A,A,A) descriptor; with the
     // render target's RGBA swizzle the text blur saw R = 1 everywhere and drew solid boxes behind tips and labels.
@@ -1286,6 +1298,15 @@ int vk_texture_slot_swz(int id, uint8_t swz[4]) {
     }
     unlock();
     return ok;
+}
+
+// vk_dump: the NVN format of the descriptor registered in slot id (the image it resolves to may be another descriptor's
+// at the same storage, slot_resolve); -1 when the slot is empty.
+int vk_texture_slot_format(int id) {
+    lock();
+    int f = id >= 0 && id < ntslots && tslots[id].used ? (int)tslots[id].t.d.format : -1;
+    unlock();
+    return f;
 }
 
 uint32_t vk_texture_epoch(void) { return __atomic_load_n(&submit_epoch, __ATOMIC_RELAXED); }

@@ -699,6 +699,8 @@ static void describe_bindings(Str *b, const VkExec *ex, const VkPipeInfo *info) 
             sp(b, "tex %d %s(%d) %ux%ux%u levels %u layers %u image %s", NVN_HANDLE_TEX(h), fmt_name(t->format, fn),
                (int)t->format, t->width, t->height, t->depth, t->levels, t->layers,
                t->view_type <= 6 ? vt[t->view_type] : "?");
+            int dfmt = vk_texture_slot_format(NVN_HANDLE_TEX(h));
+            if (dfmt >= 0) sp(b, " desc-nvn-fmt %#x", dfmt);
             if (hv && v.set_format) sp(b, " view-nvn-fmt %#x", v.format);
             if (hv && v.set_levels) sp(b, " view-levels %u+%u", v.base_level, v.nlevels);
             if (hv && v.set_layers) sp(b, " view-layers %u+%u", v.min_layer, v.nlayers);

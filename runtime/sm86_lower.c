@@ -1332,6 +1332,12 @@ static void lower_isetp(L *l, const Insn *x) {
 // bits: its immediate is an integer imm20, so an FSEL constant goes in whole (or through a register), never as a
 // float20. Until 2026-11-10 FSEL's 1.0 (0x3f800000) went in as the float20 0x3f800 and SEL produced the denormal
 // 0x0003f800: fog kernel 1a62084a's light-probe weights flushed to 0 and its volume was NaN.
+// OOT_FSEL_FLOAT20=1 (diagnostic): the encoding before 2026-11-10, wrong (and the old cache keys, sm86_probe_tag).
+static int fsel_float20(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("OOT_FSEL_FLOAT20"); v = e && e[0] == '1'; }
+    return v;
+}
 static void lower_sel(L *l, const Insn *x, int floating) {
     uint32_t rd = bits(x, 16, 8);
     Src a = src0(x, floating), b = srcn(l, x, 1, floating);
@@ -1339,7 +1345,7 @@ static void lower_sel(L *l, const Insn *x, int floating) {
     int is32;
     uint64_t w;
     if (b.neg || b.abs_) w = 0x5ca0000000000000ull | ((uint64_t)to_reg(l, b, 1, 0, 0) << 20);
-    else w = b_slot(l, b, 0x5ca0000000000000ull, 0x4ca0000000000000ull, 0x38a0000000000000ull, 0, 0, 1, &is32);
+    else w = b_slot(l, b, 0x5ca0000000000000ull, 0x4ca0000000000000ull, 0x38a0000000000000ull, 0, fsel_float20() && floating, 1, &is32);
     w |= l->pred | rd | ((uint64_t)ra << 8) | ((uint64_t)bits(x, 87, 3) << 39) | ((uint64_t)bits(x, 90, 1) << 42);
     emit(l, w);
 }
@@ -3647,7 +3653,7 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
     }
     // Likewise a program with an FSEL immediate that the old lower_sel encoded as a float20 (low 12 bits zero, not 0):
     // its constant was wrong (2026-11-10).
-    for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
+    for (uint32_t i = 0; !fsel_float20() && i + 16 <= code_size; i += 16) {
         uint32_t w0, w1;
         memcpy(&w0, code + i, 4), memcpy(&w1, code + i + 4, 4);
         if ((w0 & 0xfff) == 0x808 && w1 && !(w1 & 0xfff)) { tag ^= 0x6673656c696d6d31ull; break; }   // "fselimm1"

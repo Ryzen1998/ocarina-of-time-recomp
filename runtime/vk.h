@@ -340,6 +340,7 @@ int vk_texture_small_dirty(void);                   // a small mirrored target h
 void vk_texture_write_back_small(uint64_t fence);   // writes those rendered by work up to fence back to storage
 void vk_texture_debug(const VkTexImage *img, uint32_t *uploads, int *last_change, int *pages_written);   // vk_dump
 int vk_texture_slot_swz(int id, uint8_t swz[4]);    // vk_dump: swizzle of the descriptor in slot id
+int vk_texture_slot_format(int id);                  // vk_dump: NVN format of the descriptor in slot id, -1 if none
 int vk_texture_read_image(const tex_t *t, const view_t *v, const NVNcopyRegion *r, uint8_t *dst, uint64_t row,
                           uint64_t img);            // always from the image (GPU copy, waited for); 0 on failure
 int vk_texture_cpu_stale(uint64_t addr, uint64_t size);    // a GPU-written mirrored texture there has stale storage
