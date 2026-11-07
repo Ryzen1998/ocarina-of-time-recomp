@@ -596,6 +596,14 @@ chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a 
   null table entry; the index comes from an object record at 0x29bc10a88, in the culling buffers the window lets the
   GPU write. Likely GPU-written bytes reaching what the CPU reads (write-back of a range a window entry also
   covers, or a kernel's wrong store). Open; the window stays off by default.
+- **The `OOT_GW=1` game crash, probably (run-146..153):** a range watch (`OOT_WATCH_RANGE=<lo>:<hi>[,...]`, every
+  written binding, window entry, copy and fill over the ranges) found no GPU write to the object records nor to the
+  game's structures in 0x1a0000000..0x1b0000000, so the bad index comes from GPU results the game reads back. It did
+  show the two jump-table kernels with known wrong traces (374126bf, 358beb27: stores traced to float words of bank 3)
+  getting window entries over the culling arguments; run-119's crash came right after 358beb27's first window. They
+  now get no window (`OOT_GW_SKIP`, default those two). Since: 5 runs with the window, 3 of them with every ground
+  draw, no crash (before: 3 of 12; 5 clean by chance about 1 in 4). `build/logs/gwskip-ground.png`: the path,
+  ground, rocks and Link drawn, dark; the sky still shows where parts are missing.
 - 12 task/mesh programs used only by the indirect draws do not lower (11 mesh, 1 task: register pressure at the
   start, "no general register dead over a uniform register's span" and similar, and two "uniform datapath opcode");
   the same with the lowering before the task prologue. Their draws are skipped, so even with the crash fixed, part

@@ -1304,7 +1304,30 @@ static void gw_select_mesh(VkExec *ex, const VkPipeInfo *info) {
     mwatch_gw(ex);
 }
 
+// OOT_GW_SKIP=<input id prefixes> (default 374126bf,358beb27; "none" for none): programs that get no window. These two
+// (jump-table programs) trace stores to bank-3 words that hold floats, not pointers (docs/phase3.md), so through the
+// window their stores could land in the culling buffers; with them in, the game crashed on a bad object index in 3
+// of 12 runs (2026-11-08).
+static int gw_skipped(void) {
+    static char list[256];
+    static int init;
+    if (!init) {
+        const char *e = getenv("OOT_GW_SKIP");
+        snprintf(list, sizeof list, "%s", e ? e : "374126bf,358beb27");
+        init = 1;
+    }
+    char hx[17];
+    shader_hex(C1CUR[NVN_STAGE_CS], hx);
+    for (const char *p = list; *p;) {
+        size_t k = strcspn(p, ",");
+        if (k >= 4 && k <= 16 && !strncmp(hx, p, k)) return 1;
+        p += k + (p[k] == ',');
+    }
+    return 0;
+}
+
 static void gw_select_inner(VkExec *ex, const VkPipeInfo *info) {
+    if (gw_skipped()) return;
     double t0 = gw_now(), t1;
     int uses = 0;
     uint32_t written = 0, base, ns, nt, ni;
@@ -1633,7 +1656,35 @@ static void shader_hex(const GfxShader *s, char hex[17]) {
     const uint8_t *id = gfx_shader_input_id(s);
     for (int i = 0; i < 8; i++) snprintf(hex + 2 * i, 3, "%02x", id[i]);
 }
+// OOT_WATCH_RANGE=<lo hex>:<hi hex> (diagnostic): every GPU write that may land in [lo, hi) (written storage binding,
+// window entry, copy, fill) is logged once per writer, kernel and bank offset (2026-11-08: the game crashes on an object
+// record in 0x29bc00000.. with OOT_GW=1).
+static void wrange_check(const char *what, int st, uint32_t off, uint64_t addr, uint64_t size) {
+    static int init, nr;
+    static uint64_t lo[8], hi[8];
+    if (!init) {   // <lo>:<hi>[,<lo>:<hi>...]
+        const char *e = getenv("OOT_WATCH_RANGE");
+        init = 1;
+        for (; e && *e && nr < 8; e = strchr(e, ',') ? strchr(e, ',') + 1 : "")
+            if (sscanf(e, "%llx:%llx", (unsigned long long *)&lo[nr], (unsigned long long *)&hi[nr]) == 2) nr++;
+    }
+    int hit = 0;
+    for (int i = 0; i < nr && !hit; i++) hit = addr && addr < hi[i] && (!size || addr + size > lo[i]);
+    if (!hit) return;
+    static uint64_t seen[512];
+    static int nseen;
+    static volatile LONG lines;
+    char hex[17];
+    shader_hex(st >= 0 && st < 6 ? C1CUR[st] : NULL, hex);
+    uint64_t key = (addr * 0x9E3779B97F4A7C15ull) ^ ((st >= 0 && st < 6) ? (uintptr_t)C1CUR[st] : 0) ^ off ^ (uintptr_t)what;
+    for (int k = 0; k < nseen; k++) if (seen[k] == key) return;
+    if (nseen < 512) seen[nseen++] = key;
+    if (InterlockedIncrement(&lines) <= 300)
+        rt_log("wrange: f%llu %s by %s (stage %d, c0+%#x) at %#llx+%#llx", (unsigned long long)gfx_stats().frames, what, hex,
+               st, off, (unsigned long long)addr, (unsigned long long)size);
+}
 void vk_exec_mesh_watch(const char *what, int st, uint32_t off, uint64_t addr, uint64_t size) {   // also vk_exec_xfer.c clear_buf
+    wrange_check(what, st, off, addr, size);
     if (!mwatch_on()) return;
     static uint64_t seen[256];
     static int nseen;
