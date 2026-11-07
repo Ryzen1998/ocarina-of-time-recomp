@@ -52,6 +52,8 @@ void sm86_lower_free(Sm86Lowered *out);
 #define SM86_MESH_C0_TASK  0x610u   // {u64 address, u32 size} of the task records
 #define SM86_MESH_C0_MASK  0x620u   // u32
 #define SM86_MESH_C0_SHIFT 0x624u   // u32
+#define SM86_MESH_C0_COUNT 0x628u   // u32: a task workgroup at or past it exits at once (sm86_lower.c task_prologue); an
+                                    // indirect draw's count, copied there on the GPU, under a dispatch the host bounds
 #define SM86_MESH_C0_END   0x630u
 // The stages' own storage buffer tables in bank 0 ({u64 address, u32 size} per slot), as the game's programs read them
 // (a census of their bank-0 operands: vertex 0x110, fragment 0x510, task 0x670, mesh 0x770); the mesh table ends with
@@ -74,6 +76,19 @@ void sm86_lower_free(Sm86Lowered *out);
 #define SM86_MESH_STRIDE_LOG2 15u
 #define SM86_TASK_STRIDE_LOG2 8u
 #define SM86_MESH_MAP      0x7000u
+
+// OOT_SM86_COUNT=<code hash, hex>:<offset>[=rN|=pN][,...] (diagnostic, sm86_lower.c count_emit): every thread of
+// that compute program that arrives at the instruction at a listed byte offset adds 1 (=rN: register N; =pN: 1 << N
+// when predicate N is set) to u32 k (k = the entry's place in the list) of a counter buffer, whose {u64 address, u32 size} the host puts at bank 0 + SM86_COUNT_C0 and
+// binds to a host buffer it reads back and logs (vk_exec_draw.c "count:"). Between the global window (0x410..0x590)
+// and the mesh path's words (0x600).
+#define SM86_COUNT_C0  0x5f0u
+#define SM86_COUNT_MAX 64u
+// Nonzero for a program a diagnostic (OOT_SM86_PROBE, OOT_SM86_COUNT) changes: a tag of the setting, which the host
+// mixes into that program's cache key, so the probed lowering never comes from the cache nor goes into the normal entry.
+uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size);
+// The OOT_SM86_COUNT entries (n of them) as labels for the log ("6a00=p3"), NULL when off.
+const char (*sm86_count_points(uint32_t *n))[16];
 
 // The control section's fields the host needs (offsets measured over the game's archives, tools/shader_census.py).
 typedef struct {

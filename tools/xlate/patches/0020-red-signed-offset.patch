@@ -1,0 +1,16 @@
+--- a/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
++++ b/src/Ryujinx.Graphics.Shader/Instructions/InstEmitMemory.cs
+@@ -134,7 +134,12 @@
+         {
+             InstRed op = context.GetOp<InstRed>();
+ 
+-            (Operand addrLow, Operand addrHigh) = Get40BitsAddress(context, new Register(op.SrcA, RegisterType.Gpr), op.E, op.Imm20);
++            // The 20-bit offset is signed, as ATOM's (above): read unsigned, the culling kernels' RED.MAX at the pointer
++            // minus 12 (their group count, next to the counter the pointer names) went 1 MiB past it, so every
++            // dispatch those counts feed read zero groups (ocarina-of-time-recomp, 2026-11-08).
++            int sOffset = (op.Imm20 << 12) >> 12;
++
++            (Operand addrLow, Operand addrHigh) = Get40BitsAddress(context, new Register(op.SrcA, RegisterType.Gpr), op.E, sOffset);
+ 
+             EmitAtomicOp(context, StorageKind.GlobalMemory, (AtomOp)op.RedOp, op.RedSize, addrLow, addrHigh, GetDest(op.SrcB));
+         }

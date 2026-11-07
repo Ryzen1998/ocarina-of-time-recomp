@@ -56,7 +56,7 @@
 #define CONTROL_BOUND 0x400                                // bytes readable behind a control pointer (the records)
 #define BUCKETS 4096
 #define LINE_MAX_LEN 4096
-#define KEY_VERSION 19                                      // in every cache key; bump when the key layout or the use of the
+#define KEY_VERSION 21                                      // in every cache key; bump when the key layout or the use of the
                                                            // output changes here (4: translator identity, input ids;
                                                            // 5: NVN2 programs; 15: storage-held pointers in c0, sm86_lower.h SM86_PTR_C0;
                                                            // 16: PR #7's lowering; 17: both, merged; 18: task/mesh bank-0 layout); translator
@@ -1181,6 +1181,9 @@ static int build_code_hash(int stage, const uint8_t *control, uint32_t ctl_size,
     memcpy(p, code, (size_t)code_size), p += code_size;
     rt_sha256(buf, total, hash);
     free(buf);
+    // OOT_SM86_PROBE / OOT_SM86_COUNT: the probed program gets its own key (its lowering differs), the others keep theirs.
+    uint64_t tag = sm86_probe_tag(code, (uint32_t)code_size);
+    for (int i = 0; i < 8 && tag; i++) hash[i] ^= (uint8_t)(tag >> (8 * i));
     return 1;
 }
 

@@ -2291,6 +2291,17 @@ static void lower_p2r_r2p(L *l, const Insn *x, int r2p) {
     else emit(l, base(l, 0x38e8000000000000ull, rd, ra) | ((uint64_t)x->w[1] << 20) | ((uint64_t)bits(x, 76, 2) << 41));
 }
 
+// Maxwell PSETP P(d), P(d2), x, y, z: d = (x op_xy y) op_z z, d2 = (!(x op_xy y)) op_z z; each input a predicate
+// number with bit 3 negating. The translator (InstPsetp, InstEmitPredicate Psetp) reads x at bits 12-14 (15 negates),
+// y at 29-31 (32), z at 39-41 (42). 2026-11-08: x and z were swapped here, so every table whose operations are not
+// symmetric in x and z came out wrong (e6d5432f's c & !(a & b) gave a ^ b: every culling thread left before its
+// counters, no indirect draw drew).
+static uint64_t psetp(L *l, uint32_t d, uint32_t d2, uint32_t x, uint32_t y, uint32_t z, uint32_t op_xy, uint32_t op_z) {
+    return 0x5090000000000000ull | l->pred | d2 | ((uint64_t)d << 3) | ((uint64_t)(x & 7) << 12) | ((uint64_t)(x >> 3) << 15) |
+           ((uint64_t)op_xy << 24) | ((uint64_t)(y & 7) << 29) | ((uint64_t)(y >> 3) << 32) | ((uint64_t)(z & 7) << 39) |
+           ((uint64_t)(z >> 3) << 42) | ((uint64_t)op_z << 45);
+}
+
 // PLOP3 (0x01c): Pd = LUT(Pa, Pb, Pc) with table bits 64-66 and 72-76, inputs at 87-90, 77-80, 68-71 (bit 3
 // negates), outputs 81-83 and 84-86; bit 67 makes the third a uniform predicate. Maxwell PSETP covers
 // (a op b) op2 c for and/or/xor; other tables are not lowered.
@@ -2326,9 +2337,7 @@ static void lower_plop3(L *l, const Insn *x) {
             }
             if ((t ^ lut) & care) continue;
             uint32_t na = a ^ ((n >> 2 & 1) << 3), nb = b ^ ((n >> 1 & 1) << 3), nc = c ^ ((n & 1) << 3);
-            emit(l, 0x5090000000000000ull | l->pred | 7 | ((uint64_t)pd << 3) | ((uint64_t)(nc & 7) << 12) | ((uint64_t)(nc >> 3) << 15) |
-                        ((uint64_t)tables[i].op_ab << 24) | ((uint64_t)(nb & 7) << 29) | ((uint64_t)(nb >> 3) << 32) |
-                        ((uint64_t)(na & 7) << 39) | ((uint64_t)(na >> 3) << 42) | ((uint64_t)tables[i].op_c << 45));
+            emit(l, psetp(l, pd, 7, na, nb, nc, tables[i].op_ab, tables[i].op_c));
             return;
         }
     }
@@ -2353,10 +2362,7 @@ static void lower_plop3(L *l, const Insn *x) {
                         if ((t ^ lut) & care) continue;
                         uint32_t nx = in[perms[pi][0]] ^ ((n >> 2 & 1) << 3), ny = in[perms[pi][1]] ^ ((n >> 1 & 1) << 3),
                                  nz = in[perms[pi][2]] ^ ((n & 1) << 3);
-                        emit(l, 0x5090000000000000ull | l->pred | (second ? pd : 7) | ((uint64_t)(second ? 7 : pd) << 3) |
-                                    ((uint64_t)(nz & 7) << 12) | ((uint64_t)(nz >> 3) << 15) | ((uint64_t)oab << 24) |
-                                    ((uint64_t)(ny & 7) << 29) | ((uint64_t)(ny >> 3) << 32) | ((uint64_t)(nx & 7) << 39) |
-                                    ((uint64_t)(nx >> 3) << 42) | ((uint64_t)oc << 45));
+                        emit(l, psetp(l, second ? 7 : pd, second ? pd : 7, nx, ny, nz, oab, oc));
                         return;
                     }
     (void)fail(l, "PLOP3 table");
@@ -3150,6 +3156,25 @@ static void lower_isbe(L *l, const Insn *x, int write) {
     else emit(l, 0xeed0000000000000ull | l->pred | reg | ((uint64_t)a << 8) | (imm << 20) | ((uint64_t)1 << 45) | (size << 48));
 }
 
+// A task workgroup past the draw's count (c0[SM86_MESH_C0_COUNT]) exits before the program runs (P0 is free at the
+// start), its record left as the host cleared it (no meshes). An indirect draw's count is only on the GPU: the host
+// dispatches a bound and copies the count into bank 0 (vk_exec_draw.c op_draw_mesh).
+static void task_prologue(L *l) {
+    uint64_t saved = l->pred;
+    l->pred = (uint64_t)PT << 16;
+    uint32_t g = S(l, 0), n = S(l, 1);
+    emit(l, S2R_CTAID_X(g));
+    Src s = {0};
+    s.kind = 2, s.cb_bank = 0, s.cb_off = SM86_MESH_C0_COUNT;
+    mov_cbuf(l, n, &s);
+    // P0 = g >= count (unsigned)
+    emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)0 << 3) | ((uint64_t)g << 8) | ((uint64_t)n << 20) |
+                ((uint64_t)PT << 39) | ((uint64_t)6 << 49));
+    l->pred = 0;   // @P0
+    emit(l, 0xe30000000000000full | l->pred);
+    l->pred = saved;
+}
+
 // A mesh workgroup its task did not ask for: primitive count 0 and exit, before the program runs (P0 is free at the
 // start). Keeps the mesh program off a payload that was never written.
 static void mesh_prologue(L *l) {
@@ -3200,6 +3225,102 @@ static void probe_init(const uint8_t *code, uint32_t code_size) {
     for (uint32_t i = 0; i < code_size; i++) h = (h ^ code[i]) * 0x100000001b3ull;
     if (h != want) return;
     probe.on = 1, probe.at = at, probe.reg = reg, probe.handle = handle;
+}
+
+// ---- OOT_SM86_COUNT (diagnostic, sm86_lower.h): how many threads arrive at each of a list of instructions
+// Before the instruction at each listed offset (a branch to it lands on the count, too), unpredicated, with the scratch
+// free there: d = the value, R(a, a+1) = the 64-bit word at c0[SM86_COUNT_C0], RED.E.ADD.U32 [a + 4 k], d. The value
+// is 1 for a plain offset, register N for "<offset>=rN" (the sum over the threads arriving), and 1 << N for
+// "<offset>=pN" when predicate N is set (P2R; the sum is 2^N times the threads with it set). The translator traces the
+// address to that bank-0 word like any storage table entry; the host binds its counter buffer there.
+static struct { int on; uint32_t n, at[SM86_COUNT_MAX]; uint8_t kind[SM86_COUNT_MAX], idx[SM86_COUNT_MAX]; } cnt;
+
+static uint64_t fnv64(const uint8_t *code, uint32_t n) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < n; i++) h = (h ^ code[i]) * 0x100000001b3ull;
+    return h;
+}
+
+// The list after the colon: offsets, each optionally "=rN" (kind 1) or "=pN" (kind 2); returns the count.
+static uint32_t count_parse(const char *p, uint32_t *at, uint8_t *kind, uint8_t *idx, char (*label)[16]) {
+    uint32_t n = 0;
+    while (*p && n < SM86_COUNT_MAX) {
+        char *end;
+        unsigned long v = strtoul(p, &end, 16);
+        if (end == p) break;
+        at[n] = (uint32_t)v, kind[n] = 0, idx[n] = 0;
+        if (*end == '=' && (end[1] == 'r' || end[1] == 'p')) {
+            char *e2;
+            unsigned long r = strtoul(end + 2, &e2, 10);
+            if (e2 != end + 2 && r <= (end[1] == 'r' ? 254ul : 6ul)) kind[n] = end[1] == 'r' ? 1 : 2, idx[n] = (uint8_t)r;
+            end = e2;
+        }
+        if (label) {
+            if (kind[n]) snprintf(label[n], 16, "%lx=%c%u", v, kind[n] == 1 ? 'r' : 'p', idx[n]);
+            else snprintf(label[n], 16, "%lx", v);
+        }
+        n++;
+        while (*end && *end != ',') end++;
+        p = *end == ',' ? end + 1 : end;
+    }
+    return n;
+}
+
+// Parses OOT_SM86_COUNT for this program: 1 when it names it.
+static int count_init(const uint8_t *code, uint32_t code_size) {
+    cnt.on = 0, cnt.n = 0;
+    const char *e = getenv("OOT_SM86_COUNT");
+    if (!e || !*e) return 0;
+    char *end;
+    unsigned long long want = strtoull(e, &end, 16);
+    if (*end != ':' || fnv64(code, code_size) != want) return 0;
+    cnt.n = count_parse(end + 1, cnt.at, cnt.kind, cnt.idx, NULL);
+    return cnt.on = cnt.n > 0;
+}
+
+const char (*sm86_count_points(uint32_t *n))[16] {
+    const char *e = getenv("OOT_SM86_COUNT");
+    static uint32_t at[SM86_COUNT_MAX];
+    static uint8_t kind[SM86_COUNT_MAX], idx[SM86_COUNT_MAX];
+    static char label[SM86_COUNT_MAX][16];
+    *n = 0;
+    if (!e || !*e || !(e = strchr(e, ':'))) return NULL;
+    *n = count_parse(e + 1, at, kind, idx, label);
+    return *n ? (const char (*)[16])label : NULL;
+}
+
+uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
+    uint64_t tag = 0, h = 0;
+    const char *names[2] = {"OOT_SM86_PROBE", "OOT_SM86_COUNT"};
+    for (int i = 0; i < 2; i++) {
+        const char *e = getenv(names[i]);
+        if (!e || !*e) continue;
+        if (!h) h = fnv64(code, code_size);
+        if (strtoull(e, NULL, 16) != h) continue;
+        tag ^= fnv64((const uint8_t *)e, (uint32_t)strlen(e)) ^ (uint64_t)(i + 1);
+    }
+    return tag;
+}
+
+static void count_emit(L *l, uint32_t k) {
+    uint64_t saved = l->pred;
+    l->pred = (uint64_t)PT << 16;
+    int s = 0;
+    uint32_t a = S(l, s);
+    if (a & 1) a = S(l, ++s);
+    uint32_t b = S(l, s + 1), d = S(l, s + 2);
+    if (l->failed) return;
+    if (b != a + 1) { l->pred = saved; fail(l, "count probe pair"); return; }
+    if (cnt.kind[k] == 1) to_reg_into(l, reg_src(cnt.idx[k]), d);   // first: the register may be in the scratch
+    else if (cnt.kind[k] == 2) emit(l, base(l, 0x38e8000000000000ull, d, RZ) | ((uint64_t)(1u << cnt.idx[k]) << 20));   // P2R
+    else mov_imm(l, d, 1);
+    Src w = {0};
+    w.kind = 2, w.cb_bank = 0, w.cb_off = SM86_COUNT_C0;
+    to_reg_into(l, w, a);
+    w.cb_off = SM86_COUNT_C0 + 4;
+    to_reg_into(l, w, b);
+    emit(l, 0xebf8000000000000ull | l->pred | d | ((uint64_t)a << 8) | ((uint64_t)((4 * k) & 0xfffff) << 28) | ((uint64_t)1 << 48));
+    l->pred = saved;
 }
 
 static uint32_t log2u(uint32_t v) { uint32_t s = 0; while ((1u << s) < v) s++; return s; }
@@ -3348,6 +3469,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
     if (!l.first_out) { snprintf(out->error, sizeof out->error, "out of memory"); return 0; }
     probe_init(code, code_size);
     if (probe.on) for (int i = 0; i < 3; i++) probe_local[i] = c.local[i] ? c.local[i] : 1;
+    count_init(code, code_size);
     int pass_vs = mesh_vs_marked(control);
     if (pass_vs) {   // a mesh program's pass-through vertex program: generated, the mesh code only lends its header
         l.mesh = 0, l.graphics = 1;
@@ -3370,6 +3492,10 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         if (l.liveness) scratch_at(&l, l.index);
         if (probe.on && !l.graphics && l.index == 0) probe_emit(&l, 1);
         if (l.mesh == 7 && l.index == 0) mesh_prologue(&l);
+        if (l.mesh == 6 && l.index == 0) task_prologue(&l);
+        if (cnt.on && !l.graphics && !l.mesh)
+            for (uint32_t k = 0; k < cnt.n; k++)
+                if (cnt.at[k] == header + l.index * 16) count_emit(&l, k);
         lower_one(&l, &l.in[l.index]);
         if (probe.on && !l.graphics && header + l.index * 16 == probe.at) probe_emit(&l, 0);
         int pair;

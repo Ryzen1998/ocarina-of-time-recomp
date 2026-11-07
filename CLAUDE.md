@@ -58,10 +58,12 @@ discard buffer, not the shared zero buffer: the level now runs at about 50 fps (
 Mesh draws (`DrawMeshTasks*`) are implemented behind `OOT_MESH=1` (off by default): the task and mesh programs run as
 compute programs on per-workgroup records and a generated pass-through vertex program draws the records with the
 game's fragment stage; the direct draws (depth pre-pass, shadows) work, the indirect ones (most of the ground's colour)
-are not run yet, their arguments read 0, because the frame's culling kernels never count anything: their counters are
-atomics through pointers loaded at run time. A global window for such accesses (`OOT_GW=1`, translator patch 0019,
-`vk_exec_draw.c` `gw_select`) is in place but off: with it the pointers resolve and still no culling thread reaches its
-atomics (open). `docs/phase3.md`, the Status sections of 2026-11-07, has the details and the order of what is left.
+are not run by default. 2026-11-08: the culling that feeds them counts now (PLOP3 lowering fixed, KEY_VERSION 20;
+translator patch 0020 for RED's signed offset) when the global window is on (`OOT_GW=1`, translator patch 0019); the
+indirect mesh draws run behind `OOT_MESH_IND=1` (with `OOT_MESH=1`), not yet seen working: the first run with them lost
+the device (cause not isolated). `OOT_SM86_COUNT` counts threads (and sums registers or predicates) at instructions of
+one compute program, for bisecting a kernel. `docs/phase3.md`, the Status sections of 2026-11-07 and 11-08, has the
+details and the order of what is left.
 
 ## GPU safety (learned 2026-11-07)
 

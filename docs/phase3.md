@@ -514,6 +514,41 @@ chain, found with `OOT_MESH_WATCH`, `OOT_IND_LOG=<frame>`, `OOT_GW_TRACE` and a 
   against `default-after-gw.png`): some kernels whose pointer reads become real get worse, another reason it stays
   off. No device loss and no driver reset in the 30 runs of this work.
 
+**The culling counts (2026-11-08, run-117..126): two lowering/translation bugs, found with a counting probe.**
+
+- **New diagnostic `OOT_SM86_COUNT=<code hash>:<offset>[=rN|=pN],...`** (`sm86_lower.c` `count_emit`,
+  `vk_exec_draw.c` `cnt_log`): before each listed instruction of one compute program, every arriving thread adds 1
+  (or register N, or 1 << N when predicate N is set) into a host-visible counter buffer bound through bank 0 +
+  `SM86_COUNT_C0` (0x5f0); the host logs the sums every 120 frames (`count: f..: @6a20:0 ...`). A probed program gets
+  its own cache key (`sm86_probe_tag`, also for `OOT_SM86_PROBE`), so neither the cache nor a fresh cache is needed.
+  One run gives a whole profile of where threads go; with registers and predicates it reads values too.
+- **PLOP3 lowered with the PSETP operands swapped (fixed, KEY_VERSION 20).** e6d5432f's threads all reached 0x69a0
+  and none 0x6a20: the `@!P0 EXIT` there takes P0 from `PLOP3 P0 = c & !(a & b)` (c = PT), lowered to Maxwell PSETP.
+  The translator computes PSETP as (P@12 op P@29) op2 P@39; the lowering put its first operand at 39 and its third at
+  12, so every table not symmetric in them came out wrong (here a ^ b: with a = b = 0 every thread left). 231 of the
+  902 cached programs lower differently now (fragment shaders, the culling kernels, the fog kernel 1a62084a, 374126bf,
+  358beb27). After it: e6d5432f's atomics run, its dispatches' group counts are no longer 0 (`OOT_IND_LOG`), and the
+  intro looks cleaner without the window too (`build/logs/psetp-default.png`).
+- **RED's offset read unsigned by the translator (fixed, translator patch 0020).** The second culling level still read
+  0 groups with a counter of 139 (e6c023a5 for 032f18b8): a count probe showed the right group count reaching its
+  `RED.E.MAX [UR4 - 12]` (the count word next to the counter the pointer names), but Ryujinx's `Red` passes the 20-bit
+  offset without sign extension (its `Atom` extends it), so the max went 1 MiB past. After it every culling level runs
+  with its counts (032f18b8 2 groups, 3360a3c0 38) and the indirect mesh draws' arguments hold counts.
+- **The indirect mesh draws' arguments**: 16 bytes, word 0 the count (task workgroups with a task program, mesh
+  workgroups without), words 1-2 zero, word 3 the culling's counter (`{0xc 0 0 0xc}`, `{0x1 0 0 0x4}`). `op_draw_mesh`
+  now runs them behind `OOT_MESH_IND=1` (default off): a bound of `OOT_MESH_IND_MAX` (64) task workgroups, the count
+  copied on the GPU into bank 0 + `SM86_MESH_C0_COUNT` where a new task prologue (`task_prologue`) exits the
+  workgroups past it; a mesh-only draw gets the count as its stand-in task's mesh count. KEY_VERSION 21.
+- **Device loss (run-126, one driver reset):** the first run with `OOT_GW=1 OOT_MESH=1` and the indirect path (then
+  not behind a knob), 38 s in, on the title, during the full re-translation of KEY_VERSION 21; fault address
+  0x2003bed40, no checkpoint reached; `build/logs/fault-run126.bin`. Not isolated: the indirect path (a bound of task
+  workgroups whose count copy did not happen would read past their lists), the task prologue, or the re-translation
+  load. The indirect path is now off by default and refuses to run without the count copy. Next, one change per run:
+  `OOT_MESH=1` alone (prologue, translator), then `OOT_GW=1`, then `OOT_MESH_IND=1`.
+- Also seen once (run-119, `OOT_GW=1` with a count probe, during a re-translation): the game itself crashed on a null
+  pointer (main+0xc938d0 reads +0x150 of an entry its table lacks, index from an object record at 0x29bc01638); not
+  seen again in the three `OOT_GW=1` runs after.
+
 Left, in order: (2) the host dispatch: which programs a mesh draw uses (the bound program's stages 6 and 7), the
 workgroup size from control +0x58 (packed for these stages: the low half), the record buffers and the bank-0 words,
 the task count read back or bounded (mesh grid = tasks << SHIFT); (3) a generated pass-through vertex program that
