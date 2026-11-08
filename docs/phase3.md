@@ -533,7 +533,26 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   upload or fence wait under `vk_texture_lock`); 8.9% in `gw_scan` from `mesh_dispatch` (the mesh path's window
   scans; its cost is not in the `perf: gw_select` line, which covers compute only); ~4.6% in write-watch queries
   under `type_of_handle` -> `vk_texture_by_id_locked` -> `upload`. Those three are the next speed work.
-- Driver resets since the 02:01 boot: 0 (run-274..295).
+- **The texture lock holder** (`OOT_TEX_LOCK_LOG=1`, new diagnostic, run-297): in 10 s of the level, threads waited
+  2.9 s for `tex_lock` while `vk_texture_write_back_small` held it (355 waits, ~8 ms each); every other holder adds
+  up to under 60 ms. That function runs when a game thread waits for a fence while a small GPU-written target
+  (<= 64 KiB, TotK's grass-cut map pattern) is dirty, and copies each one back with a synchronous GPU readback
+  (`write_back` -> `image_texels`) **while holding the texture lock**; the readback queues behind the frame's other
+  GPU work, so the render thread's draw binding waits behind it. Fix options: (a) do the readback outside the lock
+  (take the list under the lock, read back without it, re-lock to clear `gpu_dirty`), or better (b) record the
+  image-to-buffer copy of small dirty targets at the end of the submission that wrote them, as the buffer mirror
+  does, so the fence wait finds the bytes ready and only deswizzles. Expected gain: most of the ~22% lock wait.
+- **The crash's precise cause** (crash report now prints the foliage manager, run-296 with `OOT_GW_SKIP=none`):
+  kind-0 foliage types: 76; kind-1 types: 203. The crashing record says kind 0 with type 86 (0x56) or 191 (0xbf),
+  types that exist only in the kind-1 table (their kind-1 slots are filled; kind-0 slots past 75 are garbage or 0).
+  main+0xc938d0 checks the index against the kind-0 count, finds no object, and dereferences it anyway. So a foliage
+  instance reaches the CPU with **kind 0 where it should be 1**: a field the GPU-side producer (one of the 18 window
+  users; the research report's non-culling suspects 7088715b, b2c273a2, 289f0e4f, 227f330b, d0bb3a4c, 745220f3,
+  fadd8d26) computes or writes wrongly, or never writes. Next: find the producer (a CPU write watch on the record
+  list, or the kernels' stores of a 0/1 next to a type), fix that translation, and drop the 18 from `OOT_GW_SKIP`.
+  A guard in the lifted function (return no object, as the kind-1 path does) would need a generator patch
+  (`recomp/patches.py`) and a full re-lift of main.
+- Driver resets since the 02:01 boot: 0 (run-274..297).
 
 ### Safety (learned the hard way)
 

@@ -139,10 +139,53 @@ static BOOL CALLBACK tex_init(PINIT_ONCE o, PVOID p, PVOID *ctx) {
     __atomic_store_n(&tex_ready, 1, __ATOMIC_RELEASE);
     return TRUE;
 }
-static void lock(void) {
-    if (!__atomic_load_n(&tex_ready, __ATOMIC_ACQUIRE)) InitOnceExecuteOnce(&tex_once, tex_init, NULL, NULL);
-    EnterCriticalSection(&tex_lock);
+// OOT_TEX_LOCK_LOG=1 (diagnostic): the time threads wait for tex_lock, charged to the call site that held it, logged
+// every 10 s (2026-11-10: the render thread spent ~22% of the frame waiting for this lock).
+static volatile void *lock_site;   // the caller of lock() that took it last
+static int lock_log = -1;
+static struct { void *site; uint64_t ns, n; } lock_hold[32];
+static void lock_note(void *holder, uint64_t ns, void *waiter) {
+    static SRWLOCK l = SRWLOCK_INIT;
+    static uint64_t t_last;
+    static struct { void *site; uint64_t ns; } waiters[32];
+    AcquireSRWLockExclusive(&l);
+    int i = 0;
+    while (i < 32 && lock_hold[i].site && lock_hold[i].site != holder) i++;
+    if (i < 32) lock_hold[i].site = holder, lock_hold[i].ns += ns, lock_hold[i].n++;
+    for (i = 0; i < 32 && waiters[i].site && waiters[i].site != waiter; i++) {}
+    if (i < 32) waiters[i].site = waiter, waiters[i].ns += ns;
+    uint64_t now = GetTickCount64();
+    if (!t_last) t_last = now;
+    if (now - t_last >= 10000) {
+        rt_log("tex lock: waits in the last %.1f s by holder site (oot.exe offsets; ms, count):", (now - t_last) / 1000.0);
+        uintptr_t exe = (uintptr_t)GetModuleHandleW(NULL);
+        for (i = 0; i < 32 && lock_hold[i].site; i++)
+            if (lock_hold[i].ns >= 1000000)
+                rt_log("  held by exe+%#llx: %.1f ms, %llu waits", (unsigned long long)((uintptr_t)lock_hold[i].site - exe),
+                       lock_hold[i].ns / 1e6, (unsigned long long)lock_hold[i].n);
+        for (i = 0; i < 32 && waiters[i].site; i++)
+            if (waiters[i].ns >= 1000000)
+                rt_log("  waiter exe+%#llx: %.1f ms", (unsigned long long)((uintptr_t)waiters[i].site - exe), waiters[i].ns / 1e6);
+        memset(lock_hold, 0, sizeof lock_hold), memset(waiters, 0, sizeof waiters);
+        t_last = now;
+    }
+    ReleaseSRWLockExclusive(&l);
 }
+static void lock_at(void *site) {
+    if (!__atomic_load_n(&tex_ready, __ATOMIC_ACQUIRE)) InitOnceExecuteOnce(&tex_once, tex_init, NULL, NULL);
+    if (lock_log < 0) lock_log = cfg_bool("OOT_TEX_LOCK_LOG");
+    if (lock_log && !TryEnterCriticalSection(&tex_lock)) {
+        void *holder = (void *)lock_site;
+        LARGE_INTEGER a, b, f;
+        QueryPerformanceCounter(&a);
+        EnterCriticalSection(&tex_lock);
+        QueryPerformanceCounter(&b), QueryPerformanceFrequency(&f);
+        lock_note(holder, (uint64_t)((b.QuadPart - a.QuadPart) * 1e9 / f.QuadPart), site);
+    } else if (!lock_log)
+        EnterCriticalSection(&tex_lock);
+    if (lock_log) lock_site = site;
+}
+__attribute__((noinline)) static void lock(void) { lock_at(__builtin_return_address(0)); }
 static void unlock(void) { LeaveCriticalSection(&tex_lock); }
 
 static uint32_t umax(uint32_t a, uint32_t b) { return a > b ? a : b; }
@@ -1228,7 +1271,7 @@ static Tex *slot_resolve(TexSlot *s, view_t *view, int *has_view) {
     return e;
 }
 
-void vk_texture_lock(void) { lock(); }
+__attribute__((noinline)) void vk_texture_lock(void) { lock_at(__builtin_return_address(0)); }
 void vk_texture_unlock(void) { unlock(); }
 uint32_t vk_texture_slots_gen(void) { return slots_gen; }
 
