@@ -708,8 +708,22 @@ Tools added: `OOT_SM86_COUNT` takes several programs (`<hash>[@<kind reg>/<id re
 0, or masked with `mask`, and id >= 76; N = 253 counts them, 254 sums their thread X) and `q` (lane bit clear in uniform register N); `OOT_BANK_WATCH=<lo>:<hi>` logs each compute
 program with a 64-bit value in that range in bank 0. A bad record comes in about 1 run in 9 of 55 s.
 
-Next: watch the counter word at 0x29bb9c010 and 0x29bbbb010: CPU writes with `OOT_CPU_WATCH`, and what the leaders' atomics return from one dispatch to the next (a value that goes down
-within a frame is a reset). If it never goes down, force a full barrier between these dispatches and measure the crash rate.
+Further checks (same day), each a way two writers could share a slot, all negative:
+
+- One backing: in all four code hashes the slot atomic (ATOMG at c0+0x70 + 0x10) and the 11 stores of the entry go through the same
+  storage binding (32, SPIR-V); no window chain is involved in either. The window is used only by the kernels' other atomics.
+- Dispatches do not overlap: `vk_exec_barrier` issues a full ALL_COMMANDS memory barrier before every dispatch, so a forced barrier adds nothing.
+- Lane equals thread X modulo 32 and every storing lane is in the VOTEU mask, on the four real writers (`l254` and `q6`: 0 of about 44,000 stores per
+  window, run-637).
+- The CPU never writes the entries: `OOT_CPU_WATCH` over the buffers (run-636) sees only the headers (+0 to +0x2c of both buffers, zeroed by the builder at main+0x2bfd750, one
+  of them the counter at +0x10) and unrelated heap below them. (That run has no bad record, and the watch slowed the game.)
+
+So one reservation per thread, on one backing, in serialized dispatches, and yet slot 74 holds an id that no store wrote together with that kind. Still open: the id word may
+be left over from an older entry in the slot (a store that did not land), or be written by a program outside these 19. Programs with the list's buffer in their global window besides the writers
+in run-595: 556b0b3d, 2d61dc08, 1cd3515d (their appends use +0x50040, no constants near the list).
+
+Next: read each entry back right after its stores in the shader and count a word that differs from what was just written (a lost or overwritten store). If that stays 0 in a run with a
+bad record, the entry changes after the dispatch: then find which later command overlaps the list (copies included).
 
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 

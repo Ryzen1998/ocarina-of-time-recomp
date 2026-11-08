@@ -3837,7 +3837,8 @@ static void count_emit(L *l, uint32_t k) {
                     ((uint64_t)1 << 48) | ((uint64_t)1 << 44));
     } else if (cnt.kind[k] == 10) {   // ISET mask (0 or ~0): (lane ^ thread X) & 31 != 0, then 0 or 1
         uint32_t t = S(l, s + 3);
-        to_reg_into(l, reg_src(cnt.idx[k]), d);
+        if (cnt.idx[k] == 254) emit(l, 0xf0c8000000000000ull | l->pred | d);   // N = 254: the lane itself (S2R SR_LANEID)
+        else to_reg_into(l, reg_src(cnt.idx[k]), d);
         emit(l, 0xf0c8000000000000ull | l->pred | t | ((uint64_t)0x21 << 20));   // S2R SR_TID.X
         emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)t << 20) | ((uint64_t)2 << 41) | ((uint64_t)PT << 48));   // LOP.XOR
         lop_imm(l, d, d, 31, 0);
