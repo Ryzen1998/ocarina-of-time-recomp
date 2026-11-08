@@ -644,6 +644,12 @@ Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
 - **Crash** main+0xc938d0 not fixed. `OOT_FOLIAGE_GUARD=1` (generator hook, runtime/main.c, off by default) answers a bad kind-0 lookup as "no object" and logs it (2 hits per run seen, in the plants' first frames); used only to make full-window diagnostic runs reach their frames. The records are real plant positions with resource types (16, 38, 86, 191 of kind 1), some marked kind 0.
 - The 14 graphics programs with the "callfal1" tag and 198 "shfmax01" programs have only been checked in the running game, not one by one.
 
+#### Foliage: the spikes are gone, leaves appear with the full window (2026-11-08, c7b8e4b, 0 driver resets)
+
+- **Spikes fixed:** Ryujinx's funnel shift is `(low >> s) | (high << (32 - s))`; at s = 0 the host ORs the other word in. Meshlet indices at a bit offset that is a multiple of 32 came out above the vertex count and picked unwritten vertices (`OOT_MESH_REC` + `OOT_MESH_CLEAR=1`: 16 of 190 groups before, 0 after). `lower_shf` selects the plain word when s is 0 (tag "shfmax02"). Not an overlap in the record: vertices end at most at 0x3400, the map at 0x7C04 of 0x8000.
+- **Pictures:** `build/logs/shf0-default.png` (default, noise 0.76): no spikes, the tunnel's stone arch is back. `build/logs/shf0-full.png` (`OOT_GW_SKIP=none`, noise 0.77): tree leaves at the left, a dark fern by the sign, more fireflies. The default's `OOT_GW_SKIP` still starves the plant chain, so leaves need the full window, so the crash is what stands between the default and this picture.
+- Next: compare other forest spots with `build/reference/` (the canopy is largely above this shot), then the crash at main+0xc938d0, then drop `OOT_GW_SKIP`.
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with
