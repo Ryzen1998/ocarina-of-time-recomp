@@ -554,6 +554,32 @@ Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
   0x29fd80000, 0x2a0e04000.., 0x29bc62000, ...). So the GPU culling that fills those args counts nothing: that is
   where the ground cover goes. 28 of 50 direct mesh draws fill only group 7 of 0-7 (66 primitives); unexplained.
 
+#### Hand-off for the foliage work (2026-11-10)
+
+- **Reach the forest:** `.venv-win\Scripts\python.exe tools\run.py --seconds 150 --retry 0 --replay
+  build/logs/a-continue.txt --skip-movies [--env ...]`. The title's Continue loads the autosave in
+  `build/profile/save`: ~60 s later Link stands in Kokiri Forest at Saria's lines (fixed scene, ~45 fps now). If a run
+  overwrites the save (the game autosaves when Link moves on), restore it: delete `build/profile/save` and copy
+  `build/profile/save-forest-backup-2026-11-10` back to that name. A new game (the opening, the white-flicker scene)
+  needs the save moved away first. `build/logs/user-forest-1.txt` is the user's recorded walk (replays drift).
+- **Reference:** `build/reference/switch2-*.png` (the user's Switch 2 video frames; git-ignored, never commit).
+- **What is known:** every indirect mesh draw in the forest reads 0 groups on the GPU and in guest memory
+  (`OOT_MESH_LOG=1 OOT_MESH_LOG_FROM=2500`: lines "indirect mesh draw (...) at 0x...: GPU 0 0 0 0"; arguments at
+  0x29d7b6000+0x00..0x40, 0x29fd80000, 0x2a0e04000.., 0x2a0ccc000.., 0x2a169c000.., 0x29bc62000, 0x29bc4a000,
+  0x29be5e000, 0x29cb0a000 in run-355; addresses can move between runs). The same with the full window (run-354) and
+  with mesh 072eb70d enabled (run-355: `OOT_MESH_IND_SKIP=none` is safe now, no blocks). So the GPU culling that
+  writes those counts counts nothing. Earlier leads, docs above: culling kernel e6d5432f appends an object only when
+  a per-object counter byte (record word 3, low byte) is 0xff, which reads 0 on CPU and GPU (table 0x2a19e9000);
+  the window families af7a80ff / ac939523 / 164d634a write the window-fed counts (0x29bc62000 / 0x29bc4a000).
+- **Also odd:** 28 of 50 direct mesh draws fill only group 7 of groups 0-7 with 66 primitives (meshlog lines
+  "primitive counts of groups 0-7: 0 0 0 0 0 0 0 66").
+- **Tools that worked today:** `OOT_PASS_TIME=1`, `OOT_CS_TIME=1`, `OOT_WB_LOG=1`, `OOT_SHOTS=w0-200:10
+  OOT_SHOTS_FULL=1 OOT_SHOTS_DIR=...`, `OOT_DUMP=when OOT_DUMP_WHEN=white:<n>@<frame> OOT_DUMP_WHITE_LEVEL=230`,
+  `OOT_SKIP_CS=<input id>` (input ids from `tools/kernel.py list`, matched by code hash), `--dump <frame>`.
+- **Defaults now:** `OOT_GPU_AHEAD=0` (lock-step, white-flicker fix), `OOT_GW_SKIP` = the 18, `OOT_TEX_REL_AGE=600`,
+  flushed mirror ranges left to write watch. Regenerate C with `recomp/gen.py` before `tools/build_game.py` after
+  a generator change (build_game.py only compiles).
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with
