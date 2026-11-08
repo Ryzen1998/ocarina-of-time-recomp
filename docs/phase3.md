@@ -605,6 +605,17 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   the c4 pointer cells, `(index * 4 + 0x83) * 16`). So the list bit is per-object data that reads 0 on our side.
   Earlier dumps showed the CPU and GPU copies of that table differing (+0x38 set on the GPU only). Next: snapshot
   that record word on both sides (`OOT_DUMP_BUF` on the table, `cpu_*.bin` vs `buf_*.bin`) and find who sets bit 0.
+- **The record word behind the list bit** (research report 14e: row 0x83 word 3 is record +0x1c; two runs):
+  run-319 (safe configuration, frame 4900): the table at 0x2a19e9000 (991 records) is byte-identical on the CPU and
+  the GPU side, +0x1c has bytes 1-2 set and bit 0 clear in every record, and `OOT_WATCH_RANGE=2a19e9000:2a1d00000`
+  saw no GPU write, copy or fill into the three tables. So no memory-path bug there: in the game's own data those
+  objects have bit 0 = 0. run-320 (full window, game crash at 131 s only, 0 resets): the culling families' window
+  entries cover all three tables (their row-0x85 counter and flag stores); `OOT_GW_TRACE=d0bb3a4c` printed nothing
+  (its trace hook sits behind an early return for this kernel). But d0bb3a4c does not take its table from the c4
+  pointer cells: it loads the record base from bank 0 + 0x60 or + 0x70 (by a sign test at 0x130), i.e. from
+  storage-buffer slot addresses, so **its table may be another buffer**. Next: one dump with d0bb3a4c dispatched,
+  identify its dispatch by its SPIR-V hash (hash the cache's .spv for its key), read which buffer its c0+0x60/0x70
+  slots name, and compare +0x1c there on both sides.
 - The tensor probe (`--probe-tensor`) fails in every switch configuration tried (window off, pointers off, old FSEL,
   old push, old views): its test kernel's plain global loads read zeros, so the harness's buffer addressing broke at
   some point (likely the bank-0 layout changes of 2026-11-06/07), not the tensor path. The game's own HMMA kernels
