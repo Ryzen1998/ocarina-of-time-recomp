@@ -524,7 +524,16 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   his shadow on the grass, normal ground colour: the over-bright speckled ground is gone; noise 0.86).
 - Mesh 072eb70d (`OOT_MESH_IND_SKIP=none`, run-291): its draws (task c7f0444a, args at 0x29bc4a000) get 0 groups
   under the workaround, so the test says nothing; it stays skipped.
-- Driver resets since the 02:01 boot: 0 (run-274..291).
+- **Speed** (run-292..295): the level runs at ~41-47 fps and is CPU-bound: frame interval 23.9 ms, GPU 13.0 ms,
+  of which the replay (recording the frame's Vulkan commands on the render thread) is 17.5 ms. `OOT_REPLAY_ASYNC=1`
+  moves it to its own thread but gains nothing (replay 21.6 ms, interval 24.3 ms): the replay's own cost bounds the
+  frame. Render-thread profile (`OOT_PROFILE_RENDER=1`, frames 5000-6500): ~22% waiting on a lock inside
+  `vk_exec_target_view`, `bind_resources`, `answers_for`, `vk_texture_get` (the texture registry's lock; no other
+  thread shows time in texture code, so the holder may be waiting while it holds it: find who, e.g. a blocking
+  upload or fence wait under `vk_texture_lock`); 8.9% in `gw_scan` from `mesh_dispatch` (the mesh path's window
+  scans; its cost is not in the `perf: gw_select` line, which covers compute only); ~4.6% in write-watch queries
+  under `type_of_handle` -> `vk_texture_by_id_locked` -> `upload`. Those three are the next speed work.
+- Driver resets since the 02:01 boot: 0 (run-274..295).
 
 ### Safety (learned the hard way)
 
