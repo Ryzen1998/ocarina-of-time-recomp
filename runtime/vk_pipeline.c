@@ -2507,6 +2507,7 @@ void vk_pipeline_async_enable(void) {
     A.on = 1;
 }
 
+int vk_force_no_depth;
 int vk_pipeline_async_on(void) { return A.on; }
 
 // A draw needs a pipeline a prebuild job owns: the job moves to the draw queue, or its worker to normal priority.
@@ -3367,7 +3368,7 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     vkCmdSetCullMode(cb, (VkCullModeFlags)(pl->cull & 3));   // NVN_FACE_* has VkCullModeFlagBits' values
     vkCmdSetFrontFace(cb, front_cw ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE);
     vkCmdSetPrimitiveTopology(cb, vk_pipeline_topology(s->prim));
-    vkCmdSetDepthTestEnable(cb, d->dt);
+    vkCmdSetDepthTestEnable(cb, d->dt && !vk_force_no_depth);   // vk_force_no_depth: OOT_MESH_NODEPTH (vk_exec_draw.c mesh_draw)
     vkCmdSetDepthWriteEnable(cb, d->dw);
     // OOT_DEPTH_EQ_LE (diagnostic): depth EQUAL tests as LESS_OR_EQUAL (=1) or GREATER_OR_EQUAL (=2); =3 draws each
     // EQUAL draw twice, the left half of the target with LESS_OR_EQUAL and the right half with EQUAL (vk_exec_draw.c

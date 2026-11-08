@@ -4044,10 +4044,10 @@ static void mesh_rb_done(VkExec *ex, int slot, uint32_t kind, uint32_t a, uint32
 
 // OOT_MESH_TASKS=<frame> (diagnostic): for every mesh draw of that frame, its indirect arguments and the mesh workgroup
 // count each of its tasks asked for, read back on the GPU. A slot holds 64 task counts and the 4 argument words.
-#define MTB_SLOT_WORDS 68u
+#define MTB_SLOT_WORDS 136u
 #define MTB_SLOTS 256u
 static struct { VkBuffer buf; VmaAllocation mem; uint32_t *map; uint32_t next; } MTB;
-typedef struct { uint32_t slot, tasks, shift; uint64_t ht, hm, ind; } MeshTasksRead;
+typedef struct { uint32_t slot, tasks, shift; uint64_t ht, hm, ind, s[9]; uint32_t sz[9]; } MeshTasksRead;
 static void mesh_tasks_read(void *arg) {
     MeshTasksRead *r = arg;
     const uint32_t *v = MTB.map + MTB_SLOT_WORDS * r->slot;
@@ -4062,6 +4062,13 @@ static void mesh_tasks_read(void *arg) {
     rt_log("meshtasks: task %016llx mesh %016llx args at %#llx: %u %u %u %u; %u tasks ran: sum %u max %u, %u over the limit of %u:%s",
            (unsigned long long)r->ht, (unsigned long long)r->hm, (unsigned long long)r->ind, v[64], v[65], v[66], v[67], n, sum,
            max, over, r->shift < 31 ? 1u << r->shift : 0u, s);
+    char b[400];
+    size_t bo = 0;
+    for (int i = 0; i < 9; i++) if (r->s[i]) bo += (size_t)snprintf(b + bo, sizeof b - bo, " %d=%#llx+%#x", i, (unsigned long long)r->s[i], r->sz[i]);
+    b[bo] = 0;
+    uint32_t psum = 0, pn = 0, pmax = 0, pfirst = 0xffffffffu;
+    for (uint32_t i = 0; i < 64; i++) if (v[72 + i]) psum += v[72 + i], pn++, pmax = v[72 + i] > pmax ? v[72 + i] : pmax, pfirst = pfirst == 0xffffffffu ? i : pfirst;
+    rt_log("meshtasks: mesh storage:%s; slot 2 head on the GPU %#x %#x %#x %#x; primitive counts of 64 groups: sum %u in %u groups, max %u, first %d", b, v[68], v[69], v[70], v[71], psum, pn, pmax, (int)pfirst);
     free(r);
 }
 static void mesh_tasks_note(VkExec *ex, const VkMemSpan *ip, uint64_t ind, uint32_t tasks, uint32_t shift) {
@@ -4091,9 +4098,21 @@ static void mesh_tasks_note(VkExec *ex, const VkMemSpan *ip, uint64_t ind, uint3
         vkCmdCopyBuffer(ex->cb, ip->buffer, MTB.buf, 1, &a);
         ex->recorded++;
     }
+    VkBufferCopy pc[64];
+    uint32_t npc = 0;
+    for (uint32_t g = 0; g < 64 && (VkDeviceSize)(g + 1) * SM86_MESH_STRIDE <= M.mesh_size; g++, npc++)
+        pc[g] = (VkBufferCopy){M.task_size + (VkDeviceSize)g * SM86_MESH_STRIDE + SM86_MESH_MAP, base + (72 + g) * 4, 4};
+    if (npc) vkCmdCopyBuffer(ex->cb, M.buf, MTB.buf, npc, pc), ex->recorded++;
     MeshTasksRead *r = malloc(sizeof *r);
     if (!r) return;
-    *r = (MeshTasksRead){slot, tasks, shift, 0, 0, ind};
+    *r = (MeshTasksRead){slot, tasks, shift, 0, 0, ind, {0}, {0}};
+    for (int i = 0; i < 9; i++) r->s[i] = ex->mssbo[1][i].addr, r->sz[i] = (uint32_t)ex->mssbo[1][i].size;
+    VkMemSpan s2;
+    if (ex->mssbo[1][2].addr && vk_mem_resolve(ex->mssbo[1][2].addr, 16, &s2)) {
+        VkBufferCopy c2 = {s2.offset, base + 68 * 4, 16};
+        vkCmdCopyBuffer(ex->cb, s2.buffer, MTB.buf, 1, &c2);
+        ex->recorded++;
+    }
     for (int m = 0; m < 2; m++) {
         const NVNshaderData *e = stage_entry(ex->mesh_prog[m], 6 + m);
         if (!e) continue;
@@ -4106,10 +4125,68 @@ static void mesh_tasks_note(VkExec *ex, const VkMemSpan *ip, uint64_t ind, uint3
     vk_completion_add(vk_sync_issued() + 1, mesh_tasks_read, r);
 }
 
+// OOT_MESH_REC=<frame>:<mesh hash prefix> (diagnostic): the mesh records of up to 8 such draws of that frame are written
+// to build/logs/meshrec/<hash>_<n>.bin (a u32 header: groups, stride, map offset, mesh count of bytes; then the records).
+#define MREC_BYTES (4u << 20)
+static struct { VkBuffer buf; VmaAllocation mem; uint8_t *map; uint32_t next; } MREC;
+typedef struct { uint32_t slot, groups, bytes; uint64_t hm; } MeshRecRead;
+static void mesh_rec_read(void *arg) {
+    MeshRecRead *r = arg;
+    char name[128];
+    CreateDirectoryA("build/logs/meshrec", NULL);
+    snprintf(name, sizeof name, "build/logs/meshrec/%016llx_%u.bin", (unsigned long long)r->hm, r->slot);
+    FILE *f = fopen(name, "wb");
+    if (f) {
+        uint32_t h[4] = {r->groups, SM86_MESH_STRIDE, SM86_MESH_MAP, r->bytes};
+        fwrite(h, 4, 4, f), fwrite(MREC.map + (size_t)r->slot * MREC_BYTES, 1, r->bytes, f), fclose(f);
+    }
+    free(r);
+}
+static void mesh_rec_note(VkExec *ex, uint32_t groups) {
+    static long long at = -2;
+    static char prefix[17];
+    if (at == -2) {
+        const char *e = getenv("OOT_MESH_REC");
+        at = e ? atoll(e) : -1;
+        if (e && strchr(e, ':')) snprintf(prefix, sizeof prefix, "%s", strchr(e, ':') + 1);
+    }
+    if (at < 0 || (long long)gfx_stats().frames != at || MREC.next >= 8) return;
+    const NVNshaderData *e = stage_entry(ex->mesh_prog[1], 7);
+    if (!e) return;
+    uint32_t len;
+    memcpy(&len, (const uint8_t *)e->control + 0x44, 4);
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint32_t i = 0; i < len; i++) h = (h ^ ((const uint8_t *)(uintptr_t)e->data)[i]) * 0x100000001b3ull;
+    char hx[17];
+    snprintf(hx, 17, "%016llx", (unsigned long long)h);
+    if (strncmp(hx, prefix, strlen(prefix))) return;
+    if (!MREC.buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = 8ull * MREC_BYTES, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                      .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &MREC.buf, &MREC.mem, &info) != VK_SUCCESS) { at = -1; return; }
+        MREC.map = info.pMappedData;
+    }
+    uint32_t slot = MREC.next++;
+    uint32_t bytes = M.mesh_size < MREC_BYTES ? (uint32_t)M.mesh_size : MREC_BYTES;
+    vk_exec_barrier(ex);
+    VkBufferCopy cp = {M.task_size, (VkDeviceSize)slot * MREC_BYTES, bytes};
+    vkCmdCopyBuffer(ex->cb, M.buf, MREC.buf, 1, &cp);
+    ex->recorded++;
+    MeshRecRead *r = malloc(sizeof *r);
+    if (!r) return;
+    *r = (MeshRecRead){slot, groups, bytes, h};
+    vk_completion_add(vk_sync_issued() + 1, mesh_rec_read, r);
+}
+
 static void mesh_release(VkCtx *c) {   // vk_exec_draw_shutdown
     if (M.buf) vmaDestroyBuffer(c->vma, M.buf, M.mem);
     if (MRB.buf) vmaDestroyBuffer(c->vma, MRB.buf, MRB.mem);
     if (MTB.buf) vmaDestroyBuffer(c->vma, MTB.buf, MTB.mem);
+    if (MREC.buf) vmaDestroyBuffer(c->vma, MREC.buf, MREC.mem);
+    memset(&MREC, 0, sizeof MREC);
     memset(&M, 0, sizeof M), memset(&MRB, 0, sizeof MRB), memset(&MTB, 0, sizeof MTB);
 }
 
@@ -4242,8 +4319,14 @@ static void mesh_draw(VkExec *ex, const prog_t *mesh, uint32_t groups) {
     ex->ssbo[NVN_STAGE_VS][SM86_MESH_VS_SLOT] = (p_bind_buf){NVN_STAGE_VS, SM86_MESH_VS_SLOT, MESH_FAKE_MESH + (++n << 24), M.mesh_size};
     ex->prog = vp, bind_gen++;
     M.drawing = 1;
+    // OOT_MESH_NODEPTH=1 (diagnostic): the pass-through draws without a depth test, to tell depth from missing geometry.
+    static int nodepth = -1;
+    if (nodepth < 0) nodepth = getenv("OOT_MESH_NODEPTH") != NULL;
+    extern int vk_force_no_depth;
+    if (nodepth) vk_force_no_depth = 1, B.st_valid = 0;
     p_draw d = {4, 0, (int32_t)(3 * prims), 0, (int32_t)groups};   // NVN triangles
     op_draw(ex, &d);
+    if (nodepth) vk_force_no_depth = 0, B.st_valid = 0;
     M.drawing = 0;
     ex->prog = sprog, bind_gen++;
     ex->ssbo[NVN_STAGE_VS][SM86_MESH_VS_SLOT] = ss;
@@ -4404,6 +4487,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     M.on = 0, M.ind = (VkMemSpan){0};
     vk_exec_barrier(ex);
     if (ok) mesh_tasks_note(ex, indirect ? &ip : NULL, d->ind, has_task ? tasks : 0, shift);
+    if (ok) mesh_rec_note(ex, groups);
     if (vk_dump_armed) {   // frame dumps: which task and mesh programs the next pass-through draw stands for
         uint64_t hq[2] = {0, 0};
         for (int m = 0; m < 2; m++) {

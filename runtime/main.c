@@ -587,6 +587,30 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
     ExitProcess(71);
 }
 
+// OOT_FOLIAGE_GUARD=1 (diagnostic, recomp/gen.py calls this at the head of main+0xc938d0): a contact record (x0) of kind
+// 0 whose type is outside the manager's kind-0 table (`*(main+0x4e22540) + 0x120`: count +0x840, table +0x848) answers
+// "no object", as the kind-1 path does; the lifted code would read through a null object (docs/phase3.md). Logged.
+int rt_foliage_guard(Cpu *c) {
+    static int on = -1;
+    if (on < 0) on = getenv("OOT_FOLIAGE_GUARD") && getenv("OOT_FOLIAGE_GUARD")[0] == '1';
+    if (!on) return 0;
+    const uint8_t *r = (const uint8_t *)(uintptr_t)c->x[0];
+    int32_t kind = *(const int32_t *)(r + 0x20), type = *(const int32_t *)(r + 0x1c);
+    uint64_t mgr = *(const uint64_t *)(uintptr_t)(*(const uint64_t *)(uintptr_t)0x7004e22540ull + 0x120);
+    if (!mgr || kind != 0 || type == -1) return 0;
+    int32_t n = *(const int32_t *)(uintptr_t)(mgr + 0x840);
+    uint64_t obj = type >= 0 && type < n ? *(const uint64_t *)(uintptr_t)(*(const uint64_t *)(uintptr_t)(mgr + 0x848) + (uint64_t)(uint32_t)type * 8) : 0;
+    if (obj) return 0;
+    static volatile LONG hits;
+    LONG h = InterlockedIncrement(&hits);
+    if (h <= 40 || h % 1000 == 0) {
+        const float *p = (const float *)r;
+        rt_log("foliage guard: hit %ld, kind-0 type %d of %d at (%.1f, %.1f, %.1f), record %p", (long)h, type, n, p[0], p[1], p[2], (const void *)r);
+    }
+    *(uint64_t *)(uintptr_t)c->x[8] = 0;
+    return 1;
+}
+
 // ---- self-test: layout, dispatch table, host-function registry, without game files
 static int failures;
 #define CHECK(cond, ...) do { if (!(cond)) { failures++; printf("  FAIL: " __VA_ARGS__); putchar('\n'); } } while (0)

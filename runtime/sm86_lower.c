@@ -1662,11 +1662,12 @@ static void lower_shf(L *l, const Insn *x, uint32_t op) {
         return;
     }
     // True funnel shifts: Maxwell SHF.L Rd = high word of (high:low << s) when .HI, SHF.R Rd = low word of
-    // (high:low >> s). MaxShift 37-38: 0 U64 (clamp 64), 2 U32 (clamp 32); M (50) wraps.
+    // (high:low >> s). MaxShift 37-38: 2 U64 (64-bit funnel), 0 U32 (Ryujinx enum MaxShift); M (50) wraps. The two were
+    // swapped until 2026-11-08: 64-bit funnels ran as 32-bit ones, which broke the mesh programs' packed index extraction.
     if (!hi_res && !right) return (void)fail(l, "SHF.L low result");
     if (hi_res && right) return (void)fail(l, "SHF.R high result");
     if (type == 0 || type == 2) return (void)fail(l, "signed funnel shift");
-    uint64_t max = (uint64_t)(type == 3 ? 2 : 0) << 37;
+    uint64_t max = (uint64_t)(type == 3 ? 0 : 2) << 37;
     if (imm) {
         if (amount > 63) return (void)fail(l, "SHF immediate");
         emit(l, base(l, right ? 0x38f8000000000000ull : 0x36f8000000000000ull, rd, low) | ((uint64_t)amount << 20) |
@@ -3535,9 +3536,19 @@ static void lower_isbe(L *l, const Insn *x, int write) {
         c0off = SM86_MESH_C0_TASK;
         emit(l, SHL_IMM(rec, t, SM86_TASK_STRIDE_LOG2) | l->pred);
     }
-    if (ra != RZ) emit(l, IADD_R(rec, rec, ra) | l->pred);
+    // The index map's bytes: the host's byte store is a read-modify-write of the 32-bit word holding it, and the threads
+    // of a workgroup write neighbouring bytes at once, so bytes were lost (triangles with stale indices, 2026-11-08). Each
+    // index gets a word of its own (mesh_vs reads them back): byte b of the map at MAP + 4 + 4 * (b - 4).
+    int map_word = write && l->mesh == 7 && out && region == 0 && !wide && off >= 4;
+    if (map_word && ra != RZ) {
+        uint32_t t4 = S(l, 2);
+        emit(l, SHL_IMM(t4, ra, 2) | l->pred);
+        emit(l, IADD_R(rec, rec, t4) | l->pred);
+    } else if (ra != RZ) {
+        emit(l, IADD_R(rec, rec, ra) | l->pred);
+    }
     uint32_t a = mesh_addr(l, c0off, rec, 6);
-    uint64_t size = wide ? 4 : 0, imm = off + base_off;
+    uint64_t size = wide || map_word ? 4 : 0, imm = map_word ? (uint64_t)(off - 4) * 4 + 4 + base_off : off + base_off;
     if (write) emit(l, 0xeed8000000000000ull | l->pred | reg | ((uint64_t)a << 8) | (imm << 20) | ((uint64_t)1 << 45) | (size << 48));
     else emit(l, 0xeed0000000000000ull | l->pred | reg | ((uint64_t)a << 8) | (imm << 20) | ((uint64_t)1 << 45) | (size << 48));
 }
@@ -3549,7 +3560,7 @@ static void task_prologue(L *l) {
     uint64_t saved = l->pred;
     l->pred = (uint64_t)PT << 16;
     uint32_t g = S(l, 0), n = S(l, 1);
-    emit(l, S2R_CTAID_X(g));
+    emit(l, S2R_CTAID_X(g) | l->pred);
     Src s = {0};
     s.kind = 2, s.cb_bank = 0, s.cb_off = SM86_MESH_C0_COUNT;
     mov_cbuf(l, n, &s);
@@ -3567,19 +3578,21 @@ static void mesh_prologue(L *l) {
     uint64_t saved = l->pred;
     l->pred = (uint64_t)PT << 16;
     uint32_t g = S(l, 0), rec = S(l, 1), t = S(l, 2), i = S(l, 3), cnt = S(l, 8);
-    emit(l, S2R_CTAID_X(g));
+    emit(l, S2R_CTAID_X(g) | l->pred);
     mesh_split(l, g, t, i, 4);
-    emit(l, SHL_IMM(rec, t, SM86_TASK_STRIDE_LOG2));
+    emit(l, SHL_IMM(rec, t, SM86_TASK_STRIDE_LOG2) | l->pred);
     uint32_t a = mesh_addr(l, SM86_MESH_C0_TASK, rec, 6);
     emit(l, 0xeed0000000000000ull | l->pred | cnt | ((uint64_t)a << 8) | ((uint64_t)4 << 20) | ((uint64_t)1 << 45) | ((uint64_t)4 << 48));
     // P0 = i >= count (unsigned)
     emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)0 << 3) | ((uint64_t)i << 8) | ((uint64_t)cnt << 20) |
                 ((uint64_t)PT << 39) | ((uint64_t)6 << 49));
-    l->pred = 0;   // @P0
+    // Every workgroup starts with a primitive count of 0 (the program stores the real one later): a record is not
+    // cleared between draws, and a stale count made the pass-through draw triangles of an earlier draw (2026-11-08).
     emit(l, SHL_IMM(rec, g, SM86_MESH_STRIDE_LOG2) | l->pred);
     a = mesh_addr(l, SM86_MESH_C0_MESH, rec, 6);
     emit(l, 0xeed8000000000000ull | l->pred | RZ | ((uint64_t)a << 8) | ((uint64_t)SM86_MESH_MAP << 20) | ((uint64_t)1 << 45) |
                 ((uint64_t)4 << 48));
+    l->pred = 0;   // @P0
     emit(l, 0xe30000000000000full | l->pred);
     l->pred = saved;
 }
@@ -3720,6 +3733,24 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
         memcpy(&w0, code + i, 4), memcpy(&w1, code + i + 4, 4);
         if ((w0 & 0xfff) == 0x808 && w1 && !(w1 & 0xfff)) { tag ^= 0x6673656c696d6d31ull; break; }   // "fselimm1"
     }
+    // A program with a funnel SHF: MaxShift was swapped (lower_shf, 2026-11-08).
+    for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
+        uint32_t w0, w2;
+        memcpy(&w0, code + i, 4), memcpy(&w2, code + i + 8, 4);
+        uint32_t f = w0 & 0xfff;
+        if (f != 0x219 && f != 0x819 && f != 0xa19 && f != 0xc19) continue;
+        uint32_t low = w0 >> 24, high = w2 & 0xff, type = (w2 >> 9) & 3, right = (w2 >> 12) & 1, hi = (w2 >> 16) & 1;
+        int plain = (!right && !hi && high == 255 && (type == 3 || type == 1)) || (right && hi && low == 255 && (type == 3 || type == 2)) ||
+                    (right && !hi && high == 255 && (type == 3 || type == 1)) || (!right && hi && low == 255 && type == 3);
+        if (!plain) { tag ^= 0x7368666d61783031ull; break; }   // "shfmax01"
+    }
+    // A mesh or task program (an ISBEWR, 0x927): mesh_vs's macros carried no predicate field until 2026-11-08, so they
+    // were @P0 and every vertex of the pass-through draw collapsed; the stand-in vertex programs lower from this code.
+    for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
+        uint32_t w0;
+        memcpy(&w0, code + i, 4);
+        if ((w0 & 0xfff) == 0x927) { tag ^= 0x6d65736876733034ull; break; }   // "meshvs04"
+    }
     // A program with a real CALL: the code behind it was dropped before lower_call kept the fall-through (2026-11-08).
     for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
         uint32_t w0, w2;
@@ -3849,30 +3880,32 @@ static void mesh_vs(L *l, const uint8_t *code, const uint8_t *control) {
         if (code[0x34 + b / 8] >> (b % 8) & 1) attr[lines++] = 0x40 + 4 * b;
     if (!prims || prims > 256 || !lines || lines > 40) return (void)fail(l, "mesh pass-through: header");
     l->pred = (uint64_t)PT << 16;
-    emit(l, ALD_R(0, 0x2fc));                                  // R0 vertex id: primitive * 3 + corner
-    emit(l, ALD_R(1, 0x2f8));                                  // R1 instance id: the mesh workgroup
-    emit(l, SHL_IMM(2, 1, SM86_MESH_STRIDE_LOG2));             // R2 its record
-    emit(l, IMAD_I(3, 0, 0xaaab, RZ));                         // R3 primitive = vertex id / 3 (exact below 2^15)
-    emit(l, SHR_IMM(3, 3, 17));
+    emit(l, ALD_R(0, 0x2fc) | l->pred);                                  // R0 vertex id: primitive * 3 + corner
+    emit(l, ALD_R(1, 0x2f8) | l->pred);                                  // R1 instance id: the mesh workgroup
+    emit(l, SHL_IMM(2, 1, SM86_MESH_STRIDE_LOG2) | l->pred);             // R2 its record
+    emit(l, IMAD_I(3, 0, 0xaaab, RZ) | l->pred);                         // R3 primitive = vertex id / 3 (exact below 2^15)
+    emit(l, SHR_IMM(3, 3, 17) | l->pred);
     mesh_vs_addr(l, 2);
-    emit(l, LDG_E(6, 4, SM86_MESH_MAP, 4));                    // R6 primitive count
+    emit(l, LDG_E(6, 4, SM86_MESH_MAP, 4) | l->pred);                    // R6 primitive count
     // P0 = primitive >= count (unsigned)
     emit(l, 0x5b60000000000000ull | l->pred | 7 | ((uint64_t)0 << 3) | ((uint64_t)3 << 8) | ((uint64_t)6 << 20) |
                 ((uint64_t)PT << 39) | ((uint64_t)6 << 49));
-    emit(l, IADD_R(7, 2, 0) | l->pred);                        // R7 record + vertex id: its index byte - MAP - 4
+    emit(l, SHL_IMM(11, 0, 2) | l->pred);
+    emit(l, IADD_R(7, 2, 11) | l->pred);                       // R7 record + 4 * vertex id: its index word - MAP - 4
     mesh_vs_addr(l, 7);
-    emit(l, LDG_E(8, 4, SM86_MESH_MAP + 4, 0));                // R8 the vertex (a byte)
-    emit(l, SHR_IMM(9, 8, 5));                                 // R9 record + (v >> 5) * lines * 0x80 + (v & 31) * 4
-    emit(l, IMAD_I(9, 9, lines * 0x80, 2));
+    emit(l, LDG_E(8, 4, SM86_MESH_MAP + 4, 4) | l->pred);      // R8 the vertex (one word each: lower_isbe)
+    lop_imm(l, 8, 8, 0xff, 0);
+    emit(l, SHR_IMM(9, 8, 5) | l->pred);                                 // R9 record + (v >> 5) * lines * 0x80 + (v & 31) * 4
+    emit(l, IMAD_I(9, 9, lines * 0x80, 2) | l->pred);
     lop_imm(l, 10, 8, 31, 0);
-    emit(l, SHL_IMM(10, 10, 2));
+    emit(l, SHL_IMM(10, 10, 2) | l->pred);
     emit(l, IADD_R(9, 9, 10) | l->pred);
     mesh_vs_addr(l, 9);
-    for (uint32_t k = 0; k < lines; k++) emit(l, LDG_E(12 + k, 4, 0x80 * k, 4));
+    for (uint32_t k = 0; k < lines; k++) emit(l, LDG_E(12 + k, 4, 0x80 * k, 4) | l->pred);
     l->pred = 0;                                               // @P0: a primitive past the count, all outputs 0
     for (uint32_t k = 0; k < lines; k++) mov_imm(l, 12 + k, 0);
     l->pred = (uint64_t)PT << 16;
-    for (uint32_t k = 0; k < lines; k++) emit(l, AST_R(12 + k, attr[k]));
+    for (uint32_t k = 0; k < lines; k++) emit(l, AST_R(12 + k, attr[k]) | l->pred);
     emit(l, 0xe30000000007000full);                            // EXIT
 }
 

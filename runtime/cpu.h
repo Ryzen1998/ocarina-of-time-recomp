@@ -44,6 +44,8 @@ uint64_t rt_ticks(void);
 // Guest setjmp/longjmp (kernel.c; recomp/gen.py lifts calls to a setjmp and the body of longjmp as these).
 void rt_setjmp_site(Cpu *c, GuestFn setjmp_fn, GuestFn cont);
 void rt_guest_longjmp(Cpu *c) __attribute__((noreturn));
+// Called at the head of the game's foliage object lookup (main+0xc938d0, recomp/gen.py); nonzero: the lookup answered.
+int rt_foliage_guard(Cpu *c);
 
 #if defined(__aarch64__)
 static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }
