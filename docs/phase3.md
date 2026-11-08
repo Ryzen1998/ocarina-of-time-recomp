@@ -760,6 +760,88 @@ in run-595: 556b0b3d, 2d61dc08, 1cd3515d (their appends use +0x50040, no constan
 Next: read each entry back right after its stores in the shader and count a word that differs from what was just written (a lost or overwritten store). If that stays 0 in a run with a
 bad record, the entry changes after the dispatch: then find which later command overlaps the list (copies included).
 
+#### Foliage hand-off: where things stand, and the grass next (2026-11-09, through run-733)
+
+Read this first. The sections above are how it was found; the conclusions here supersede them.
+
+**Fixed, in order (all local on `visuals`, none pushed)**
+
+| Commit | What |
+|---|---|
+| 8c03ee7 | A mesh task launches 32 mesh groups, not 16 |
+| 294e182 | The code behind a real shader CALL is kept (50 programs) |
+| 1a8c960 | Mesh draws reach the screen: unconditional pass-through and prologue, one word per mesh index, the right size for funnel shifts |
+| c7b8e4b | A funnel shift of 0 gives its word (the white spikes) |
+| 2dcd44e | Predicated atomic with result != data: the data stays out of the branch (the crash at main+0xc938d0) |
+| ec3d080 | The 18-program `OOT_GW_SKIP` default is gone: every compute program has the global window |
+| afc3a82 | Translator patch 0023: ballots and shuffles stay where computed (the plant counts, the flicker). Mesh-only indirect draws take their count from the GPU |
+| 2e994f9 | Storage-held pointers of mesh programs are bound to their buffers, not the zero buffer (the black plants) |
+
+**Defaults and measured state** (default settings, no switches, no `--shot`; 6 runs, run-728..733, 2 of them 180 s)
+
+- 0 crashes, 0 driver resets through run-733.
+- Forest about 37 fps, 1% low about 31 in most runs, 19-22 in three of the six. The first minute of a run (title, loading) reads about 30, 1% low 6. The opening runs at 60.
+- Plant lists read steady counts from frame to frame (1592, 826, 710, 260 groups). Picture: `build/logs/ptrfix.png`, noise 0.95.
+- **`build/v131072/oot_xlate.id` is c0e112ed on purpose, while `build/xlate/oot_xlate.id` is the patched ca58cd02.** The exe in `build/v131072` is the patched one. Only programs with a VOTE, VOTEU, SHFL or REDUX were re-keyed (tag "ballotk1"); the rest keep translations that cannot differ. Copying the new `.id` across, a fresh install or `--fresh-cache` retranslates everything: not during a run (GPU safety section of CLAUDE.md).
+- `OOT_MESH_IND_MAX` (64) still bounds task draws. Mesh-only indirect draws no longer use it (`OOT_MESH_MI=0` restores the bound). `MI_MAX_GROUPS` is 5120: a list above it would run past the record buffer. The largest possible is 4320, the largest seen 1592.
+- `OOT_MESH_IND_SKIP` still defaults to a11f465b (see the grass, below).
+
+**Open, in order**
+
+1. Grass tufts (below).
+2. Tree crowns much thinner than on the Switch 2, and a tree at the left of the Saria area that stays bare in every frame of the user's recording (`build/reference/user-rec/burst-316.png`). May share the grass's cause.
+3. Forest speed: 37 fps against 60 in the opening. Replay was about 28 of 32 ms in the worst frames of run-700, so the CPU side counts. Earlier leads are in the 2026-11-10 notes (texture write-back under its lock, `OOT_WB_FENCE_LIMIT=0`).
+4. The flicker: the counts are steady, but the user has not yet played a build with the fix (`afc3a82` or later). The recording (run-697) predates it.
+
+Unverified:
+
+- Only programs re-keyed "ballotk1" got patch 0023. A ballot or shuffle added by the lowering itself (HMMA, REDUX is tagged) in a program with no such instruction of its own keeps its old translation.
+- Graphics programs under the CALL fix and patch 0023 are checked only by running: `kernel.py` validates compute programs. Task and mesh programs are listed as `cs` and do validate.
+- `lower_atomg`'s `atomkeep` is redundant with patch 0023 but left in place.
+- The plants' green was compared by eye with video frames from other spots, not a same-camera frame.
+
+**The grass: what is known**
+
+- Target: `build/reference/sheet-632-646.png` shows thick grass on the mounds and along the stone path near the Saria area; also `switch2-600s.png`, `sheet-480-660.png`. `sheet-538-550.png` shows full tree crowns. For a full-size frame: `ffmpeg -ss 636 -i C:\Users\apexa\Downloads\OOT_WALK_THROUGH.mp4 -frames:v 1 build\reference\f636.png`. The video has no frame from our exact camera position.
+- **First suspect: mesh program 072eb70d (code hash a11f465b) is still skipped by default** (`OOT_MESH_IND_SKIP`, default a11f465b, in `op_draw_mesh`; `=none` runs it; `OOT_MESH_IND_ONLY=<hex>` isolates draws). It "turned the frame into black and white blocks" when it first lowered. That judgment predates the funnel-shift, ballot and pointer fixes, and the user's rule forbids a skip list. Try `OOT_MESH_IND_SKIP=none` first, watching the driver.
+- Second: the small mesh programs 27a40ad7 and 8a59f4a8 (116 instructions, `popcount * 2` as an output count): sized like billboards. Patch 0023 corrected their count. Whether they are the grass is not established.
+- Third: task draws are bounded at 64 tasks. The lists seen read 55 and 31, so this does not bite yet; check any above 64. Lists that read 0 every frame in `OOT_MESH_SERIES` (0x2a0c3f040, 0x29e6eb040, 0x2a124f050, 0x2a0d67050, 0x2a1727050 and the like) were measured before the pointer fix: measure again.
+- Mesh programs with storage-held pointers get no global window (`gw_select_mesh`: the two tables overlap in bank 0). Such a program that also needs the window reads zeros through it. Not seen yet; a candidate if a program draws nothing.
+- The dark clumps in the air were seen before the pointer fix and have not been checked since.
+
+**How to reach the scene** (PowerShell, from the repo root)
+
+    .venv-win\Scripts\python.exe tools\build_game.py
+    $t0 = Get-Date
+    .venv-win\Scripts\python.exe tools\run.py --seconds 130 --retry 0 --replay build/logs/a-continue.txt --skip-movies --shot build/logs/x.png
+    (Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='nvlddmkm'; StartTime=$t0} -ErrorAction SilentlyContinue).Count
+    .venv-win\Scripts\python.exe tools\shot_diff.py build/logs/x.png
+
+The save is restored from `build/profile/save-forest-backup-2026-11-10`. The forest appears from about frame 1020. At 130 s the shot is Link on the wooden platform overlooking the path, the same spot each time. Frames reach about 3700 by 130 s: use `--dump 3300` or 3600, not 4600. Some runs stall on the title (few calls, high fps): check the log before believing a result. The user's inputs are in `build/logs/user-play-2.txt` and `-3.txt` (they drift).
+
+**Diagnostics that paid off**
+
+- `OOT_MESH_SERIES=<first frame>:<frames>`: indirect draw counts per address and frame. The first thing to run on any plant question.
+- `--dump F --env OOT_DUMP_PNG_MB=6000`: each pass with its colour target. `passes.txt` notes the mesh draws, and `sh_<hash>.spv` holds each shader. To find which pass paints a pixel, read its value through the `_tm.png` files in order.
+- `OOT_MESH_REC=<frame>:<mesh hash prefix>` (`build/logs/meshrec/`): the mesh records. Lines are the declared attributes in bit order (header bits at code + 0x34), stored at `(v >> 5) * lines * 0x80 + (v & 31) * 4`. Attribute bit b is at 0x40 + 4b, location (0x40 + 4b - 0x80) / 16.
+- `OOT_ISBE_SPY=<hash>:<offset>=<reg>,...`: a mesh output stores another register, read through `OOT_MESH_REC`. A register may have been reused by then: check its defs first.
+- `OOT_SM86_COUNT=<hash>[@k/l/m]:<points>;...`: several programs per run. Kinds `z n g m` float tests (a pointer's high word of 1 is a denormal: use `h`), `h` >= 76, `j` joint, `l` lane != X, `q` not in the mask, `v w x` read-back. `h` and `k` sums count in units of 0x3f800000: `n mod 512 = (v >> 23) * pow(127, -1, 512) % 512`. Walk zeros back with a script over `kernel.py dis`.
+- `OOT_BANK_WATCH=<lo>:<hi>`: which programs have an address in bank 0, and at which offset.
+- `OOT_DUMP_BUF=<addr>:<size>`: guest and GPU copies of a buffer at a dump, which tells memory from binding at once.
+- Offline, no GPU: `kernel.py dis`, `kernel.py xlate`, then `spirv-dis --raw-id`. `res.json`'s `sbufs` gives each binding's bank-0 offset.
+
+**Dead ends, not worth repeating**
+
+- Timing: a full GPU wait at the builder changed nothing (3 crashes in 10).
+- The VRAM mirror as a cause; write-back keeping CPU pages (it starved the game of GPU results); subgroup size (`OOT_VK_FULL_SUBGROUPS`); lane order; a forced barrier (one already precedes every dispatch).
+- Wide loads overlapping their address register: the translator takes the high word first, they are safe.
+- `OOT_MESH_IND_MAX=2048`: more plants at 4 fps, replaced by the GPU count.
+- A counter state shared between lowering threads gave a false lead (run-596): it is thread-local now.
+
+**Standing rules**
+
+One GPU run at a time, always through `tools/run.py`. Count nvlddmkm events after each. On any driver reset stop all GPU work, no retry, diagnose offline; the user must reboot. Never `--fresh-cache`, never partial `OOT_GW_SKIP` bisects. Local commits only, after `tools/check_content.py --staged`; no push and no PR without the user's approval of the text. Never commit `build/`, `dump/`, `notes/`, `fault-vendor.bin` or game data. GPL emulators (Lichii, yuzu, Ryujinx, Eden) for behaviour only, never copied. `tangerineturtle1/NX2navi` is never read, fetched or cloned. The user's rule is that no object is skipped.
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with
