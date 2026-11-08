@@ -3683,7 +3683,7 @@ static void op_draw_idx_ind(VkExec *ex, const p_draw_idx_ind *d) {
 // OOT_CS_TIME=1 (diagnostic): the GPU time of every compute dispatch, from timestamps around it, summed per shader
 // (its input id) and logged every CST_REPORT timed dispatches, the costliest first. For finding which kernel of a
 // frame the GPU spends its time in (the title cinematic's upscaler: 49 ms of GPU time per frame, 2026-11-06).
-enum { CST_PAIRS = 2048, CST_SHADERS = 64, CST_REPORT = 1400 };
+enum { CST_PAIRS = 2048, CST_SHADERS = 1024, CST_REPORT = 6000, CST_LINES = 28 };   // 64 shaders hid the mesh programs, the first to overflow it
 typedef struct { uint8_t iid[8]; uint32_t groups[3]; uint64_t n; double ns; } CstShader;
 typedef struct { uint32_t pair; uint8_t iid[8]; uint32_t groups[3]; } CstRead;
 static VkQueryPool cst_pool;
@@ -3736,7 +3736,7 @@ static void cst_read(void *arg) {   // completion thread
         double all = 0;
         for (int k = 0; k < cst_nsh; k++) all += cst_sh[k].ns;
         rt_log("vk_exec: OOT_CS_TIME: %d dispatches, %.1f ms of GPU time in %d shaders:", cst_reads, all / 1e6, cst_nsh);
-        for (int k = 0; k < cst_nsh; k++) {
+        for (int k = 0; k < cst_nsh && k < CST_LINES; k++) {
             const CstShader *c = &cst_sh[k];
             rt_log("vk_exec:   %02x%02x%02x%02x%02x%02x%02x%02x x%llu: %.3f ms each, %.1f%%, groups %ux%ux%u", c->iid[0],
                    c->iid[1], c->iid[2], c->iid[3], c->iid[4], c->iid[5], c->iid[6], c->iid[7], (unsigned long long)c->n,
@@ -4356,7 +4356,7 @@ static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
         const VkPipeInfo *info = NULL;
         VkPipeline p = vk_pipeline_compute(cs, &info);
         if (p && info) {
-            vk_exec_barrier(ex);
+            vk_exec_barrier_compute(ex);   // op_draw_mesh's full barrier precedes the first stage
             bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, p);
             c0_dim[0] = groups, c0_dim[1] = c0_dim[2] = 1;
             B.c0_valid[2] = 0;
@@ -4370,7 +4370,7 @@ static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
                 VkBufferCopy cp = {M.ind.offset, B.c0_off[2] + SM86_MESH_C0_COUNT, 4};
                 vkCmdCopyBuffer(ex->cb, M.ind.buffer, B.c0_buf[2], 1, &cp);
                 ex->recorded++;
-                vk_exec_barrier(ex);
+                vk_exec_barrier_compute(ex);
             }
         }
         if (cs && p && info) {
@@ -4451,7 +4451,7 @@ static int mc_ready(void) {
     return 1;
 }
 static void mesh_compact(VkExec *ex) {
-    vk_exec_barrier(ex);   // the task stage's records
+    vk_exec_barrier_compute(ex);   // the task stage's records
     bind_pipeline(ex, VK_PIPELINE_BIND_POINT_COMPUTE, MC.pipe);
     VkDescriptorBufferInfo bi[2] = {{M.buf, 0, M.task_size + M.mesh_size}, {MI.buf, 0, MI_SLOTS * 32}};
     VkWriteDescriptorSet w[2];
@@ -4463,7 +4463,7 @@ static void mesh_compact(VkExec *ex) {
     vkCmdPushConstants(ex->cb, MC.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(ex->cb, 1, 1, 1);
     ex->recorded += 3;
-    vk_exec_barrier(ex);   // the list and the counts, for the mesh stage and as indirect arguments
+    vk_exec_barrier_compute(ex);   // the list and the counts, for the mesh stage and as indirect arguments
 }
 
 static void op_draw(VkExec *ex, const p_draw *d);
@@ -4632,7 +4632,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     if (mesh_clear < 0) mesh_clear = getenv("OOT_MESH_CLEAR") != NULL;
     if (mesh_clear) vkCmdFillBuffer(ex->cb, M.buf, M.task_size, M.mesh_size, 0), ex->recorded++;
     if (!has_task) {
-        vk_exec_barrier(ex);   // transfers are not ordered among themselves: the fill could land after the update
+        vk_exec_barrier_compute(ex);   // transfers are not ordered among themselves: the fill could land after the update
         // a mesh-only draw: one stand-in task whose count (+4) asks for every mesh group (an indirect draw: its count).
         // A fill or copy, not vkCmdUpdateBuffer: that has no recorder wrapper (vk_rec.h), so it went into the command
         // buffer at once, out of order and from a second thread while the recorder wrote the rest (run-68's device

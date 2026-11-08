@@ -602,6 +602,25 @@ static void barrier_to(VkExec *ex, const VkImage *want, const VkImageAspectFlags
 
 void vk_exec_barrier(VkExec *ex) { barrier_to(ex, NULL, NULL, 0); }
 
+// Between the compute and transfer steps of one mesh draw: only those stages and the indirect reads wait, where a full barrier drains the graphics
+// pipeline too. A full barrier when images are in the feedback layout, or with OOT_MESH_FULL_BARRIER=1.
+void vk_exec_barrier_compute(VkExec *ex) {
+    static int full = -1;
+    if (full < 0) { const char *e = getenv("OOT_MESH_FULL_BARRIER"); full = e && e[0] == '1'; }
+    if (full || ex->nfbl) { vk_exec_barrier(ex); return; }
+    vk_exec_pass_end(ex);
+    if (ex->barrier_at == ex->recorded) return;
+    VkMemoryBarrier2 mb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+                           .srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                           .srcAccessMask = VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                           .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT,
+                           .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT | VK_ACCESS_2_UNIFORM_READ_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT |
+                                            VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT};
+    VkDependencyInfo di = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(ex->cb, &di);
+    ex->barrier_at = ++ex->recorded;
+}
+
 // OOT_PASS_TIME=1 (diagnostic, 2026-11-10): the GPU time of every render pass, from timestamps at its begin and end,
 // summed per kind of pass (size, colour targets and the first one's NVN format, depth) and logged every PT_REPORT
 // timed passes as milliseconds per frame, the costliest first, with the frames counted in between. For the Kokiri

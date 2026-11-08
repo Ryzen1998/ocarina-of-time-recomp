@@ -856,6 +856,17 @@ Ruled out on the way: deferred buffer binds (`BindUniformBuffersDeferred`): read
 
 `OOT_MESH_REC` takes several hash prefixes now, and `OOT_MESH_TASKS` also logs each draw's uniform banks.
 
+#### Forest speed: full barriers between the steps of a mesh draw (2026-11-09, run-753..761)
+
+Next to Saria the frame took 88 ms, of which the GPU 79 (`OOT_TRACE=perf`; walk: `build/logs/saria-route.txt`, from the forest save). Each mesh draw is several short compute and transfer steps, and a full barrier (`ALL_COMMANDS`) separated each from the next. Those steps now use `vk_exec_barrier_compute` (compute and transfer stages and indirect reads only; `OOT_MESH_FULL_BARRIER=1` restores the full one, and images in the feedback layout still get it). GPU time at the same spot: 79 -> 19 ms, frame interval 88 -> 30 ms (11.4 -> 33.5 fps; run-761, `build/logs/saria-lightbar.png`, noise 1.10). The frame is now bound by the CPU replay (27.6 of 30 ms).
+
+How it was found, including the wrong turns:
+
+- VRAM: over its budget at the moment the time rose, but `OOT_TEX_REL_AGE=120` brought it to 13.9 of 15.2 GiB and the GPU time stayed (run-754). A coincidence of the same scene change.
+- The grass's task draws: `OOT_MESH_MAP=0` still 70 ms (run-755). The pass-through draws: `OOT_MESH_NODRAW=1` still 70 (run-758). `OOT_MESH=0`: 15 ms (run-759), so the cost was in the mesh path, not in drawing.
+- `OOT_WB_FENCE_LIMIT=0` gave 27 ms (run-756), but that is not a saving to take: the game may read those targets, and recording the copies at the end of the writing submission instead, which removes the wait and keeps the data, gained nothing (run-757, 79 ms), so the 27 ms came from something else that changes when the game does not get them. Its one picture (`build/logs/saria-nowb.png`) has black falling leaves; whether they come from this was not checked. The change was not kept.
+- `OOT_CS_TIME` hid the mesh programs: its table held 64 shaders and they were the first to overflow. It holds 1024 now and prints the costliest 28. It then showed 9 ms a frame for the three heaviest mesh programs (1b731402, 8c4bd916, ae6743ec), far below the 60 ms: the rest was the stalls between the steps, which no timer around a dispatch sees.
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with
