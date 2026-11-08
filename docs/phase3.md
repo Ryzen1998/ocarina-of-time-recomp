@@ -577,6 +577,12 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   entries' real span first: they start at the buffer + a base offset read from the readback object's descriptor
   (`*(plVar33[2]) + 0xac` in the decompile), so `OOT_BREAK_AT=main+0x2bfd750` with `OOT_BREAK_FOLLOW` to that word,
   or `OOT_WATCH_RANGE` over 0x29bc1a000..0x29bc20000 with the window on, names the GPU writer.
+  Three more full-window runs (run-308..310, 0 resets): `OOT_BREAK_FOLLOW=28,10,0@a0` shows instance A's buffer
+  descriptor at 0x29bc19608 (just below the buffer) holding the buffer pointer 0x29bc1a000 at +0xc8 and 0x29bc1c060
+  at +0xd0, and a small value (2) in the word at +0xac that the copy adds to its entry offset. 0x29bc1c000 is in no
+  pool (`OOT_DUMP_BUF` refuses it), so the GPU list is the 0x2000 bytes at 0x29bc1a000. The level-frame snapshot of
+  it (frame 3500) did not happen: that run crashed at 32 s (frame ~750). Next: the same snapshot at frame 3500 (or
+  `OOT_DUMP=when` armed by the first non-zero header), repeated until a run reaches the frame.
 - **The crash's precise cause** (crash report now prints the foliage manager, run-296 with `OOT_GW_SKIP=none`):
   kind-0 foliage types: 76; kind-1 types: 203. The crashing record says kind 0 with type 86 (0x56) or 191 (0xbf),
   types that exist only in the kind-1 table (their kind-1 slots are filled; kind-0 slots past 75 are garbage or 0).
