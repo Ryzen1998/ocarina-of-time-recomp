@@ -616,6 +616,17 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   storage-buffer slot addresses, so **its table may be another buffer**. Next: one dump with d0bb3a4c dispatched,
   identify its dispatch by its SPIR-V hash (hash the cache's .spv for its key), read which buffer its c0+0x60/0x70
   slots name, and compare +0x1c there on both sides.
+- **d0bb3a4c's table, identified** (run-321, full window, dump at frame 4000, game crash later at 143 s, 0 resets):
+  its control section puts its 8 storage slots at bank 0 + 0x40 (end 0xc0, no textures or images), so the bank-0
+  words at +0x60 and +0x70 are slots 2 and 3. In the dumped foliage dispatch (SPIR-V 2ae36c0c, the one with the
+  0x5004x store offsets) those are the pointer cells **0x29bb2b940 and 0x29bb2b880**: the same cells as the shadow
+  culling, the first leading to the table at 0x2a19e9000 that run-319 compared (bit 0 of +0x1c clear on both
+  sides, in the game's own data). So unless its objects come from the second cell's table, the list bit 0 is what
+  the game data says, and the wrong field may be the **type** (86 / 191, kind-1 types), not the kind: d0bb3a4c
+  takes the type from `SEL R29 = P ? R47 : -1` at 0x6d80. Next (offline first): where R47 comes from, and which
+  table cell 0x29bb2b880 names. Shadows in the same run: with the full window and tonight's lowering fixes the
+  cascades are unchanged (2 of 19 shadow passes hold geometry, 7.7% and 1.5%, the vertex-draw ones; the mesh-only
+  terrain passes stay empty).
 - **Terrain shadows, next test**: the kernels that write the cascades' indirect counts (027a50b7, 68e84b77,
   75dc8d60, and the per-view writers 1b4d7f5f / 6372b7bd / fdaa71ac among the 18) all had a lost ULOP3 predicate,
   fixed tonight, and most also depended on the FSEL constants. Under the crash workaround the 18 cannot write those
