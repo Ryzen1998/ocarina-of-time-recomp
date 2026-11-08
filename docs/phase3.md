@@ -856,16 +856,20 @@ Ruled out on the way: deferred buffer binds (`BindUniformBuffersDeferred`): read
 
 `OOT_MESH_REC` takes several hash prefixes now, and `OOT_MESH_TASKS` also logs each draw's uniform banks.
 
-#### Forest speed: full barriers between the steps of a mesh draw (2026-11-09, run-753..761)
+#### Forest speed: VRAM over budget at the scene change (2026-11-09, run-753..768)
 
-Next to Saria the frame took 88 ms, of which the GPU 79 (`OOT_TRACE=perf`; walk: `build/logs/saria-route.txt`, from the forest save). Each mesh draw is several short compute and transfer steps, and a full barrier (`ALL_COMMANDS`) separated each from the next. Those steps now use `vk_exec_barrier_compute` (compute and transfer stages and indirect reads only; `OOT_MESH_FULL_BARRIER=1` restores the full one, and images in the feedback layout still get it). GPU time at the same spot: 79 -> 19 ms, frame interval 88 -> 30 ms (11.4 -> 33.5 fps; run-761, `build/logs/saria-lightbar.png`, noise 1.10). The frame is now bound by the CPU replay (27.6 of 30 ms).
+Walking to Saria (`build/logs/saria-route.txt`, from the forest save, `OOT_TRACE=perf`) the GPU time rose from 13 to about 80 ms a frame (11 fps) and stayed there for up to a minute or more. **The cause is VRAM going over budget at the scene change** (15.9 of 15.2 GiB): the slow stretch starts with that peak and outlasts it, which fits the driver having moved device-local memory out and bringing it back late. The sweep of released textures now starts at 80% of the budget (was 90) and takes entries released 30 frames ago (was 600): the peak is 14.7 GiB and the GPU time stays at 12-14 ms through the whole walk (run-766, run-767). The "left uninitialised" aliases stayed at the single one every run has. `OOT_TEX_VRAM_PRESSURE` and `OOT_TEX_REL_AGE` set them.
+
+Between the compute and transfer steps of a mesh draw, `vk_exec_barrier_compute` replaces the full barrier (compute and transfer stages and indirect reads only; `OOT_MESH_FULL_BARRIER=1` restores it, images in the feedback layout still get it). Measured with VRAM under budget: GPU 12.3 ms against 13.9 (run-767 and 768). **Commit 07d65cf says 79 -> 19 ms: that was wrong**, those two numbers came from frames on either side of the VRAM stretch ending, not from the barrier.
+
+Default settings now (run-767, 0 driver resets, `build/logs/saria-D-default.png`): a minute of the walk 40.0 fps, 1% low 24.5, and 44.5 fps in Saria's dialogue. The frame is bound by the CPU replay. `shot_diff.py` scored that picture 1.24 ("not a picture"), but it is a correct frame: dark, dense grass raises the noise score.
 
 How it was found, including the wrong turns:
 
-- VRAM: over its budget at the moment the time rose, but `OOT_TEX_REL_AGE=120` brought it to 13.9 of 15.2 GiB and the GPU time stayed (run-754). A coincidence of the same scene change.
+- VRAM was blamed first, then cleared by mistake: `OOT_TEX_REL_AGE=120` still let the peak through (15.25 GiB, run-754), so the slow stretch came anyway.
 - The grass's task draws: `OOT_MESH_MAP=0` still 70 ms (run-755). The pass-through draws: `OOT_MESH_NODRAW=1` still 70 (run-758). `OOT_MESH=0`: 15 ms (run-759), so the cost was in the mesh path, not in drawing.
 - `OOT_WB_FENCE_LIMIT=0` gave 27 ms (run-756), but that is not a saving to take: the game may read those targets, and recording the copies at the end of the writing submission instead, which removes the wait and keeps the data, gained nothing (run-757, 79 ms), so the 27 ms came from something else that changes when the game does not get them. Its one picture (`build/logs/saria-nowb.png`) has black falling leaves; whether they come from this was not checked. The change was not kept.
-- `OOT_CS_TIME` hid the mesh programs: its table held 64 shaders and they were the first to overflow. It holds 1024 now and prints the costliest 28. It then showed 9 ms a frame for the three heaviest mesh programs (1b731402, 8c4bd916, ae6743ec), far below the 60 ms: the rest was the stalls between the steps, which no timer around a dispatch sees.
+- `OOT_CS_TIME` hid the mesh programs: its table held 64 shaders and they were the first to overflow. It holds 1024 now and prints the costliest 28. It then showed 9 ms a frame for the three heaviest mesh programs (1b731402, 8c4bd916, ae6743ec) during the slow stretch, far below the 60 ms. Why turning the mesh stages off removed that stretch (run-759, with the mesh records' large buffer gone and VRAM lower) was not separated out.
 
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 

@@ -588,8 +588,8 @@ static uint64_t n_pressure_drops, n_age_drops;   // n_age_drops: GPU-written ent
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
         const char *s = cfg_get("OOT_TEX_VRAM_PRESSURE");
-        vram_pressure = s && *s ? atoi(s) : 90;
-        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 90;
+        vram_pressure = s && *s ? atoi(s) : 80;   // 80 and an age of 30 frames: see the age rule below
+        if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 80;
         rt_log("vk: released textures under VRAM pressure: %s%d%%", vram_pressure ? "dropped above " : "off", vram_pressure);
     }
     if (!vram_pressure || !rel_head || submit_epoch & 7) return;   // the budget query every 8 submits
@@ -601,11 +601,14 @@ static void sweep_pressure(void) {   // tex_lock held
     // and never took back, kept because their content lives only in the image; with them VRAM stayed over its budget
     // (15.1 of 15.1 GiB, 16-18 at times) and nothing qualified under the rule above. A target freed 10 s ago and not
     // re-created since is not read back; the Depths flashes came from targets taken back within frames.
+    // 2026-11-09, walking to Saria: at 90% and 600 frames VRAM still reached 15.9 of 15.2 GiB when the scene changed. The driver then moved
+    // device-local memory out, and the frame's GPU time went from 13 to 80 ms and stayed there for as long as a minute, after VRAM had come back
+    // (run-764, 765). At 80% and 30 frames it peaked at 14.7 and the GPU time stayed at 14 ms for the whole walk (run-766).
     static int64_t rel_age = -1;
     if (rel_age < 0) {
         const char *s = getenv("OOT_TEX_REL_AGE");
-        rel_age = s && *s ? atoll(s) : 600;
-        if (rel_age < 0) rel_age = 600;
+        rel_age = s && *s ? atoll(s) : 30;
+        if (rel_age < 0) rel_age = 30;
     }
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     int dropped = 0;
