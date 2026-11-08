@@ -480,6 +480,16 @@ reboot before the next GPU run.**
   culling kernels), and fix that kernel's address trace. Until then the defaults (window on, pushes kept, views
   reformatted) give the right picture but crash in most runs past frame ~4,000; `OOT_GW_SKIP=<the 18>` ran clean.
 
+### Partial window test (2026-11-10, morning, user-approved, one run)
+
+run-323: `OOT_GW_SKIP=af7a80ff,ac939523,164d634a` (only the three culling families off the window; the other 15 of
+the default 18 used it, confirmed by `OOT_GW_USERS=1`: 17 users logged, none of the three). 110 s replay to frame
+4929: **no game crash, 0 driver resets**. Frame rate: in the level 49.7 fps mean, 1% low 28.0 (the 60 s window
+includes the level load: 40.7 / 6.3). The end screenshot (`build/logs/partial3.png`, noise 0.92) landed on the
+Deku Tree narration cutscene, so it does not show the Kokiri ground: terrain shadows and the foliage draws are not
+judged by this run. One clean run is not proof (the crash hit "most" runs, not all): the default stays the 18.
+Next if wanted: the same config with `--dump 4600` to look at the ground, and two more runs for stability.
+
 ### Morning summary (2026-11-10): what the night changed
 
 Runs run-274 to run-322 after the 02:01 reboot: **0 driver resets**. Commits 57c1cba .. (all local, nothing pushed).
