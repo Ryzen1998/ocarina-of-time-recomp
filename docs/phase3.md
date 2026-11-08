@@ -542,6 +542,11 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   (take the list under the lock, read back without it, re-lock to clear `gpu_dirty`), or better (b) record the
   image-to-buffer copy of small dirty targets at the end of the submission that wrote them, as the buffer mirror
   does, so the fence wait finds the bytes ready and only deswizzles. Expected gain: most of the ~22% lock wait.
+  Measured prize (run-299, `OOT_WB_FENCE_LIMIT=0`, i.e. no small fence write-backs at all): 56.0 fps and 1% low
+  41.7 fps in the level (default ~46.7 / 26), frame 19.4 ms, replay 13.5 ms; `build/logs/wb0.png` is a correct
+  picture (Kokiri fences, Navi; noise 0.80). Not a default: the game may read those targets on the CPU (TotK's grass
+  does). (a) cannot be done naively: five paths destroy texture entries, one when a whole pool is finalized, so an
+  unlocked readback needs the entry pinned (a busy flag the destroy paths respect) first.
 - **The crash's precise cause** (crash report now prints the foliage manager, run-296 with `OOT_GW_SKIP=none`):
   kind-0 foliage types: 76; kind-1 types: 203. The crashing record says kind 0 with type 86 (0x56) or 191 (0xbf),
   types that exist only in the kind-1 table (their kind-1 slots are filled; kind-0 slots past 75 are garbage or 0).

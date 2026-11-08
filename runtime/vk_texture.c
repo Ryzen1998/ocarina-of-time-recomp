@@ -173,7 +173,7 @@ static void lock_note(void *holder, uint64_t ns, void *waiter) {
 }
 static void lock_at(void *site) {
     if (!__atomic_load_n(&tex_ready, __ATOMIC_ACQUIRE)) InitOnceExecuteOnce(&tex_once, tex_init, NULL, NULL);
-    if (lock_log < 0) lock_log = cfg_bool("OOT_TEX_LOCK_LOG");
+    if (lock_log < 0) { const char *e = getenv("OOT_TEX_LOCK_LOG"); lock_log = e && e[0] == '1'; }
     if (lock_log && !TryEnterCriticalSection(&tex_lock)) {
         void *holder = (void *)lock_site;
         LARGE_INTEGER a, b, f;
