@@ -3820,7 +3820,25 @@ const char (*sm86_count_points(uint32_t *n))[16] {
     return *n ? (const char (*)[16])label : NULL;
 }
 
+static uint64_t probe_tag_calc(const uint8_t *code, uint32_t code_size);
+// Asked on every draw and dispatch (gfx_shader.c req_init), and the answer takes four getenv and a walk over the code: 2% of the render thread by Saria
+// (2026-11-09). A per-thread memo; a few of the program's words are part of the key, as a program can be replaced at the same address.
 uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
+    enum { N = 512 };
+    static __thread struct { const uint8_t *code; uint32_t size, w[3]; uint64_t tag; } memo[N];
+    uint32_t w[3] = {0, 0, 0};
+    if (code_size >= 16) {
+        memcpy(&w[0], code, 4), memcpy(&w[1], code + code_size / 2 / 16 * 16, 4), memcpy(&w[2], code + code_size - 16, 4);
+    }
+    uintptr_t k = ((uintptr_t)code >> 4 ^ code_size) * 0x9E3779B1u;
+    __typeof__(&memo[0]) m = &memo[(k >> 12) % N];
+    if (m->code == code && m->size == code_size && !memcmp(m->w, w, sizeof w)) return m->tag;
+    uint64_t tag = probe_tag_calc(code, code_size);
+    m->code = code, m->size = code_size, memcpy(m->w, w, sizeof w), m->tag = tag;
+    return tag;
+}
+
+static uint64_t probe_tag_calc(const uint8_t *code, uint32_t code_size) {
     uint64_t tag = 0, h = 0;
     const char *names[4] = {"OOT_SM86_PROBE", "OOT_SM86_COUNT", "OOT_SM86_FORCE", "OOT_ISBE_SPY"};
     for (int i = 0; i < 4; i++) {

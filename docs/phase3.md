@@ -864,6 +864,8 @@ Between the compute and transfer steps of a mesh draw, `vk_exec_barrier_compute`
 
 Default settings now (run-767, 0 driver resets, `build/logs/saria-D-default.png`): a minute of the walk 40.0 fps, 1% low 24.5, and 44.5 fps in Saria's dialogue. The frame is bound by the CPU replay. `shot_diff.py` scored that picture 1.24 ("not a picture"), but it is a correct frame: dark, dense grass raises the noise score.
 
+CPU replay, from a render-thread profile of the walk (`OOT_PROFILE=<file> OOT_PROFILE_RENDER=1`, `tools/prof_report.py build/v131072/oot.map <file>`): `gw_scan` under `mesh_dispatch` was 28% of the active samples, because `gw_select_mesh` read all 18 uniform blocks of every stage and most are new addresses each frame. It now reads only the blocks the program binds (gw_scan 1.5% of all samples after). `sm86_probe_tag`, four `getenv` and a walk over the code per draw, is memoised per thread. Same walk: a minute at 45.0 fps, 1% low 23.3 (from 40.0 and 24.5), dialogue 48.9 fps (from 44.5), replay 18.8 ms; run-769, `build/logs/saria-F-scan.png`, same picture as run-767, 0 driver resets.
+
 How it was found, including the wrong turns:
 
 - VRAM was blamed first, then cleared by mistake: `OOT_TEX_REL_AGE=120` still let the peak through (15.25 GiB, run-754), so the slow stretch came anyway.

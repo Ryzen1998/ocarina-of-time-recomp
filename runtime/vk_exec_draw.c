@@ -1338,8 +1338,16 @@ static void gw_select_mesh(VkExec *ex, const VkPipeInfo *info) {
     for (uint32_t k = 0; k < 16; k++) gwr_note(ex->ssbo[NVN_STAGE_CS][k].addr, ex->ssbo[NVN_STAGE_CS][k].size);
     uint64_t hop[64];
     int nhop = 0;
+    // Only the uniform blocks the program reads can hand it a pointer: scanning all 18 for every stage of every mesh draw was 28% of the render
+    // thread's active time by Saria (2026-11-09), as most blocks are new addresses each frame and so miss the scan cache.
+    uint32_t ubo_used = 0;
+    for (uint32_t i = 0; i < info->n_bindings; i++) {
+        const GfxShaderRes *r = info->bindings[i].res;
+        if (info->bindings[i].kind == GFX_RES_UBO && r && r->cbuf_slot >= 3 && r->cbuf_slot - 3 < 18) ubo_used |= 1u << (r->cbuf_slot - 3);
+    }
     for (uint32_t k = 0; k < 16 + 18 && gw_n < VK_GW_N; k++) {
         int ubo = k >= 16;
+        if (ubo && !(ubo_used >> (k - 16) & 1)) continue;
         const p_bind_buf *b = ubo ? &ex->ubo[NVN_STAGE_CS][k - 16] : &ex->ssbo[NVN_STAGE_CS][k];
         if (!b->addr || (b->addr & 7) || nvn_gpu_only(b->addr)) continue;
         VkMemSpan sp;
