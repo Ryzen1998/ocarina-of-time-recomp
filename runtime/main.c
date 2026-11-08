@@ -591,6 +591,7 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
 // 0 whose type is outside the manager's kind-0 table (`*(main+0x4e22540) + 0x120`: count +0x840, table +0x848) answers
 // "no object", as the kind-1 path does; the lifted code would read through a null object (docs/phase3.md). Logged.
 extern uint64_t rt_foliage_builders[8];
+void rt_foliage_slot_history(int k, uint32_t b, uint32_t slot);
 int rt_foliage_guard(Cpu *c) {
     static int on = -1;
     if (on < 0) on = getenv("OOT_FOLIAGE_GUARD") && getenv("OOT_FOLIAGE_GUARD")[0] == '1';
@@ -623,7 +624,7 @@ int rt_foliage_guard(Cpu *c) {
                 const uint64_t *pl = (const uint64_t *)(uintptr_t)(*(const uint64_t *)(uintptr_t)(me + 0x28) + (uint64_t)b * 0x90);
                 uint64_t data = pl[3], desc = *(const uint64_t *)(uintptr_t)pl[2];
                 uint64_t base = data + *(const uint32_t *)(uintptr_t)(desc + 0xac);
-                uint32_t bad = 0, shown = 0, nz = 0;
+                uint32_t bad = 0, shown = 0, nz = 0, hist = 0;
                 for (uint32_t i = 0; i < 170; i++) {   // the list holds 0x2000 bytes; the header counts are cleared once it has been read
                     const uint32_t *e = (const uint32_t *)(uintptr_t)(base + (uint64_t)i * 0x30);
                     MEMORY_BASIC_INFORMATION mi;
@@ -631,6 +632,7 @@ int rt_foliage_guard(Cpu *c) {
                     int match = e[7] == w[3];
                     int isbad = e[2] == 0 && (int32_t)e[1] >= 76;
                     bad += isbad, total_match += match, nz += e[1] != 0;
+                    if (isbad && hist < 3) hist++, rt_foliage_slot_history(k, b, i);
                     if ((match || (isbad && shown < 2)) && shown < 6) {
                         shown++;
                         rt_log("foliage guard:   builder %d buffer %u [%u]%s%s: %08x %08x %08x %08x  %08x %08x %08x %08x  %08x %08x %08x %08x", k, b, i, match ? " SAME +1c" : "", isbad ? " bad" : "",

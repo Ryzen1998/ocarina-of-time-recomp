@@ -874,11 +874,47 @@ NVN_API(nvnWindowAcquireTexture) {
 // which finds a bad record's GPU list through their pointers. Nothing but OOT_FOLIAGE_GUARD uses this. A wait for the GPU
 // here does not change the crash at main+0xc938d0 (2026-11-08: 3 of 10 runs with it, as without).
 uint64_t rt_foliage_builders[8];
+// With OOT_FOLIAGE_GUARD=1: the last FH_N copies of each list as it stood when its builder ran, for the guard to show what a bad slot
+// held before (rt_foliage_slot_history).
+enum { FH_N = 8, FH_BYTES = 0x2000 };
+static struct { uint64_t frame; uint32_t cur, valid; uint8_t d[FH_BYTES]; } *fh;   // [builder 3][buffer 2][FH_N]
+static uint32_t fh_at[3][2];
+static const uint8_t *fh_list(uint64_t me, uint32_t b) {
+    const uint64_t *pl = (const uint64_t *)(uintptr_t)(*(const uint64_t *)(uintptr_t)(me + 0x28) + (uint64_t)b * 0x90);
+    uint64_t data = pl[3], desc = *(const uint64_t *)(uintptr_t)pl[2];
+    return (const uint8_t *)(uintptr_t)(data + *(const uint32_t *)(uintptr_t)(desc + 0xac));
+}
 void rt_foliage_builder(Cpu *c) {
-    for (int i = 0; i < 8; i++) {
+    int k = -1;
+    for (int i = 0; i < 8 && k < 0; i++) {
         uint64_t v = __atomic_load_n(&rt_foliage_builders[i], __ATOMIC_RELAXED);
-        if (v == c->x[0]) break;
-        if (!v) { uint64_t z = 0; if (__atomic_compare_exchange_n(&rt_foliage_builders[i], &z, c->x[0], 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) || z == c->x[0]) break; }
+        if (v == c->x[0]) k = i;
+        else if (!v) { uint64_t z = 0; if (__atomic_compare_exchange_n(&rt_foliage_builders[i], &z, c->x[0], 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) || z == c->x[0]) k = i; }
+    }
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("OOT_FOLIAGE_GUARD"); on = e && e[0] == '1'; if (on) fh = calloc(3 * 2 * FH_N, sizeof *fh); }
+    if (!on || !fh || k < 0 || k >= 3) return;
+    uint32_t nbuf = *(const uint32_t *)(uintptr_t)(c->x[0] + 0x20);
+    for (uint32_t b = 0; b < nbuf && b < 2; b++) {
+        const uint8_t *src = fh_list(c->x[0], b);
+        MEMORY_BASIC_INFORMATION mi;
+        if (!VirtualQuery(src, &mi, sizeof mi) || mi.State != MEM_COMMIT || !VirtualQuery(src + FH_BYTES - 1, &mi, sizeof mi) || mi.State != MEM_COMMIT) continue;
+        uint32_t a = fh_at[k][b]++ % FH_N;
+        typeof(fh) e = &fh[(k * 2 + (int)b) * FH_N + (int)a];
+        e->frame = gfx_stats().frames, e->cur = *(const uint32_t *)(uintptr_t)(c->x[0] + 0x18), e->valid = 1;
+        memcpy(e->d, src, FH_BYTES);
+    }
+}
+// Prints what entry `slot` of list (k, b) held in the copies kept, oldest first.
+void rt_foliage_slot_history(int k, uint32_t b, uint32_t slot) {
+    if (!fh || k < 0 || k >= 3 || b >= 2 || slot >= FH_BYTES / 0x30) return;
+    uint32_t at = fh_at[k][b];
+    for (uint32_t n = 0; n < FH_N; n++) {
+        typeof(fh) e = &fh[(k * 2 + (int)b) * FH_N + (int)((at + n) % FH_N)];
+        if (!e->valid) continue;
+        const uint32_t *w = (const uint32_t *)(e->d + slot * 0x30);
+        rt_log("foliage guard:     history builder %d buffer %u [%u] frame %llu cur %u: object %08x id %08x kind %08x x %08x y %08x +1c %08x",
+               k, b, slot, (unsigned long long)e->frame, e->cur, w[0], w[1], w[2], w[4], w[5], w[7]);
     }
 }
 

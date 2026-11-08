@@ -2989,6 +2989,13 @@ static void lower_red(L *l, const Insn *x) {
                 ((uint64_t)operation << 23) | ((uint64_t)((uint32_t)offset & 0xfffff) << 28) | ((uint64_t)1 << 48));
 }
 
+// OOT_ATOM_KEEP=0: a predicated atomic's data is left as it was (lower_atomg).
+static int atom_keep_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("OOT_ATOM_KEEP"); on = !(e && e[0] == '0'); }
+    return on;
+}
+
 // ATOMG (0x3a8 register address pair; 0x9a8 uniform pair at 64-69 with RZ at 24-31): op 87-90, U32, data 32-39.
 static void lower_atomg(L *l, const Insn *x, uint32_t op) {
     uint32_t rd = bits(x, 16, 8), operation = bits(x, 87, 4), data = bits(x, 32, 8), address;
@@ -3000,6 +3007,26 @@ static void lower_atomg(L *l, const Insn *x, uint32_t op) {
         if (bits(x, 24, 8) != RZ || (x->w[2] & ~0x3fu & ~0x07800000u) != 0x081ee140u) return (void)fail(l, "ATOMG uniform mode");
         address = ur_pair(l, bits(x, 64, 6), 2);
         if (address == NOREG) return;
+    }
+    // A predicated atomic whose result register is not its data register: the translator's AST optimizer moves a data
+    // value with one use to that use, inside the branch of the predicate. A ballot there sees only the lanes of the branch: the slot
+    // reservation of ac939523 and 358beb27 (`@P4 ATOMG R23 = add(R18)`, R18 the population count of the active lanes, P4 true in one lane)
+    // added 1 per warp instead of the count, so reserved slots overlapped and threads wrote over each other (docs/phase3.md, the crash at
+    // main+0xc938d0). With the data in a register that the atomic also writes and that is read after the branch, it stays in a variable computed
+    // before the branch, as in the kernels whose atomic has rd == data.
+    if (bits(x, 12, 4) != 7 && rd != RZ && rd != data && atom_keep_on()) {
+        uint32_t t = S(l, 0);
+        uint64_t saved = l->pred, pf = (saved >> 16) & 0xf;
+        if (l->failed) return;
+        l->pred = (uint64_t)PT << 16;
+        mov_reg(l, t, data);
+        l->pred = saved;
+        emit(l, 0xed00000000000000ull | l->pred | t | ((uint64_t)address << 8) | ((uint64_t)t << 20) |
+                    ((uint64_t)((uint32_t)offset & 0xfffff) << 28) | ((uint64_t)1 << 48) | ((uint64_t)operation << 52));
+        l->pred = (uint64_t)PT << 16;
+        emit(l, base(l, 0x5ca0000000000000ull, rd, t) | ((uint64_t)rd << 20) | (pf << 39));   // SEL rd = P ? t : rd
+        l->pred = saved;
+        return;
     }
     emit(l, 0xed00000000000000ull | l->pred | rd | ((uint64_t)address << 8) | ((uint64_t)data << 20) |
                 ((uint64_t)((uint32_t)offset & 0xfffff) << 28) | ((uint64_t)1 << 48) | ((uint64_t)operation << 52));
@@ -3645,7 +3672,7 @@ static void probe_init(const uint8_t *code, uint32_t code_size) {
 // is 1 for a plain offset, register N for "<offset>=rN" (the sum over the threads arriving), and 1 << N for
 // "<offset>=pN" when predicate N is set (P2R; the sum is 2^N times the threads with it set). The translator traces the
 // address to that bank-0 word like any storage table entry; the host binds its counter buffer there.
-static __thread struct { int on; uint32_t n, base, at[SM86_COUNT_MAX]; uint8_t kind[SM86_COUNT_MAX], idx[SM86_COUNT_MAX]; int jk, jl, jmask; } cnt;
+static __thread struct { int on; uint32_t n, base, at[SM86_COUNT_MAX]; uint8_t kind[SM86_COUNT_MAX], idx[SM86_COUNT_MAX], arg[SM86_COUNT_MAX]; int jk, jl, jmask; } cnt;
 
 static uint64_t fnv64(const uint8_t *code, uint32_t n) {
     uint64_t h = 0xcbf29ce484222325ull;
@@ -3659,7 +3686,10 @@ static uint64_t fnv64(const uint8_t *code, uint32_t n) {
 // R[link] >= 76 (OOT_SM86_JOINT=<kind reg>:<link reg>, default 68:43; what the game's main+0xc938d0 cannot take), the sum
 // of register N, or for N = 253 their count and for N = 254 the sum of their thread X.
 // q: threads arriving whose lane bit is clear in uniform register N (a lane that reaches here but was not in the mask of a VOTEU).
-#define COUNT_KINDS "rpnzmgahkljq"   // h: signed value >= 76 (one count per thread), k: the value is 0
+// v: threads for which the word at [UR4:UR5 + R[N]] differs from register <kind reg of the program> (a store just made, read back).
+// With "/M" the register compared is M, not the program's kind reg. w: as v, the sum of the memory word where they differ; x: of the register.
+#define COUNT_KINDS "rpnzmgahkljqvwx"   // h: signed value >= 76 (one count per thread), k: the value is 0
+static uint8_t count_arg[SM86_COUNT_MAX];   // of the last count_parse: M of "<kind>N/M"
 static uint32_t count_parse(const char *p, uint32_t *at, uint8_t *kind, uint8_t *idx, char (*label)[16]) {
     uint32_t n = 0;
     while (*p && n < SM86_COUNT_MAX) {
@@ -3673,6 +3703,7 @@ static uint32_t count_parse(const char *p, uint32_t *at, uint8_t *kind, uint8_t 
             unsigned long r = strtoul(end + 2, &e2, 10);
             if (e2 != end + 2 && r <= (end[1] == 'p' ? 6ul : 254ul)) kind[n] = (uint8_t)(kc - COUNT_KINDS + 1), idx[n] = (uint8_t)r;
             end = e2;
+            count_arg[n] = *end == '/' ? (uint8_t)strtoul(end + 1, &end, 10) : 255;
         }
         if (label) {
             if (kind[n]) snprintf(label[n], 16, "%lx=%c%u", v, COUNT_KINDS[kind[n] - 1], idx[n]);
@@ -3706,6 +3737,7 @@ static int count_init(const uint8_t *code, uint32_t code_size) {
         uint32_t n = count_parse(end + 1, at, kind, idx, NULL);
         if (want == h) {
             cnt.n = n, cnt.jk = jk, cnt.jl = jl, cnt.jmask = jm;
+            memcpy(cnt.arg, count_arg, n);
             memcpy(cnt.at, at, n * sizeof at[0]), memcpy(cnt.kind, kind, n), memcpy(cnt.idx, idx, n);
             return cnt.on = cnt.n > 0;
         }
@@ -3794,6 +3826,13 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
         memcpy(&w0, code + i, 4);
         if ((w0 & 0xfff) == 0x927) { tag ^= 0x6d65736876733034ull; break; }   // "meshvs04"
     }
+    // A program with a predicated atomic whose result is not its data register (lower_atomg, 2026-11-08).
+    for (uint32_t i = 0; atom_keep_on() && i + 16 <= code_size; i += 16) {
+        uint32_t w0, w1;
+        memcpy(&w0, code + i, 4), memcpy(&w1, code + i + 4, 4);
+        uint32_t f = w0 & 0xfff;
+        if ((f == 0x3a8 || f == 0x9a8) && ((w0 >> 12) & 0xf) != 7 && ((w0 >> 16) & 0xff) != 255 && ((w0 >> 16) & 0xff) != (w1 & 0xff)) { tag ^= 0x61746f6d6b656570ull; break; }   // "atomkeep"
+    }
     // A program with a real CALL: the code behind it was dropped before lower_call kept the fall-through (2026-11-08).
     for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
         uint32_t w0, w2;
@@ -3869,6 +3908,20 @@ static void count_emit(L *l, uint32_t k) {
         emit(l, base(l, 0x5c28000000000000ull, d, ur) | ((uint64_t)t << 20));   // SHR.U32
         lop_imm(l, d, d, 1, 0);
         lop_imm(l, d, d, 1, 2);   // XOR 1
+    } else if (cnt.kind[k] >= 13 && cnt.kind[k] <= 15) {   // read back a 32-bit word and compare it with the register that was stored
+        uint32_t lo = S(l, s + 4), hi = S(l, s + 5), t = S(l, s + 3);
+        uint32_t ub = ur_pair(l, 4, 6);
+        if (l->failed) return;
+        if (hi != lo + 1) { l->pred = saved; fail(l, "count read-back pair"); return; }
+        emit(l, base(l, 0x5c10000000000000ull, lo, ub) | ((uint64_t)cnt.idx[k] << 20) | ((uint64_t)1 << 47));
+        emit(l, base(l, 0x5c10000000000000ull, hi, ub + 1) | ((uint64_t)RZ << 20) | ((uint64_t)1 << 43));
+        emit(l, base(l, 0xeed0000000000000ull, d, lo) | ((uint64_t)1 << 45) | ((uint64_t)4 << 48));
+        to_reg_into(l, reg_src(cnt.arg[k] != 255 ? cnt.arg[k] : (uint32_t)cnt.jk), t);
+        uint32_t m = S(l, s + 8);
+        emit(l, base(l, 0x5b50000000000000ull, m, d) | ((uint64_t)t << 20) | ((uint64_t)PT << 39) | ((uint64_t)5 << 49) | ((uint64_t)1 << 48));   // m = ~0 where they differ
+        if (cnt.kind[k] == 13) { lop_imm(l, m, m, 1, 0); emit(l, base(l, 0x5c98000000000000ull, d, 0) | ((uint64_t)m << 20)); }   // d = m & 1
+        else if (cnt.kind[k] == 14) emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)m << 20) | ((uint64_t)PT << 48));   // memory & m
+        else emit(l, base(l, 0x5c40000000000000ull, d, t) | ((uint64_t)m << 20) | ((uint64_t)PT << 48));   // register & m
     } else if (cnt.kind[k] == 7) {   // F2I.U32 of the absolute value
         to_reg_into(l, reg_src(cnt.idx[k]), d);
         emit(l, base(l, 0x5cb0000000000000ull, d, 0) | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) | ((uint64_t)d << 20) | ((uint64_t)1 << 49));
