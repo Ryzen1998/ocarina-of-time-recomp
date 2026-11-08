@@ -990,6 +990,7 @@ static SRWLOCK flush_lock = SRWLOCK_INIT;
 typedef struct {
     uint64_t subs, syncs, upload_bytes, upload_copies, first_n, first_bytes, wb_bytes, wb_copies, wb_ranges;
     uint64_t presnap_queries, sync_queries, presnap_t, sync_t, prologues, presnap_bytes;
+    uint64_t flush_skipped;   // flushed bytes left to write watch (mirror_sync)
 } MirrorAcc;
 static MirrorAcc mrep;                 // replay: this submission
 static MirrorAcc macc;                 // mirror_stat_lock: since the last summary
@@ -1206,8 +1207,14 @@ static void mirror_sync(PoolRec *r) {
                 range_add(&pend, &npend, &cpend, r, x - lo, 1ull << GEN_PAGE_SHIFT);
     }
     r->mgen = gen_now;
-    if (excl) ReleaseSRWLockExclusive(&gen_lock);
-    else ReleaseSRWLockShared(&gen_lock);
+    // A flushed range (nvnMemoryPoolFlushMappedRange) goes up whole only where write watch does not track it: in a
+    // tracked region the pages the CPU wrote are stamped above, whoever wrote them (game code, host code, ReadFile;
+    // tex_probe.c test_import, test_readfile), and the GPU's own writes are in the mirror already (write watch does not
+    // see them: --probe-vkmem "GPU writes seen by write watch 0/32 pages"). 2026-11-10: in Kokiri Forest the game
+    // flushes 47 MiB a frame, whole 15 MiB buffers the GPU writes, and their re-upload doubled the mirror's traffic
+    // (~113 MiB up a frame with ~90 MiB written back). OOT_MIRROR_FLUSH_ALL=1: every flushed range goes up whole.
+    static int flush_all = -1;
+    if (flush_all < 0) { const char *e = getenv("OOT_MIRROR_FLUSH_ALL"); flush_all = e && e[0] == '1'; }
     if (__atomic_load_n(&r->fl_hi, __ATOMIC_ACQUIRE)) {
         AcquireSRWLockExclusive(&flush_lock);
         uint64_t a = r->fl_lo, b = r->fl_hi;
@@ -1215,8 +1222,14 @@ static void mirror_sync(PoolRec *r) {
         ReleaseSRWLockExclusive(&flush_lock);
         a = a > lo ? a & ~0xfffull : lo;
         b = b < hi ? (b + 0xfff) & ~0xfffull : hi;
-        if (a < b) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
+        int untracked = flush_all;
+        for (uint64_t k = a >> SNAP_SHIFT; a < b && k <= (b - 1) >> SNAP_SHIFT && !untracked; k++)
+            untracked |= snap_untracked[k] || snap_at[k] != mepoch;
+        if (a < b && untracked) range_add(&pend, &npend, &cpend, r, a - lo, b - a);
+        else if (a < b) mrep.flush_skipped += b - a;
     }
+    if (excl) ReleaseSRWLockExclusive(&gen_lock);
+    else ReleaseSRWLockShared(&gen_lock);
     mrep.syncs++;
     mrep.sync_t += qpc() - t0;
 }
@@ -1536,12 +1549,13 @@ static void mirror_log(uint64_t frame) {
                  (long long)InterlockedExchange64(&v_mismatch, 0));
     rt_log("mem: mirror frame %llu: pools %lld, %.1f MiB device-local; stay imported: budget %lld (%.1f MiB), untracked "
            "%lld, overlapping %lld, failed %lld; per frame: submits %.2f, syncs %.1f, upload %.3f MiB in %.1f ranges, "
-           "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, flush calls %.1f (%.3f MiB), queries "
+           "first use %.2f pools %.3f MiB, write-back %.3f MiB in %.1f ranges, flush calls %.1f (%.3f MiB, %.3f MiB left "
+           "to write watch), queries "
            "%.1f pre-snap (%.1f MiB) + %.1f sync, prologues %.2f, tracking cpu %.3f ms (pre-snap %.3f, syncs %.3f)%s",
            (unsigned long long)frame, (long long)m_live_n, m_live_bytes / M, (long long)m_refused_n[MR_BUDGET],
            m_refused_bytes[MR_BUDGET] / M, (long long)m_refused_n[MR_UNTRACKED], (long long)m_refused_n[MR_OVERLAP],
            (long long)m_refused_n[MR_ALLOC], a.subs / f, a.syncs / f, a.upload_bytes / f / M, a.upload_copies / f,
-           a.first_n / f, a.first_bytes / f / M, a.wb_bytes / f / M, a.wb_copies / f, fc / f, fb / f / M,
+           a.first_n / f, a.first_bytes / f / M, a.wb_bytes / f / M, a.wb_copies / f, fc / f, fb / f / M, a.flush_skipped / f / M,
            a.presnap_queries / f, a.presnap_bytes / f / M, a.sync_queries / f, a.prologues / f, qpc_ms(a.presnap_t + a.sync_t) / f,
            qpc_ms(a.presnap_t) / f, qpc_ms(a.sync_t) / f, ver);
 }
