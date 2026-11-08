@@ -3239,7 +3239,11 @@ static void lower_call(L *l, const Insn *x) {
         return;
     }
     reloc(l, (uint32_t)(t / 16));
-    emit(l, 0xe26000000007000full);
+    // CAL has NoPred in the decoder's table, so its predicate field is ignored when it is translated, but
+    // Decoder.IsUnconditionalBranch reads that field and with PT (7) took the call for a branch with nothing after
+    // it: the code behind every real CALL was never decoded (2026-11-08: the plant kernels' list stores, 50 programs).
+    // Any other predicate number keeps the block after the call.
+    emit(l, 0xe26000000000000full);
 }
 
 static void lower_ret(L *l, const Insn *x) {
@@ -3623,7 +3627,9 @@ static uint64_t fnv64(const uint8_t *code, uint32_t n) {
     return h;
 }
 
-// The list after the colon: offsets, each optionally "=rN" (kind 1) or "=pN" (kind 2); returns the count.
+// The list after the colon: offsets, each optionally "=<kind>N": r register sum, p predicate, and for a register read
+// as a float n NaN, z zero, m negative, g positive (counts of such threads), a its absolute value truncated (a sum).
+#define COUNT_KINDS "rpnzmga"
 static uint32_t count_parse(const char *p, uint32_t *at, uint8_t *kind, uint8_t *idx, char (*label)[16]) {
     uint32_t n = 0;
     while (*p && n < SM86_COUNT_MAX) {
@@ -3631,14 +3637,15 @@ static uint32_t count_parse(const char *p, uint32_t *at, uint8_t *kind, uint8_t 
         unsigned long v = strtoul(p, &end, 16);
         if (end == p) break;
         at[n] = (uint32_t)v, kind[n] = 0, idx[n] = 0;
-        if (*end == '=' && (end[1] == 'r' || end[1] == 'p')) {
+        const char *kc = *end == '=' && end[1] ? strchr(COUNT_KINDS, end[1]) : NULL;
+        if (kc) {
             char *e2;
             unsigned long r = strtoul(end + 2, &e2, 10);
-            if (e2 != end + 2 && r <= (end[1] == 'r' ? 254ul : 6ul)) kind[n] = end[1] == 'r' ? 1 : 2, idx[n] = (uint8_t)r;
+            if (e2 != end + 2 && r <= (end[1] == 'p' ? 6ul : 254ul)) kind[n] = (uint8_t)(kc - COUNT_KINDS + 1), idx[n] = (uint8_t)r;
             end = e2;
         }
         if (label) {
-            if (kind[n]) snprintf(label[n], 16, "%lx=%c%u", v, kind[n] == 1 ? 'r' : 'p', idx[n]);
+            if (kind[n]) snprintf(label[n], 16, "%lx=%c%u", v, COUNT_KINDS[kind[n] - 1], idx[n]);
             else snprintf(label[n], 16, "%lx", v);
         }
         n++;
@@ -3713,6 +3720,12 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
         memcpy(&w0, code + i, 4), memcpy(&w1, code + i + 4, 4);
         if ((w0 & 0xfff) == 0x808 && w1 && !(w1 & 0xfff)) { tag ^= 0x6673656c696d6d31ull; break; }   // "fselimm1"
     }
+    // A program with a real CALL: the code behind it was dropped before lower_call kept the fall-through (2026-11-08).
+    for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
+        uint32_t w0, w2;
+        memcpy(&w0, code + i, 4), memcpy(&w2, code + i + 8, 4);
+        if ((w0 & 0xfff) == 0x944 && ((w0 >> 12) & 0xf) == 7 && (w2 & ~0x3ffffu) == 0x03c00000u) { tag ^= 0x63616c6c66616c31ull; break; }   // "callfal1"
+    }
     // And a program with a ULOP3 that writes a uniform predicate, or a UIMNMX that selects on one (up_fields, 2026-11-10).
     for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
         uint32_t w0, w2;
@@ -3736,6 +3749,16 @@ static void count_emit(L *l, uint32_t k) {
     if (b != a + 1) { l->pred = saved; fail(l, "count probe pair"); return; }
     if (cnt.kind[k] == 1) to_reg_into(l, reg_src(cnt.idx[k]), d);   // first: the register may be in the scratch
     else if (cnt.kind[k] == 2) emit(l, base(l, 0x38e8000000000000ull, d, RZ) | ((uint64_t)(1u << cnt.idx[k]) << 20));   // P2R
+    else if (cnt.kind[k] >= 3 && cnt.kind[k] <= 6) {   // FSET (0 or ~0) against zero, or against itself for NaN; then 0 or 1
+        static const uint32_t cmp[4] = {8, 2, 1, 4};
+        uint32_t c = cmp[cnt.kind[k] - 3];
+        to_reg_into(l, reg_src(cnt.idx[k]), d);
+        emit(l, base(l, 0x5800000000000000ull, d, d) | ((uint64_t)(c == 8 ? d : RZ) << 20) | ((uint64_t)PT << 39) | ((uint64_t)c << 48));
+        lop_imm(l, d, d, 1, 0);
+    } else if (cnt.kind[k] == 7) {   // F2I.U32 of the absolute value
+        to_reg_into(l, reg_src(cnt.idx[k]), d);
+        emit(l, base(l, 0x5cb0000000000000ull, d, 0) | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) | ((uint64_t)d << 20) | ((uint64_t)1 << 49));
+    }
     else mov_imm(l, d, 1);
     Src w = {0};
     w.kind = 2, w.cb_bank = 0, w.cb_off = SM86_COUNT_C0;

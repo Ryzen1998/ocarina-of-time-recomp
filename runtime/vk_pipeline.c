@@ -2910,6 +2910,15 @@ static VkPipeline compute_create(const GfxShader *cs, const Layout *l) {
                                                 .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = m, .pName = "main"},
                                       .layout = l->layout};
     pin_subgroup32(&ci.stage, &rqc, code, words);
+    // OOT_VK_FULL_SUBGROUPS=1 (test): a program pinned to 32-lane subgroups whose workgroup width is a multiple of 32 runs
+    // full subgroups, where lane == invocation index % 32 as on the console's warps (the foliage kernels rely on it).
+    static int full = -1;
+    if (full < 0) { const char *e = getenv("OOT_VK_FULL_SUBGROUPS"); full = e && e[0] == '1'; }
+    if (full && ci.stage.pNext) {
+        uint32_t local[3];
+        gfx_shader_local_size(cs, local);
+        if (local[0] && local[0] % 32 == 0) ci.stage.flags |= VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT;
+    }
     VkPipeline pipe = VK_NULL_HANDLE;
     double t0 = now_ms();
     if (vkCreateComputePipelines(P.device, P.cache, 1, &ci, NULL, &pipe) != VK_SUCCESS) pipe = VK_NULL_HANDLE;
