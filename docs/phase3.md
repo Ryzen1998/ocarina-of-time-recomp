@@ -610,6 +610,27 @@ Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
   and `S2R` lane 0 / LtMask (57, correct); whether the host's lanes equal id & 31 is not tested
   (no `REQUIRE_FULL_SUBGROUPS` is set on compute pipelines: a candidate).
 
+#### Foliage: the code behind every shader CALL was missing (2026-11-08, run-375..421, 0 driver resets)
+
+- **Fixed: lost code after CAL** (`sm86_lower.c` lower_call; 294e182). Ryujinx's `Decoder.IsUnconditionalBranch` reads the
+  predicate field of a CAL, which decodes as NoPred; with PT (7) a real call looked like a branch with nothing after it, so
+  every instruction behind it was dropped (the SPIR-V went from the call straight to OpReturn). Now the CAL carries another
+  predicate number, ignored at translation. 50 of 2,224 programs have such a call and get a new cache key (tag "callfal1");
+  all 36 compute ones validate offline, the 14 graphics ones cannot be checked with `kernel.py`. Found with `OOT_SM86_COUNT` on e6c023a5:
+  the leader reached its atomic (0x10c0), threads entered the helper at 0x1320 and reached its RET (0x1530), none reached the return address 0x1180.
+- **Effect with the full window** (run-410, frame 3700 of the Saria scene): the plant kernel 3d1fdbc3's threads reach
+  its output at 0x7e90: 29,027 of 29,759, 0 before. Its input list had read 0 for every thread (e6c023a5's store loop
+  was the dropped code), so every plant landed on one spot (66, 106, 72) behind the camera. Mesh-only draws now read
+  249, 253, 137, 383 items. Pictures: `build/logs/calfix-full.png` (noise 0.74), `build/logs/calfix-default.png` (0.75): fireflies and
+  particles appear; **ground and trees in the Saria shot still look bare**, so the plant geometry itself is the next
+  step (does the count reach the mesh draw; a pass-by-pass dump with `OOT_DUMP_PNG_MB=6000`, new; dump-417/421 hit the
+  crash or the run's end before their frame).
+- New counter kinds in `OOT_SM86_COUNT`: `=nN` NaN, `=zN` zero, `=mN` negative, `=gN` positive, `=aN` truncated
+  absolute value (sum). 0x7c10's P4 in my first note was lane != 0 (the leader test), not a culling result.
+- **The crash is not fixed by this** (run-411..416: 3 of 6; run-418..421: 4 of 4 before the dump frame). `OOT_VK_FULL_SUBGROUPS=1` (lane == index
+  % 32) made no difference (1 of 4 either way): not the cause, off by default. The crashing list mixes kind 0 and
+  kind 1 entries of the same types (0x10, 0x26, 0x56); `+4` of an entry is the type on the CPU side.
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with
