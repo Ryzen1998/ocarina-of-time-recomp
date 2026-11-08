@@ -490,6 +490,22 @@ Deku Tree narration cutscene, so it does not show the Kokiri ground: terrain sha
 judged by this run. One clean run is not proof (the crash hit "most" runs, not all): the default stays the 18.
 Next if wanted: the same config with `--dump 4600` to look at the ground, and two more runs for stability.
 
+Follow-ups (user-approved, three runs, same config + `OOT_GW_USERS=1`, 0 driver resets in each, 0 since the 02:01 boot):
+
+- run-324 (150 s, `OOT_MESH_LOG=1 OOT_MESH_LOG_FROM=3000`, `--dump 4600`): no crash, frame 5301. At frame 3000 every
+  indirect mesh draw reads **0 groups**, the window-fed args at 0x29bc62000 / 0x29bc4a000 included (full window,
+  run-290, same frame: 7 and 24) and the CPU-filled ones that read 1 in run-290 (0x29fd80000, 0x29d7b6010): the same
+  as with the 18 skipped. The three skipped families are the ones that write those counts, so skipping them loses
+  the same draws; terrain shadows and the window-fed foliage cannot come back in this config. The frame-4600 dump
+  (`build/logs/dump-324`, final target noise 0.92) is again the Deku Tree narration shot: correct picture, no ground.
+- run-325, run-326 (200 s plain): no crash, frames 8136 and 8187 (past ~6500, where full-window crashes came).
+  Level window (60-120 s): 48.1 fps, 1% low 28.6 / 33.3 (18-skip default: ~47, 26-31). Both end screenshots are the
+  game's white-out with "Link! Hey, Link, wake up!" (scripted scene, not a fault).
+- With run-323: 4 of 4 runs clean with only the three culling families off the window (full window: crash in most
+  runs). So the crash needs the window in af7a80ff, ac939523 or 164d634a; the other 15 are innocent. The 3-family list
+  is as stable as the 18 and closer to correct, but it brings back nothing visible yet: the fix has to make those
+  three families' window use safe, after which their indirect draws (foliage, perhaps terrain shadows) return.
+
 ### Morning summary (2026-11-10): what the night changed
 
 Runs run-274 to run-322 after the 02:01 reboot: **0 driver resets**. Commits 57c1cba .. (all local, nothing pushed).
