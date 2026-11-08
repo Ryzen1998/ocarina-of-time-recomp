@@ -650,6 +650,22 @@ Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
 - **Pictures:** `build/logs/shf0-default.png` (default, noise 0.76): no spikes, the tunnel's stone arch is back. `build/logs/shf0-full.png` (`OOT_GW_SKIP=none`, noise 0.77): tree leaves at the left, a dark fern by the sign, more fireflies. The default's `OOT_GW_SKIP` still starves the plant chain, so leaves need the full window, so the crash is what stands between the default and this picture.
 - Next: compare other forest spots with `build/reference/` (the canopy is largely above this shot), then the crash at main+0xc938d0, then drop `OOT_GW_SKIP`.
 
+#### Foliage: the crash at main+0xc938d0 is fixed, and nothing is skipped from the window by default (2026-11-08, 2dcd44e, 0 driver resets through run-695)
+
+Cause: the slot reservation of the list writers ac939523 and 358beb27 (code hash d4088949) is `@P4 ATOMG R23 = add(R18)`, with R18 the population count of the active lanes and P4 true in one
+lane. The translator's AST optimizer moved that one-use value into the branch of the predicate, where a ballot sees only that lane, so the counter advanced by 1 per warp and not by the
+number of threads. Threads then shared slots and overwrote each other's fields. The other three hashes have rd == data in the atomic, which gives the value a second use and keeps it in a variable.
+
+Found by: the slot history (`OOT_FOLIAGE_GUARD`: a bad slot held the same id in the frames before, every other field new) and a read-back after the stores (`OOT_SM86_COUNT` kinds `v`, `w`, `x`): 289 of 878 threads of this hash read
+another object number at their own entry, 177 another id, 0 another kind, and the mean slot was 42 where the healthy hash has 219.
+
+Fix: `lower_atomg` (sm86_lower.c): a predicated atomic with rd != data works on a scratch register that is read after the branch by a SEL. Those programs alone are re-keyed (tag "atomkeep"); `OOT_ATOM_KEEP=0` is the old form.
+After it: read-back 0 on all three words, mean slot 219, 0 bad records in 20 runs with the guard, 0 crashes in 13 full-window runs without it (10 of 55 s, 3 of 210 s). `OOT_GW_SKIP` is empty by default (`build/logs/default-leaves.png`, noise 0.77, leaves on the trees).
+
+Not done: the translator still moves any ballot into a branch when it has one use; the correct place for that is `AstOptimizer.IsWorthPropagating`, but a translator change retranslates every program. The other programs with such a ballot have not been surveyed.
+
+The notes below are the investigation as it went; the conclusions about timing and "two writers" are superseded by this.
+
 #### Foliage: the crash at main+0xc938d0, what is known and what is ruled out (2026-11-08, 0 driver resets through run-593)
 
 Not fixed. `OOT_GW_SKIP` stays at its default of 18 programs, so the default picture has no leaves; `OOT_GW_SKIP=none` has

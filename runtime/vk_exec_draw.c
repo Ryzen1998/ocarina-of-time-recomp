@@ -1355,7 +1355,7 @@ static void gw_select_mesh(VkExec *ex, const VkPipeInfo *info) {
     mwatch_gw(ex);
 }
 
-// OOT_GW_SKIP=<input id prefixes> (default none since 2026-11-09): programs that get no window. 374126bf and
+// OOT_GW_SKIP=<input id prefixes> (default none): programs that get no window. 374126bf and
 // 358beb27 were skipped from 2026-11-08: their stores were traced to bank-3 words that hold floats (docs/phase3.md),
 // and with the window the game crashed on a bad object index in 3 of 12 runs. Translator patch 0021 sends such stores
 // to the window after the wrong candidate, and without the window these kernels never write their per-object state,
@@ -1364,15 +1364,10 @@ static int gw_skipped(void) {
     static char list[256];
     static int init;
     if (!init) {
-        // Default since 2026-11-10: the 18 window users first seen from frame 813 (OOT_GW_USERS=1 lists them). With
-        // their window the game crashed at main+0xc938d0 in 19 of 21 runs once the FSEL fix, the kept pushes and the
-        // reformatted views made the frame's kernels compute real values; without it, 0 of 5. The crash itself is a
-        // game-side mismatch between a resource's state byte and its table slot (CPU memory, no GPU write lands
-        // there; also with OOT_MEMORY=import), so the window changes timing or what the game decides from GPU
-        // results, not the bytes. A workaround until that is understood (docs/phase3.md). OOT_GW_SKIP=none: off.
+        // The default used to list 18 programs, a workaround for the crash at main+0xc938d0, which came with their window.
+        // Its cause was the slot reservation of the foliage kernels (lower_atomg), so nothing is skipped by default now.
         const char *e = getenv("OOT_GW_SKIP");
-        snprintf(list, sizeof list, "%s", e ? e : "af7a80ff,9ab7c483,81789336,7088715b,b2c273a2,289f0e4f,227f330b,"
-                 "1b4d7f5f,6372b7bd,b3aaf027,0bb96198,745220f3,ac939523,164d634a,c685ba55,d0bb3a4c,fdaa71ac,fadd8d26");
+        snprintf(list, sizeof list, "%s", e && strcmp(e, "none") ? e : "");
         init = 1;
     }
     char hx[17];
