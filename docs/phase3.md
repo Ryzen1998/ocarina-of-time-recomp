@@ -842,6 +842,25 @@ The save is restored from `build/profile/save-forest-backup-2026-11-10`. The for
 
 One GPU run at a time, always through `tools/run.py`. Count nvlddmkm events after each. On any driver reset stop all GPU work, no retry, diagnose offline; the user must reboot. Never `--fresh-cache`, never partial `OOT_GW_SKIP` bisects. Local commits only, after `tools/check_content.py --staged`; no push and no PR without the user's approval of the text. Never commit `build/`, `dump/`, `notes/`, `fault-vendor.bin` or game data. GPL emulators (Lichii, yuzu, Ryujinx, Eden) for behaviour only, never copied. `tangerineturtle1/NX2navi` is never read, fetched or cloned. The user's rule is that no object is skipped.
 
+#### Where things stand after the grass and speed work (2026-11-09, through run-771)
+
+| Item | State |
+|---|---|
+| Grass tufts | Drawn (c0a0943). `build/logs/packed.png`, and thick grass and plants around Saria in `build/logs/saria-F-scan.png`. |
+| Tree crowns | Full in the opening panorama of Kokiri Forest (run-749, `build/reference/play/20261109-013615-saria/contact.png`). |
+| Bare tree at the left of the Saria area | Not re-seen: no route reached that view. To confirm when the user plays. |
+| Forest speed | The walk to Saria (`build/logs/saria-route.txt`, default settings): a minute at 48.6 fps, 1% low 33.6; 51 fps in Saria's dialogue; the frame was 11 fps for a stretch of up to a minute or more before. Frame 19.5 ms, replay 16, GPU 12.4. Not 60 yet. The opening panorama was 10-15 fps before these fixes and was not measured again. |
+| One-frame sparks, large glow | Seen in `burst-84.95.png`. Over successive frames the glow moves across the left edge like a firefly close to the camera, so it may be correct; not established. |
+| Black particles | The user's report near the Deku Tree: that spot was not reached. Black falling leaves appeared in one picture with `OOT_WB_FENCE_LIMIT=0` and in none with default settings. |
+| Terrain shadows | The cascades hold trees and leaves (`dump-736`: 0.02-6% of each map written) and no ground. The mesh-only lists now have counts (`OOT_MESH_SERIES`), but whether ground should appear there was not settled against a Switch 2 frame. |
+| Skipped or unlowered programs | None by default: `OOT_MESH_IND_SKIP`, `OOT_GW_SKIP` and `OOT_SKIP_CS` are empty, and run-771 logs 0 shader failures and 0 draws skipped. |
+| Ballot / predicated atomic pattern | The two fixes apply by opcode to every program that has one (translator patch 0023, `lower_atomg`, tags "ballotk1" and "atomkeep"). Ballots the lowering itself adds in a program without such an instruction keep their old translation (open from the hand-off). No separate search was made. |
+| Flicker | Steady over the near-still bursts of `tools/play.py` (run-748, run-751), with a mean reversal of 0.06-0.09. The user has not confirmed it in play. |
+
+CPU hot spots left in the walk's render-thread profile, of the 43% of samples that are not idle: `GetWriteWatch` from `written_pages` (5.1% of all samples before 8f5c720, not profiled since), `vk_exec_op_draw` 3.0%, `bind_resources` 2.2%, `gw_scan` under `gw_select` 2.2%, deswizzling in `upload` under `resolve_target` 2-3%.
+
+A replay of an input script that starts a **new game** writes a new save slot, which "Continue" then loads: run-749 made `slot_05`. It was moved to `build/profile/held-new-game-run749` and `option.sav` restored from the backup before that run. Replay such scripts only with a copied profile (`OOT_PROFILE_DIR`).
+
 #### The grass tufts (2026-11-09, run-734..747)
 
 The tufts are drawn. Two faults hid them; both are in the record of how a mesh program gets its data.
