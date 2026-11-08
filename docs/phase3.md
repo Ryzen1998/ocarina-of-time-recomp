@@ -616,6 +616,11 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   storage-buffer slot addresses, so **its table may be another buffer**. Next: one dump with d0bb3a4c dispatched,
   identify its dispatch by its SPIR-V hash (hash the cache's .spv for its key), read which buffer its c0+0x60/0x70
   slots name, and compare +0x1c there on both sides.
+- **Terrain shadows, next test**: the kernels that write the cascades' indirect counts (027a50b7, 68e84b77,
+  75dc8d60, and the per-view writers 1b4d7f5f / 6372b7bd / fdaa71ac among the 18) all had a lost ULOP3 predicate,
+  fixed tonight, and most also depended on the FSEL constants. Under the crash workaround the 18 cannot write those
+  counts at all, so the test needs the full window: one `OOT_GW_SKIP=none` run with `--dump` in the level, then the
+  mesh-only shadow passes' coverage (the 1600x1600 d16 targets) as in run-286/287.
 - The tensor probe (`--probe-tensor`) fails in every switch configuration tried (window off, pointers off, old FSEL,
   old push, old views): its test kernel's plain global loads read zeros, so the harness's buffer addressing broke at
   some point (likely the bank-0 layout changes of 2026-11-06/07), not the tensor path. The game's own HMMA kernels
