@@ -560,6 +560,17 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   foliage contact records there; the only writes zero two small blocks at 0x29bc1a000 / 0x29bc1d000 each frame. The
   records exist only with the full window (no foliage reaches the contact code otherwise), so catching their
   producer needs one watch run in the old full-window configuration (crashes the game, 0 driver resets in ~20 runs).
+- **The producer, found** (run-304, full window, `OOT_CPU_WATCH`; game crash only, 0 resets): the records are
+  written by the lifted game function f_7002bfd750 (main+0x2bfd750, next to the foliage code), ~8,300 a second.
+  Its decompile (Ghidra, research folder, behaviour only): each record is copied field by field from a 0x30-byte
+  entry of a GPU readback list reached through `param_1+0x28` (objects of 0x90 bytes, buffer pointer at +0x18, a
+  header at the buffer's start that the same function zeroes every frame): **type = entry+0x04, kind = entry+0x08**,
+  position = +0x10..+0x28, weight = +0x2c. `OOT_BREAK_AT=main+0x2bfd750 OOT_BREAK_FOLLOW=28,18` (run-305, safe
+  configuration) shows two instances: buffers 0x29bc26000 / 0x29bc29000 (0x1840 bytes; written by GPU kernels
+  8b78bb7d and b800e3f9 through a storage-held pointer, not among the 18) and **0x29bc1a000 / 0x29bc1d000**, which
+  stay empty in the safe configuration and are filled by a GPU program only with the full window. So the crash is
+  that program writing a wrong value (0 where 1 belongs) at +0x08 of its entries. Next: one full-window run with
+  `OOT_DUMP_BUF=0x29bc1a000:0x3000` and a frame dump names the pass that writes it and shows the values.
 - **The crash's precise cause** (crash report now prints the foliage manager, run-296 with `OOT_GW_SKIP=none`):
   kind-0 foliage types: 76; kind-1 types: 203. The crashing record says kind 0 with type 86 (0x56) or 191 (0xbf),
   types that exist only in the kind-1 table (their kind-1 slots are filled; kind-0 slots past 75 are garbage or 0).
