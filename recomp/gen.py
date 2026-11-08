@@ -402,6 +402,8 @@ class Emitter:
             out = [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});']
             if entry == 0x7000c938d0:   # the foliage object lookup: runtime/main.c rt_foliage_guard (OOT_FOLIAGE_GUARD)
                 out.append('    if (rt_foliage_guard(c)) return;')
+            if entry == 0x7002bfd750:   # the foliage contact list builder: nvn_api_obj.c rt_foliage_builder
+                out.append('    rt_foliage_builder(c);')
             if fp.used:
                 out.append('    ' + fp.decl())
 

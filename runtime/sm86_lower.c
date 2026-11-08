@@ -3655,7 +3655,10 @@ static uint64_t fnv64(const uint8_t *code, uint32_t n) {
 
 // The list after the colon: offsets, each optionally "=<kind>N": r register sum, p predicate, and for a register read
 // as a float n NaN, z zero, m negative, g positive (counts of such threads), a its absolute value truncated (a sum).
-#define COUNT_KINDS "rpnzmga"
+// l: threads whose lane (register N) differs from their thread X modulo 32. j: only for threads with R[kind] == 0 and
+// R[link] >= 76 (OOT_SM86_JOINT=<kind reg>:<link reg>, default 68:43; what the game's main+0xc938d0 cannot take), the sum
+// of register N, or for N = 253 their count and for N = 254 the sum of their thread X.
+#define COUNT_KINDS "rpnzmgahklj"   // h: signed value >= 76 (one count per thread), k: the value is 0
 static uint32_t count_parse(const char *p, uint32_t *at, uint8_t *kind, uint8_t *idx, char (*label)[16]) {
     uint32_t n = 0;
     while (*p && n < SM86_COUNT_MAX) {
@@ -3799,6 +3802,36 @@ static void count_emit(L *l, uint32_t k) {
         to_reg_into(l, reg_src(cnt.idx[k]), d);
         emit(l, base(l, 0x5800000000000000ull, d, d) | ((uint64_t)(c == 8 ? d : RZ) << 20) | ((uint64_t)PT << 39) | ((uint64_t)c << 48));
         lop_imm(l, d, d, 1, 0);
+    } else if (cnt.kind[k] == 8 || cnt.kind[k] == 9) {   // ISET.BF (0 or 1): >= 76 signed, or == 0
+        uint32_t t = S(l, s + 3);
+        to_reg_into(l, reg_src(cnt.idx[k]), d);
+        mov_imm(l, t, cnt.kind[k] == 8 ? 76 : 0);
+        emit(l, base(l, 0x5b50000000000000ull, d, d) | ((uint64_t)t << 20) | ((uint64_t)PT << 39) | ((uint64_t)(cnt.kind[k] == 8 ? 6 : 2) << 49) |
+                    ((uint64_t)1 << 48) | ((uint64_t)1 << 44));
+    } else if (cnt.kind[k] == 10) {   // ISET mask (0 or ~0): (lane ^ thread X) & 31 != 0, then 0 or 1
+        uint32_t t = S(l, s + 3);
+        to_reg_into(l, reg_src(cnt.idx[k]), d);
+        emit(l, 0xf0c8000000000000ull | l->pred | t | ((uint64_t)0x21 << 20));   // S2R SR_TID.X
+        emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)t << 20) | ((uint64_t)2 << 41) | ((uint64_t)PT << 48));   // LOP.XOR
+        lop_imm(l, d, d, 31, 0);
+        mov_imm(l, t, 0);
+        emit(l, base(l, 0x5b50000000000000ull, d, d) | ((uint64_t)t << 20) | ((uint64_t)PT << 39) | ((uint64_t)5 << 49) | ((uint64_t)1 << 48));
+        lop_imm(l, d, d, 1, 0);
+    } else if (cnt.kind[k] == 11) {   // value & mask(whole kind word == 0) & mask(link >= 76); N = 253: 1, 254: thread X
+        static int kr = -1, lr = -1;
+        if (kr < 0) { const char *e = getenv("OOT_SM86_JOINT"); kr = 68, lr = 43; if (e) sscanf(e, "%d:%d", &kr, &lr); }
+        uint32_t t = S(l, s + 3), u = S(l, s + 4), v = S(l, s + 5);
+        if (cnt.idx[k] == 253) mov_imm(l, d, 1);
+        else if (cnt.idx[k] == 254) emit(l, 0xf0c8000000000000ull | l->pred | d | ((uint64_t)0x21 << 20));
+        else to_reg_into(l, reg_src(cnt.idx[k]), d);
+        to_reg_into(l, reg_src((uint32_t)kr), t);
+        to_reg_into(l, reg_src((uint32_t)lr), u);
+        mov_imm(l, v, 0);
+        emit(l, base(l, 0x5b50000000000000ull, t, t) | ((uint64_t)v << 20) | ((uint64_t)PT << 39) | ((uint64_t)2 << 49) | ((uint64_t)1 << 48));
+        mov_imm(l, v, 76);
+        emit(l, base(l, 0x5b50000000000000ull, u, u) | ((uint64_t)v << 20) | ((uint64_t)PT << 39) | ((uint64_t)6 << 49) | ((uint64_t)1 << 48));
+        emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)t << 20) | ((uint64_t)PT << 48));   // LOP.AND, no predicate output
+        emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)u << 20) | ((uint64_t)PT << 48));
     } else if (cnt.kind[k] == 7) {   // F2I.U32 of the absolute value
         to_reg_into(l, reg_src(cnt.idx[k]), d);
         emit(l, base(l, 0x5cb0000000000000ull, d, 0) | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) | ((uint64_t)d << 20) | ((uint64_t)1 << 49));

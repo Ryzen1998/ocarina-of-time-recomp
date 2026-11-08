@@ -590,10 +590,14 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
 // OOT_FOLIAGE_GUARD=1 (diagnostic, recomp/gen.py calls this at the head of main+0xc938d0): a contact record (x0) of kind
 // 0 whose type is outside the manager's kind-0 table (`*(main+0x4e22540) + 0x120`: count +0x840, table +0x848) answers
 // "no object", as the kind-1 path does; the lifted code would read through a null object (docs/phase3.md). Logged.
+extern uint64_t rt_foliage_builders[8];
 int rt_foliage_guard(Cpu *c) {
     static int on = -1;
     if (on < 0) on = getenv("OOT_FOLIAGE_GUARD") && getenv("OOT_FOLIAGE_GUARD")[0] == '1';
     if (!on) return 0;
+    static volatile LONG calls;
+    LONG nc = InterlockedIncrement(&calls);
+    if (nc == 1 || nc % 5000 == 0) rt_log("foliage guard: %ld object lookups so far (frame %llu)", (long)nc, (unsigned long long)gfx_stats().frames);
     const uint8_t *r = (const uint8_t *)(uintptr_t)c->x[0];
     int32_t kind = *(const int32_t *)(r + 0x20), type = *(const int32_t *)(r + 0x1c);
     uint64_t mgr = *(const uint64_t *)(uintptr_t)(*(const uint64_t *)(uintptr_t)0x7004e22540ull + 0x120);
@@ -605,7 +609,38 @@ int rt_foliage_guard(Cpu *c) {
     LONG h = InterlockedIncrement(&hits);
     if (h <= 40 || h % 1000 == 0) {
         const float *p = (const float *)r;
-        rt_log("foliage guard: hit %ld, kind-0 type %d of %d at (%.1f, %.1f, %.1f), record %p", (long)h, type, n, p[0], p[1], p[2], (const void *)r);
+        const uint32_t *w = (const uint32_t *)r;
+        rt_log("foliage guard: frame %llu hit %ld, kind-0 type %d of %d at (%.1f, %.1f, %.1f), record %p; words +0c %08x +24 %08x; next records kind/type %d/%d %d/%d, previous %d/%d",
+               (unsigned long long)gfx_stats().frames, (long)h, type, n, p[0], p[1], p[2], (const void *)r, w[3], w[9], (int)w[18], (int)w[17], (int)w[28], (int)w[27], (int)w[-2], (int)w[-3]);
+    }
+    if (h <= 12) {   // the GPU list entries this record may come from, through each builder's own pointers (main+0x2bfd750)
+        const uint32_t *w = (const uint32_t *)r;
+        for (int k = 0; k < 8 && rt_foliage_builders[k]; k++) {
+            uint64_t me = rt_foliage_builders[k];
+            uint32_t nbuf = *(const uint32_t *)(uintptr_t)(me + 0x20), cur = *(const uint32_t *)(uintptr_t)(me + 0x18), cnt = *(const uint32_t *)(uintptr_t)(me + 0x4c);
+            int total_match = 0;
+            for (uint32_t b = 0; b < nbuf && b < 4; b++) {
+                const uint64_t *pl = (const uint64_t *)(uintptr_t)(*(const uint64_t *)(uintptr_t)(me + 0x28) + (uint64_t)b * 0x90);
+                uint64_t data = pl[3], desc = *(const uint64_t *)(uintptr_t)pl[2];
+                uint64_t base = data + *(const uint32_t *)(uintptr_t)(desc + 0xac);
+                uint32_t bad = 0, shown = 0, nz = 0;
+                for (uint32_t i = 0; i < 170; i++) {   // the list holds 0x2000 bytes; the header counts are cleared once it has been read
+                    const uint32_t *e = (const uint32_t *)(uintptr_t)(base + (uint64_t)i * 0x30);
+                    MEMORY_BASIC_INFORMATION mi;
+                    if ((i & 15) == 0 && (!VirtualQuery(e, &mi, sizeof mi) || mi.State != MEM_COMMIT)) break;
+                    int match = e[7] == w[3];
+                    int isbad = e[2] == 0 && (int32_t)e[1] >= 76;
+                    bad += isbad, total_match += match, nz += e[1] != 0;
+                    if ((match || (isbad && shown < 2)) && shown < 6) {
+                        shown++;
+                        rt_log("foliage guard:   builder %d buffer %u [%u]%s%s: %08x %08x %08x %08x  %08x %08x %08x %08x  %08x %08x %08x %08x", k, b, i, match ? " SAME +1c" : "", isbad ? " bad" : "",
+                               e[0], e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8], e[9], e[10], e[11]);
+                    }
+                }
+                rt_log("foliage guard:   builder %d (%p) buffer %u of %u at %p, current %u, entries %u: nonzero ids %u, word 0 with id >= 76: %u", k, (const void *)(uintptr_t)me, b, nbuf, (const void *)(uintptr_t)base, cur, cnt, nz, bad);
+            }
+            if (!total_match && k >= 0) rt_log("foliage guard:   builder %d: no entry with this record's +1c word", k);
+        }
     }
     *(uint64_t *)(uintptr_t)c->x[8] = 0;
     return 1;

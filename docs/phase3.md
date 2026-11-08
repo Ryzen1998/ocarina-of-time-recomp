@@ -650,6 +650,52 @@ Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
 - **Pictures:** `build/logs/shf0-default.png` (default, noise 0.76): no spikes, the tunnel's stone arch is back. `build/logs/shf0-full.png` (`OOT_GW_SKIP=none`, noise 0.77): tree leaves at the left, a dark fern by the sign, more fireflies. The default's `OOT_GW_SKIP` still starves the plant chain, so leaves need the full window, so the crash is what stands between the default and this picture.
 - Next: compare other forest spots with `build/reference/` (the canopy is largely above this shot), then the crash at main+0xc938d0, then drop `OOT_GW_SKIP`.
 
+#### Foliage: the crash at main+0xc938d0, what is known and what is ruled out (2026-11-08, 0 driver resets through run-593)
+
+Not fixed. `OOT_GW_SKIP` stays at its default of 18 programs, so the default picture has no leaves; `OOT_GW_SKIP=none` has
+them and crashes in some runs, always in the first frames of the forest (frames about 890 to 1240).
+
+Ruled out, each by measurement:
+
+- The CPU reading the list before the GPU finished: a wait for every submit so far at the head of the builder
+  (main+0x2bfd750) left 3 crashes in 10 runs (run-515..524), as before. The wait really waited (20 or more logged per run).
+  Removed.
+- The VRAM mirror as the cause: `OOT_MEMORY=import` still crashes the same way (run-534, type 191), 1 of 10 there and 0 of 4
+  in the earlier long runs, against 6 of 18 with the mirror. The mirror may make it more likely (a small sample); it is not needed.
+- Write-back overwriting CPU data: holding back pages the CPU wrote made the crash go away, but also held back 40-54 MiB
+  of GPU results per submission and the protected runs logged no object lookups, so the data had just stopped arriving. Removed.
+- Lane order: in the 7de574d0 kernels (227f330b, f5d729ab) the partner lane is `(X & 0x1c) + k`, which needs the lane to
+  equal X modulo 32. A counter at the append found 0 mismatches over about 90,000 threads (`OOT_SM86_COUNT` kind `l`, run-536).
+  No full subgroups needed either (`OOT_VK_FULL_SUBGROUPS=1`: 1 of 4 both ways).
+
+What a caught record shows (`OOT_FOLIAGE_GUARD=1`; it now searches the GPU lists through the builders' own pointers, run-578 and
+run-588):
+
+- Three builder objects exist; the bad records come from builder 0 (0x29bb0c0c0), whose two lists are at 0x29bbad830
+  and 0x29bbcc830, 75 entries that frame. The others had 0 entries, so a search of only the last builder finds nothing.
+- The entry layout: +0 an object number, +4 id, +8 kind word, +0x10..0x18 position, +0x1c, +0x20..0x28 normal, +0x2c.
+- **The wrong pair is already in the GPU's list**: run-588 slots 74 and 75 hold id 0x56 with kind word 0 (three such entries
+  that frame, 0 in the other buffer). So the GPU writes it, and the CPU only copies it. Not a torn CPU copy, and not memory
+  overwritten after the copy.
+- The kind word is exactly 0 or 1 in every entry seen. The same spot appears in the two buffers as (object 0x77f, id 21, kind
+  0) and (object 0x117a, id 86, kind 1): both legal. The crash needs the mixture (id 86, kind 0), with an object number of the kind-0 family.
+- Ids repeat over runs of consecutive entries (0x10 twelve times in a row), so this list's id is a per-object value. The link written by
+  the 7de574d0 kernels cannot repeat that way (at most four lanes share one partner), so those kernels do not write this list.
+
+Not known: which kernel writes builder 0's list. All six kernels with this entry layout (entries at +0x50040: 7de574d0, 9eed67bc,
+0f3af67e, 46edda32, 7c683d82, fd390b6a) store at rates that do not single one out, and the joint counter below never fired, but
+only 46edda32 was measured in a run with a hit (run-541: 0 of its 15 threads).
+
+Reading the kernels: the LEA that builds the kind word (shift field 27) must be the high form, `(a >> 5) + b`, as otherwise
+lane bits would show in the word and they do not. This is inferred, not checked against a manual.
+
+Tools added: `OOT_SM86_COUNT` kinds `l` (lane differs from thread X modulo 32) and `j` (only threads with kind word 0 and id >= 76;
+`OOT_SM86_JOINT=<kind reg>:<id reg>`; N = 253 counts them, 254 sums their thread X). A hit comes in about 1 of 9 runs of 55 s (6 of 52).
+
+Next: find the writer of 0x29bb5d7f0 / 0x29bb7c7f0 (the kernel whose bank-0 slot holds that pointer, which the dispatch dump shows),
+run `j` on it until a run has a hit, then read where its id and kind come from. Both should come from one object; the question is
+why they disagree.
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with

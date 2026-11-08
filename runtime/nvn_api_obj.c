@@ -870,6 +870,18 @@ NVN_API(nvnWindowAcquireTexture) {
     ret_x(c, NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS);
 }
 
+// The game's foliage contact list builders (main+0x2bfd750; three objects): noted for rt_foliage_guard (runtime/main.c),
+// which finds a bad record's GPU list through their pointers. Nothing but OOT_FOLIAGE_GUARD uses this. A wait for the GPU
+// here does not change the crash at main+0xc938d0 (2026-11-08: 3 of 10 runs with it, as without).
+uint64_t rt_foliage_builders[8];
+void rt_foliage_builder(Cpu *c) {
+    for (int i = 0; i < 8; i++) {
+        uint64_t v = __atomic_load_n(&rt_foliage_builders[i], __ATOMIC_RELAXED);
+        if (v == c->x[0]) break;
+        if (!v) { uint64_t z = 0; if (__atomic_compare_exchange_n(&rt_foliage_builders[i], &z, c->x[0], 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED) || z == c->x[0]) break; }
+    }
+}
+
 // void nvnQueuePresentTexture(NVNqueue *q, NVNwindow *w, int index): queues the copy and returns at once. The display
 // time comes from the pacer: the back end's present thread holds the host present until then (back-edge pacing, as the
 // Switch's display flips at vblank), so the present cadence does not follow the replay time; one period later the
