@@ -571,6 +571,12 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   stay empty in the safe configuration and are filled by a GPU program only with the full window. So the crash is
   that program writing a wrong value (0 where 1 belongs) at +0x08 of its entries. Next: one full-window run with
   `OOT_DUMP_BUF=0x29bc1a000:0x3000` and a frame dump names the pass that writes it and shows the values.
+  Tried (run-306/307, full window, 0 resets, no crash): only 0x2000 bytes are contiguous at 0x29bc1a000 (0x3000 is
+  refused), and at frame 1200 (the title) the list is all zero on the GPU and the CPU side through the whole frame.
+  Next time: dump in the level before the crash (frame ~3000-4000, crashes came from frame 743 to 5474), and find the
+  entries' real span first: they start at the buffer + a base offset read from the readback object's descriptor
+  (`*(plVar33[2]) + 0xac` in the decompile), so `OOT_BREAK_AT=main+0x2bfd750` with `OOT_BREAK_FOLLOW` to that word,
+  or `OOT_WATCH_RANGE` over 0x29bc1a000..0x29bc20000 with the window on, names the GPU writer.
 - **The crash's precise cause** (crash report now prints the foliage manager, run-296 with `OOT_GW_SKIP=none`):
   kind-0 foliage types: 76; kind-1 types: 203. The crashing record says kind 0 with type 86 (0x56) or 191 (0xbf),
   types that exist only in the kind-1 table (their kind-1 slots are filled; kind-0 slots past 75 are garbage or 0).
