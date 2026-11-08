@@ -480,6 +480,30 @@ reboot before the next GPU run.**
   culling kernels), and fix that kernel's address trace. Until then the defaults (window on, pushes kept, views
   reformatted) give the right picture but crash in most runs past frame ~4,000; `OOT_GW_SKIP=<the 18>` ran clean.
 
+### Morning summary (2026-11-10): what the night changed
+
+Runs run-274 to run-322 after the 02:01 reboot: **0 driver resets**. Commits 57c1cba .. (all local, nothing pushed).
+
+- **Stable**: the game crash at main+0xc938d0 is worked around (`OOT_GW_SKIP` default = 18 window users;
+  `OOT_GW_SKIP=none` = full window, which crashes in most runs). Default runs reach the level and play the replay
+  to the end. Its cause is traced to a foliage readback entry whose "type" is really a link index computed from an
+  atomic counter in kernel d0bb3a4c (details below); not fixed yet.
+- **Picture**: tone mapping reaches the screen (fixed the evening before), the fog renders, characters cast shadows,
+  the over-bright speckled ground is gone (`build/logs/mesh072.png`, `skip18.png`, `wbbatch.png`, noise 0.80-0.86).
+  Terrain shadows are still missing: the cascades' mesh-only passes get 0 groups, also with the full window.
+- **Fixed in the shader path**: float atomic adds (translator patch 0022, compare-and-swap loop); ULOP3 / UIMNMX
+  uniform predicates in up_swap mode (`sm86_lower.c` up_fields, cache tag "ulop3up1").
+- **Speed**: the level is CPU-bound by the replay (17.5 of 24 ms). The fence write-back of small render targets is
+  now batched (1% low 26 -> 29-31 fps). The big remaining lever is copying those targets on the GPU at the end of the
+  submission that writes them (`OOT_WB_FENCE_LIMIT=0` shows the prize: 56 fps, 1% low 42).
+- **New diagnostics**: `OOT_CPU_WATCH` (CPU writes by host instruction), `OOT_TEX_LOCK_LOG` (lock waits by holder,
+  write-back targets), `OOT_SM86_FORCE`, `OOT_GW_USERS`, `OOT_PUSH_NOINHERIT`, `OOT_FSEL_FLOAT20`; crash reports
+  print the foliage manager's tables.
+- **Decisions for the user**: (1) the partial window test (only the three culling families off the window) to get
+  back the window-fed indirect draws; (2) whether `OOT_WB_FENCE_LIMIT=0` may become an option or default.
+- **Open, separate**: `--probe-tensor` fails in every configuration (its test kernel's loads read zeros; the game's
+  own tensor kernels render correctly).
+
 ### Status (2026-11-10, night): the crash is a game-side table mismatch; stable runs with 18 programs off the window
 
 After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
@@ -627,6 +651,16 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   table cell 0x29bb2b880 names. Shadows in the same run: with the full window and tonight's lowering fixes the
   cascades are unchanged (2 of 19 shadow passes hold geometry, 7.7% and 1.5%, the vertex-draw ones; the mesh-only
   terrain passes stay empty).
+- **The "type" is a link index** (research report 14g): entry +0x04 is the slot of another entry in d0bb3a4c's own
+  list, from an atomic counter at the list header + 12 (storage slot c0+0x90, not the window), or -1. run-322 (full
+  window, `OOT_SM86_COUNT` on 9eed67bcda1aaccf, dump at frame 4000; no crash this run, 0 resets): the link R29 was
+  -1 in every thread counted (sums exactly minus the thread count), the counter's old values small (sums 306-1,270
+  per 120 frames), and the readback list at 0x29bc1a000 empty again on both sides: d0bb3a4c appends to the buffer in
+  its slot c0+0x90 (entries at +0x50040), so the game's readback list is filled from there by a copy (the dump's
+  "copy after pass" lines). The CPU write watch (run-304) showed the game zeroing the readback list's header,
+  counter included, every frame. Next: the frames where a link of 86/191 appears (the counter not reset in time,
+  research 14g reading 1, or a wrong SHFL lane, reading 2): `OOT_DUMP_BUF` on d0bb3a4c's own buffer (slot c0+0x90)
+  with `OOT_DUMP=when` armed on the first non-negative link, or repeated runs until one catches it.
 - **Terrain shadows, next test**: the kernels that write the cascades' indirect counts (027a50b7, 68e84b77,
   75dc8d60, and the per-view writers 1b4d7f5f / 6372b7bd / fdaa71ac among the 18) all had a lost ULOP3 predicate,
   fixed tonight, and most also depended on the FSEL constants. Under the crash workaround the 18 cannot write those
