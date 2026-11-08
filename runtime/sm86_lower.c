@@ -3645,7 +3645,7 @@ static void probe_init(const uint8_t *code, uint32_t code_size) {
 // is 1 for a plain offset, register N for "<offset>=rN" (the sum over the threads arriving), and 1 << N for
 // "<offset>=pN" when predicate N is set (P2R; the sum is 2^N times the threads with it set). The translator traces the
 // address to that bank-0 word like any storage table entry; the host binds its counter buffer there.
-static struct { int on; uint32_t n, at[SM86_COUNT_MAX]; uint8_t kind[SM86_COUNT_MAX], idx[SM86_COUNT_MAX]; } cnt;
+static __thread struct { int on; uint32_t n, base, at[SM86_COUNT_MAX]; uint8_t kind[SM86_COUNT_MAX], idx[SM86_COUNT_MAX]; int jk, jl, jmask; } cnt;
 
 static uint64_t fnv64(const uint8_t *code, uint32_t n) {
     uint64_t h = 0xcbf29ce484222325ull;
@@ -3658,7 +3658,8 @@ static uint64_t fnv64(const uint8_t *code, uint32_t n) {
 // l: threads whose lane (register N) differs from their thread X modulo 32. j: only for threads with R[kind] == 0 and
 // R[link] >= 76 (OOT_SM86_JOINT=<kind reg>:<link reg>, default 68:43; what the game's main+0xc938d0 cannot take), the sum
 // of register N, or for N = 253 their count and for N = 254 the sum of their thread X.
-#define COUNT_KINDS "rpnzmgahklj"   // h: signed value >= 76 (one count per thread), k: the value is 0
+// q: threads arriving whose lane bit is clear in uniform register N (a lane that reaches here but was not in the mask of a VOTEU).
+#define COUNT_KINDS "rpnzmgahkljq"   // h: signed value >= 76 (one count per thread), k: the value is 0
 static uint32_t count_parse(const char *p, uint32_t *at, uint8_t *kind, uint8_t *idx, char (*label)[16]) {
     uint32_t n = 0;
     while (*p && n < SM86_COUNT_MAX) {
@@ -3678,22 +3679,41 @@ static uint32_t count_parse(const char *p, uint32_t *at, uint8_t *kind, uint8_t 
             else snprintf(label[n], 16, "%lx", v);
         }
         n++;
-        while (*end && *end != ',') end++;
-        p = *end == ',' ? end + 1 : end;
+        while (*end && *end != ',' && *end != ';') end++;
+        if (*end != ',') break;
+        p = end + 1;
     }
     return n;
 }
 
-// Parses OOT_SM86_COUNT for this program: 1 when it names it.
+// Parses OOT_SM86_COUNT for this program: 1 when it names it. The setting is one or more programs separated by ';', each
+// "<code hash>[@<kind reg>/<id reg>/<mask>]:<points>"; counters follow on from one program to the next, so several
+// programs can be watched in the same run. The optional part sets the registers of kind j for that program (mask 0: the whole kind word
+// must be 0; otherwise the kind word masked with it).
 static int count_init(const uint8_t *code, uint32_t code_size) {
-    cnt.on = 0, cnt.n = 0;
+    cnt.on = 0, cnt.n = 0, cnt.base = 0, cnt.jk = -1, cnt.jl = -1, cnt.jmask = 0;
     const char *e = getenv("OOT_SM86_COUNT");
     if (!e || !*e) return 0;
-    char *end;
-    unsigned long long want = strtoull(e, &end, 16);
-    if (*end != ':' || fnv64(code, code_size) != want) return 0;
-    cnt.n = count_parse(end + 1, cnt.at, cnt.kind, cnt.idx, NULL);
-    return cnt.on = cnt.n > 0;
+    uint64_t h = fnv64(code, code_size);
+    for (;;) {
+        char *end;
+        unsigned long long want = strtoull(e, &end, 16);
+        int jk = -1, jl = -1, jm = 0, used = 0;
+        if (*end == '@' && sscanf(end + 1, "%d/%d/%i%n", &jk, &jl, &jm, &used) == 3) end += 1 + used;
+        if (*end != ':') return 0;
+        uint32_t at[SM86_COUNT_MAX];
+        uint8_t kind[SM86_COUNT_MAX], idx[SM86_COUNT_MAX];
+        uint32_t n = count_parse(end + 1, at, kind, idx, NULL);
+        if (want == h) {
+            cnt.n = n, cnt.jk = jk, cnt.jl = jl, cnt.jmask = jm;
+            memcpy(cnt.at, at, n * sizeof at[0]), memcpy(cnt.kind, kind, n), memcpy(cnt.idx, idx, n);
+            return cnt.on = cnt.n > 0;
+        }
+        cnt.base += n;
+        const char *next = strchr(end, ';');
+        if (!next) return 0;
+        e = next + 1;
+    }
 }
 
 // ---- OOT_SM86_FORCE=<code hash, hex>:<offset hex>:<value hex> (diagnostic): the instruction at that byte offset of
@@ -3719,8 +3739,13 @@ const char (*sm86_count_points(uint32_t *n))[16] {
     static uint8_t kind[SM86_COUNT_MAX], idx[SM86_COUNT_MAX];
     static char label[SM86_COUNT_MAX][16];
     *n = 0;
-    if (!e || !*e || !(e = strchr(e, ':'))) return NULL;
-    *n = count_parse(e + 1, at, kind, idx, label);
+    while (e && *e && *n < SM86_COUNT_MAX) {
+        const char *c = strchr(e, ':');
+        if (!c) break;
+        *n += count_parse(c + 1, at + *n, kind + *n, idx + *n, label + *n);
+        e = strchr(c, ';');
+        if (e) e++;
+    }
     return *n ? (const char (*)[16])label : NULL;
 }
 
@@ -3731,7 +3756,9 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
         const char *e = getenv(names[i]);
         if (!e || !*e) continue;
         if (!h) h = fnv64(code, code_size);
-        if (strtoull(e, NULL, 16) != h) continue;
+        int named = strtoull(e, NULL, 16) == h;
+        for (const char *q = strchr(e, ';'); q && !named && i == 1; q = strchr(q + 1, ';')) named = strtoull(q + 1, NULL, 16) == h;
+        if (!named) continue;
         tag ^= fnv64((const uint8_t *)e, (uint32_t)strlen(e)) ^ (uint64_t)(i + 1);
     }
     // A program with a BRXU (0x958) lowers differently since 2026-11-09 (lower_brx: a compare chain): its own key, so
@@ -3820,18 +3847,27 @@ static void count_emit(L *l, uint32_t k) {
     } else if (cnt.kind[k] == 11) {   // value & mask(whole kind word == 0) & mask(link >= 76); N = 253: 1, 254: thread X
         static int kr = -1, lr = -1;
         if (kr < 0) { const char *e = getenv("OOT_SM86_JOINT"); kr = 68, lr = 43; if (e) sscanf(e, "%d:%d", &kr, &lr); }
+        int jk = cnt.jk >= 0 ? cnt.jk : kr, jl = cnt.jl >= 0 ? cnt.jl : lr;
         uint32_t t = S(l, s + 3), u = S(l, s + 4), v = S(l, s + 5);
         if (cnt.idx[k] == 253) mov_imm(l, d, 1);
         else if (cnt.idx[k] == 254) emit(l, 0xf0c8000000000000ull | l->pred | d | ((uint64_t)0x21 << 20));
         else to_reg_into(l, reg_src(cnt.idx[k]), d);
-        to_reg_into(l, reg_src((uint32_t)kr), t);
-        to_reg_into(l, reg_src((uint32_t)lr), u);
+        to_reg_into(l, reg_src((uint32_t)jk), t);
+        to_reg_into(l, reg_src((uint32_t)jl), u);
+        if (cnt.jmask) lop_imm(l, t, t, (uint32_t)cnt.jmask, 0);
         mov_imm(l, v, 0);
         emit(l, base(l, 0x5b50000000000000ull, t, t) | ((uint64_t)v << 20) | ((uint64_t)PT << 39) | ((uint64_t)2 << 49) | ((uint64_t)1 << 48));
         mov_imm(l, v, 76);
         emit(l, base(l, 0x5b50000000000000ull, u, u) | ((uint64_t)v << 20) | ((uint64_t)PT << 39) | ((uint64_t)6 << 49) | ((uint64_t)1 << 48));
         emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)t << 20) | ((uint64_t)PT << 48));   // LOP.AND, no predicate output
         emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)u << 20) | ((uint64_t)PT << 48));
+    } else if (cnt.kind[k] == 12) {   // 1 when (UR[N] >> lane) & 1 is clear
+        uint32_t t = S(l, s + 3);
+        uint32_t ur = ur_in(l, cnt.idx[k], 5);
+        emit(l, 0xf0c8000000000000ull | l->pred | t);   // S2R SR_LANEID
+        emit(l, base(l, 0x5c28000000000000ull, d, ur) | ((uint64_t)t << 20));   // SHR.U32
+        lop_imm(l, d, d, 1, 0);
+        lop_imm(l, d, d, 1, 2);   // XOR 1
     } else if (cnt.kind[k] == 7) {   // F2I.U32 of the absolute value
         to_reg_into(l, reg_src(cnt.idx[k]), d);
         emit(l, base(l, 0x5cb0000000000000ull, d, 0) | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) | ((uint64_t)d << 20) | ((uint64_t)1 << 49));
@@ -3842,7 +3878,7 @@ static void count_emit(L *l, uint32_t k) {
     to_reg_into(l, w, a);
     w.cb_off = SM86_COUNT_C0 + 4;
     to_reg_into(l, w, b);
-    emit(l, 0xebf8000000000000ull | l->pred | d | ((uint64_t)a << 8) | ((uint64_t)((4 * k) & 0xfffff) << 28) | ((uint64_t)1 << 48));
+    emit(l, 0xebf8000000000000ull | l->pred | d | ((uint64_t)a << 8) | ((uint64_t)((4 * (k + cnt.base)) & 0xfffff) << 28) | ((uint64_t)1 << 48));
     l->pred = saved;
 }
 

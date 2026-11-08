@@ -1057,6 +1057,7 @@ static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
 // stayed 0, nothing was culled in, and the indirect mesh draws (the ground's colour) drew nothing.
 
 static int cnt_on(void);
+static void shader_hex(const GfxShader *s, char hex[17]);
 static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     memset(bank, 0, VK_C0_BYTES);
     memcpy(bank, c0_dim, 12);
@@ -1093,6 +1094,27 @@ static void nvn2_c0_fill_cs(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     // the address at bank 0 + 0x10), and the uniform table at 0x210 for the blocks read as storage.
     c0_table(bank + 0x310, ex->ssbo[NVN_STAGE_CS]);
     c0_table(bank + 0x210, ex->ubo[NVN_STAGE_CS]);
+    // OOT_BANK_WATCH=<lo hex>:<hi hex> (diagnostic): each compute program whose bank 0 holds a 64-bit value in that range,
+    // once per program, offset and value: which kernel is given a buffer the game later reads.
+    static uint64_t bw_lo, bw_hi;
+    static int bw_on = -1;
+    if (bw_on < 0) { const char *e = getenv("OOT_BANK_WATCH"); bw_on = e && sscanf(e, "%llx:%llx", (unsigned long long *)&bw_lo, (unsigned long long *)&bw_hi) == 2; }
+    if (bw_on) {
+        static struct { char hx[17]; uint32_t off; uint64_t v; } seen[512];
+        static int nseen;
+        char hx[17];
+        shader_hex(C1CUR[NVN_STAGE_CS], hx);
+        for (uint32_t b = 0; b + 8 <= VK_C0_BYTES; b += 8) {
+            uint64_t v;
+            memcpy(&v, bank + b, 8);
+            if (v < bw_lo || v >= bw_hi) continue;
+            int known = 0;
+            for (int i = 0; i < nseen && !known; i++) known = seen[i].off == b && seen[i].v == v && !strcmp(seen[i].hx, hx);
+            if (known || nseen >= 512) continue;
+            strcpy(seen[nseen].hx, hx), seen[nseen].off = b, seen[nseen].v = v, nseen++;
+            rt_log("vk_exec: OOT_BANK_WATCH: %s c0+%#x = %#llx (frame %llu)", hx, b, (unsigned long long)v, (unsigned long long)gfx_stats().frames);
+        }
+    }
 }
 
 // The NVN slot a bank-0 byte offset falls in under that layout: *kind 0 storage buffer, 1 texture, 2 image; -1 outside.

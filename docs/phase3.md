@@ -682,19 +682,34 @@ run-588):
 - Ids repeat over runs of consecutive entries (0x10 twelve times in a row), so this list's id is a per-object value. The link written by
   the 7de574d0 kernels cannot repeat that way (at most four lanes share one partner), so those kernels do not write this list.
 
-Not known: which kernel writes builder 0's list. All six kernels with this entry layout (entries at +0x50040: 7de574d0, 9eed67bc,
-0f3af67e, 46edda32, 7c683d82, fd390b6a) store at rates that do not single one out, and the joint counter below never fired, but
-only 46edda32 was measured in a run with a hit (run-541: 0 of its 15 threads).
+The writers (later on 2026-11-08, `OOT_BANK_WATCH`): the list is at +0x11830 in the buffer at 0x29bb9c000 (bank-0 slot c0+0x70), not at the
++0x50040 of the 7de574d0 family's own lists. 19 compute programs store there, the same family as the `OOT_GW_SKIP` default list, and they
+share four code hashes: a2731d1f (13 programs, 164d634a among them, the one that runs every frame), d4088949 (ac939523), f081ff77
+(af7a80ff), b9f52206 (fa1ae496).
 
-Reading the kernels: the LEA that builds the kind word (shift field 27) must be the high form, `(a >> 5) + b`, as otherwise
-lane bits would show in the word and they do not. This is inferred, not checked against a manual.
+How they pick the two fields (ac939523, the others alike): the kind word comes only from a tier number R3, found by comparing the
+instance index with c3[0x660..0x6e0]: tier 0 gives 0 (or -1 on one path), 1 gives 1, 2 gives 0, 3 gives 1, the rest -1. The id is a
+single value from the tier's table, `table[idx + 8]` through the pointer cell at c4[tier * 16], copied to R17 unchanged.
 
-Tools added: `OOT_SM86_COUNT` kinds `l` (lane differs from thread X modulo 32) and `j` (only threads with kind word 0 and id >= 76;
-`OOT_SM86_JOINT=<kind reg>:<id reg>`; N = 253 counts them, 254 sums their thread X). A hit comes in about 1 of 9 runs of 55 s (6 of 52).
+**No single thread stores the bad pair.** With the guard catching 5 and 3 bad records in run-628 and run-632, the counter on all four hashes
+(`j`: kind word 0 and id >= 76, at the store) stayed 0 over about 44,000 stores per window. The positive control (run-633, the kind test relaxed)
+reads 14,694 such entries of mean id 92, so the counter works. At the id load no even tier reads an id >= 76 either (a2731d1f and d4088949, each
+in a run with a hit). The lanes storing are always in the VOTEU mask (`q6` 0, run-634, 2 hits); lane equals thread X modulo 32 (`l` 0, run-536).
 
-Next: find the writer of 0x29bb5d7f0 / 0x29bb7c7f0 (the kernel whose bank-0 slot holds that pointer, which the dispatch dump shows),
-run `j` on it until a run has a hit, then read where its id and kind come from. Both should come from one object; the question is
-why they disagree.
+So the entry is a mixture. In run-588 slot 74 holds the object number, kind and position of a kind-0 thread and the id 86 of a kind-1 thread.
+Two threads must have written one slot, each field going to whichever store came last. Within a warp the slot is base + the number of active lanes
+below this lane, so it cannot repeat there given `q6` and `l`; that leaves two reservations overlapping: the counter at c0+0x70 + 0x10
+being reset or read stale between dispatches, or two dispatches whose stores overlap in GPU time (the crash only comes with the full window, which these 19 programs need).
+
+Corrections to the notes above: the "LEA high form" reading was about the 7de574d0 kernels, which do not write this list, and is withdrawn. A count of 8,588 "garbage" ids
+in run-596 was my tool: the counter's state was shared between lowering threads, so one kernel was instrumented with another's registers. It is thread-local now.
+
+Tools added: `OOT_SM86_COUNT` takes several programs (`<hash>[@<kind reg>/<id reg>/<mask>]:<points>;...`) and kinds `l` (lane differs from thread X modulo 32), `j` (kind word
+0, or masked with `mask`, and id >= 76; N = 253 counts them, 254 sums their thread X) and `q` (lane bit clear in uniform register N); `OOT_BANK_WATCH=<lo>:<hi>` logs each compute
+program with a 64-bit value in that range in bank 0. A bad record comes in about 1 run in 9 of 55 s.
+
+Next: watch the counter word at 0x29bb9c010 and 0x29bbbb010: CPU writes with `OOT_CPU_WATCH`, and what the leaders' atomics return from one dispatch to the next (a value that goes down
+within a frame is a reset). If it never goes down, force a full barrier between these dispatches and measure the crash rate.
 
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
