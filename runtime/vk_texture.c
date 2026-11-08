@@ -1763,7 +1763,34 @@ void vk_texture_write_back_small(uint64_t fence) {
             Tex *x = hit[j];
             hit[j] = hit[j - 1], hit[j - 1] = x;
         }
-    for (int i = 0; i < k; i++) write_back(hit[i]);
+    for (int i = 0; i < k; i++) {
+        LARGE_INTEGER a, b, f;
+        if (lock_log) QueryPerformanceCounter(&a);
+        write_back(hit[i]);
+        if (lock_log) {   // OOT_TEX_LOCK_LOG: which targets the fence write-back copies, and how long each takes
+            static struct { uint64_t addr; uint64_t n; double ms; } seen[16];
+            static uint64_t t_last;
+            QueryPerformanceCounter(&b), QueryPerformanceFrequency(&f);
+            double ms = (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart;
+            int j = 0;
+            while (j < 16 && seen[j].addr && seen[j].addr != hit[i]->pub.addr) j++;
+            if (j < 16) {
+                if (!seen[j].addr)
+                    rt_log("tex lock: fence write-back target %#llx %ux%u fmt %#x size %llu", (unsigned long long)hit[i]->pub.addr,
+                           hit[i]->t.d.width, hit[i]->t.d.height, hit[i]->t.d.format, (unsigned long long)hit[i]->t.L.size);
+                seen[j].addr = hit[i]->pub.addr, seen[j].n++, seen[j].ms += ms;
+            }
+            uint64_t now = GetTickCount64();
+            if (!t_last) t_last = now;
+            if (now - t_last >= 10000) {
+                for (j = 0; j < 16 && seen[j].addr; j++)
+                    rt_log("tex lock: write-back %#llx: %llu in 10 s, %.1f ms", (unsigned long long)seen[j].addr,
+                           (unsigned long long)seen[j].n, seen[j].ms);
+                for (j = 0; j < 16; j++) seen[j].n = 0, seen[j].ms = 0;
+                t_last = now;
+            }
+        }
+    }
     for (int i = 0; i < k; i++) perf_count(PERF_CNT_WB);
     for (int i = k; i < n; i++) perf_count(PERF_CNT_WB_SKIP);
     free(hit);

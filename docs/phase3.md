@@ -547,6 +547,19 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   picture (Kokiri fences, Navi; noise 0.80). Not a default: the game may read those targets on the CPU (TotK's grass
   does). (a) cannot be done naively: five paths destroy texture entries, one when a whole pool is finalized, so an
   unlocked readback needs the entry pinned (a busy flag the destroy paths respect) first.
+  What it copies (`OOT_TEX_LOCK_LOG=1` now lists targets, run-302), per 10 s of the level: a 306x104 R8 target 174
+  times (491 ms), a 120x68 format-0x3 target 74 times (277 ms), the bloom chain's 120x67 / 60x33 / 30x16 R11G11B10F
+  targets 76-228 times (~60 ms), each a separate submit and wait behind the frame's GPU work, all under the lock.
+  Safe designs, in order of effort: (1) batch one call's copies into one submit and one wait (`image_texels` split
+  into record and finish); (2) pin the entries and wait outside the lock: destroy paths must then wait for the pin
+  without holding the lock the writer needs, and `gpu_dirty` may only be cleared if `gpu_seq` did not move during
+  the readback (a racing GPU write would otherwise be lost); (3) skip targets the CPU never reads (needs a read
+  watch to know which).
+- `OOT_CPU_WATCH=<lo>:<hi>` (new diagnostic, `memory.c`): CPU writes into a range by host instruction, via read-only
+  pages and a single step. run-301 (safe configuration) over 0x29bc00000..0x29bc20000: the CPU never writes the
+  foliage contact records there; the only writes zero two small blocks at 0x29bc1a000 / 0x29bc1d000 each frame. The
+  records exist only with the full window (no foliage reaches the contact code otherwise), so catching their
+  producer needs one watch run in the old full-window configuration (crashes the game, 0 driver resets in ~20 runs).
 - **The crash's precise cause** (crash report now prints the foliage manager, run-296 with `OOT_GW_SKIP=none`):
   kind-0 foliage types: 76; kind-1 types: 203. The crashing record says kind 0 with type 86 (0x56) or 191 (0xbf),
   types that exist only in the kind-1 table (their kind-1 slots are filled; kind-0 slots past 75 are garbage or 0).

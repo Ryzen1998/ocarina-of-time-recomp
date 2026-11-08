@@ -213,6 +213,82 @@ static LONG CALLBACK thaw_handler(EXCEPTION_POINTERS *ep) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+// ---- OOT_CPU_WATCH=<lo hex>:<hi hex> (diagnostic): CPU writes into [lo, hi), by the host instruction that made them.
+// The pages are read-only; a write fault opens its page, single-steps the writing instruction (trap flag) and closes
+// the page again, recording the instruction (lifted game functions are f_<guest address> in oot.map), a sample address
+// and the value written. Per site: count, first address, last value; logged every 10 s. 2026-11-10: to find the code
+// that builds the foliage contact records the game crashes on (docs/phase3.md).
+static uint64_t cw_lo, cw_hi;
+static __thread uint64_t cw_page;   // the page this thread opened for its single step, 0 if none
+static SRWLOCK cw_lock = SRWLOCK_INIT;
+static struct { uint64_t rip, n, first, last_addr; uint64_t last_val; } cw_site[64];
+static void cw_protect(uint64_t page, DWORD prot) { DWORD old; VirtualProtect((void *)(uintptr_t)page, 0x1000, prot, &old); }
+static LONG CALLBACK cw_handler(EXCEPTION_POINTERS *ep) {
+    const EXCEPTION_RECORD *er = ep->ExceptionRecord;
+    if (er->ExceptionCode == EXCEPTION_SINGLE_STEP && cw_page) {
+        uint64_t page = cw_page;
+        cw_page = 0;
+        cw_protect(page, PAGE_READONLY);
+        AcquireSRWLockExclusive(&cw_lock);   // the value now in memory at the site's last address
+        for (int i = 0; i < 64 && cw_site[i].rip; i++)
+            if ((cw_site[i].last_addr & ~0xfffull) == page) cw_site[i].last_val = *(const uint64_t *)(uintptr_t)(cw_site[i].last_addr & ~7ull);
+        ReleaseSRWLockExclusive(&cw_lock);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2 || er->ExceptionInformation[0] != 1)
+        return EXCEPTION_CONTINUE_SEARCH;
+    uint64_t a = er->ExceptionInformation[1];
+    if (a < cw_lo || a >= cw_hi) return EXCEPTION_CONTINUE_SEARCH;
+    uint64_t rip = (uint64_t)ep->ContextRecord->Rip, now = GetTickCount64();
+    static uint64_t t_last;
+    AcquireSRWLockExclusive(&cw_lock);
+    int i = 0;
+    while (i < 64 && cw_site[i].rip && cw_site[i].rip != rip) i++;
+    if (i < 64) {
+        if (!cw_site[i].rip) cw_site[i].rip = rip, cw_site[i].first = a;
+        cw_site[i].n++, cw_site[i].last_addr = a;
+    }
+    if (!t_last) t_last = now;
+    if (now - t_last >= 10000) {
+        uintptr_t exe = (uintptr_t)GetModuleHandleW(NULL);
+        rt_log("cpu watch: writes into %#llx..%#llx in the last 10 s by site (exe offset: count, first address, last address = value):",
+               (unsigned long long)cw_lo, (unsigned long long)cw_hi);
+        for (int k = 0; k < 64 && cw_site[k].rip; k++)
+            rt_log("  exe+%#llx: %llu, first %#llx, last %#llx = %#llx", (unsigned long long)(cw_site[k].rip - exe),
+                   (unsigned long long)cw_site[k].n, (unsigned long long)cw_site[k].first,
+                   (unsigned long long)cw_site[k].last_addr, (unsigned long long)cw_site[k].last_val);
+        memset(cw_site, 0, sizeof cw_site);
+        t_last = now;
+    }
+    ReleaseSRWLockExclusive(&cw_lock);
+    cw_page = a & ~0xfffull;
+    cw_protect(cw_page, PAGE_READWRITE);
+    ep->ContextRecord->EFlags |= 0x100;   // trap after the write
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+// Arms the watch when OOT_CPU_WATCH is set (from the first mem_cpu_watch_poll).
+static void mem_cpu_watch_init(void) {
+    const char *e = getenv("OOT_CPU_WATCH");
+    if (!e || sscanf(e, "%llx:%llx", (unsigned long long *)&cw_lo, (unsigned long long *)&cw_hi) != 2 || cw_hi <= cw_lo) return;
+    cw_lo &= ~0xfffull, cw_hi = (cw_hi + 0xfff) & ~0xfffull;
+    AddVectoredExceptionHandler(1, cw_handler);
+    rt_log("cpu watch: OOT_CPU_WATCH %#llx..%#llx armed (pages made read-only when first committed and checked)",
+           (unsigned long long)cw_lo, (unsigned long long)cw_hi);
+}
+// Re-protects the watched pages that are committed and writable; vk_mem_mirror_begin calls it at every submission
+// (memory gets committed later, and a page whose single step was interrupted stays open).
+void mem_cpu_watch_poll(void) {
+    static int init;
+    if (!init) init = 1, mem_cpu_watch_init();
+    if (!cw_hi) return;
+    for (uint64_t p = cw_lo; p < cw_hi; p += 0x1000) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery((void *)(uintptr_t)p, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE &&
+            p != cw_page)
+            cw_protect(p, PAGE_READONLY);
+    }
+}
+
 // Mapping changes thaw the regions they touch and run under frz_lock, so no freeze sees them half done.
 static void commit(uint64_t a, uint64_t n, const char *what) {
     AcquireSRWLockExclusive(&frz_lock);

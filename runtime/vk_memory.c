@@ -1283,6 +1283,7 @@ static void freeze_pass(void) {
 }
 
 void vk_mem_mirror_begin(void) {
+    mem_cpu_watch_poll();
     if (!vk_mirror_on) {   // import mode: the texture checks' snapshots still skip frozen regions
         if (!freeze_idle) return;
         AcquireSRWLockExclusive(&gen_lock);

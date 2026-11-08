@@ -149,6 +149,7 @@ uint64_t mem_written_pages(uint64_t addr, uint64_t size, uint64_t *pages, uint64
 uint64_t mem_written_peek(uint64_t addr, uint64_t size, uint64_t *pages, uint64_t max);
                                                            // the same without the reset: the bits stay for the next
                                                            // mem_written_pages (verify checks only)
+void mem_cpu_watch_poll(void);                         // memory.c: OOT_CPU_WATCH (diagnostic), per submission
 int mem_freeze(uint64_t a);                                // makes the 2 MiB region at a (2 MiB aligned, watched,
                                                            // committed PAGE_READWRITE) read-only until a write or
                                                            // mem_thaw thaws it; 1 frozen (or already), 0 refused
