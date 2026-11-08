@@ -663,7 +663,11 @@ cannot differ. Copying the new .id there, or a fresh install, retranslates every
 The real counts then ran into our own bound: indirect mesh draws dispatched `OOT_MESH_IND_MAX` (64) groups. 2048 shows the rest of the plants but runs at 4 fps (about 50 draws x 2048). Mesh-only indirect draws now take their count from the
 GPU (`vkCmdDispatchIndirect`, `vkCmdDrawIndirect`, buffer `MI`, `OOT_MESH_MI=0` for the old bound): 36-37 fps, same plants (`build/logs/mi.png`, noise 0.93). Task draws keep the bound.
 
-Still wrong: the near plants render too dark (bushes almost black); grass tufts are still sparser than on the Switch 2.
+Fixed after that: the near plants rendered almost black. Six of the plant mesh programs' outputs (locations 10 and 11 of the fragment stage, a tint) held a constant 1.3e-6: the programs read per-mesh tables through storage-held pointers,
+whose bank-0 table (`SM86_PTR_C0_MESH`, 0x480) lies inside the global window's range (`VK_GW_C0`, 0x410..0x590). `bind_resources` tested the window first and bound every such pointer to the zero buffer, so the stride read from the table was 0 and every vertex read the same records.
+Found by walking back with `OOT_SM86_COUNT` zero counters and `OOT_ISBE_SPY=<hash>:<offset>=<register>,...` (an ISBEWR stores another register; read it with `OOT_MESH_REC`). `build/logs/ptrfix.png`: green plants, noise 0.95, 37 fps.
+
+Still wrong: grass tufts are sparser than on the Switch 2, and a tree at the left of the Saria area stays bare.
 
 #### Foliage: the crash at main+0xc938d0 is fixed, and nothing is skipped from the window by default (2026-11-08, 2dcd44e, 0 driver resets through run-695)
 

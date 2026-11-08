@@ -3544,8 +3544,31 @@ static void mesh_split(L *l, uint32_t g, uint32_t rt, uint32_t ri, int k) {
     emit(l, IADD_R(ri, g, sh) | l->pred | ((uint64_t)1 << 48));          // g - (t << SHIFT)
 }
 
+// OOT_ISBE_SPY=<code hash>:<offset>=<register>,... (diagnostic): the ISBEWR at those byte offsets stores that register instead, so that a mesh
+// record (OOT_MESH_REC) shows an intermediate value of the program. Program offsets as kernel.py dis prints them.
+static __thread uint64_t isbe_hash;
+static __thread uint32_t isbe_header;
+static uint32_t isbe_spy(const L *l, uint32_t reg) {
+    const char *e = getenv("OOT_ISBE_SPY");
+    if (!e || !*e) return reg;
+    char *end;
+    unsigned long long h = strtoull(e, &end, 16);
+    if (*end != ':' || h != isbe_hash) return reg;
+    uint32_t at = isbe_header + l->index * 16;
+    for (const char *p = end + 1; *p;) {
+        char *e2;
+        unsigned long o = strtoul(p, &e2, 16);
+        if (e2 == p || *e2 != '=') break;
+        unsigned long r = strtoul(e2 + 1, &e2, 10);
+        if (o == at) return (uint32_t)r;
+        if (*e2 != ',') break;
+        p = e2 + 1;
+    }
+    return reg;
+}
+
 static void lower_isbe(L *l, const Insn *x, int write) {
-    uint32_t reg = write ? bits(x, 32, 8) : bits(x, 16, 8), ra = bits(x, 24, 8), off = bits(x, 40, 24);
+    uint32_t reg = write ? isbe_spy(l, bits(x, 32, 8)) : bits(x, 16, 8), ra = bits(x, 24, 8), off = bits(x, 40, 24);
     uint32_t wide = bits(x, 75, 1), region = bits(x, 76, 2), out = bits(x, 79, 1);
     if (!l->mesh) return (void)fail(l, "stage buffer access outside a task or mesh program");
     if ((x->w[2] & ~0xf800u) || (region != 0 && region != 3) || (!wide && (!write || region != 0)) || off >= 0x800000)
@@ -3783,8 +3806,8 @@ const char (*sm86_count_points(uint32_t *n))[16] {
 
 uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
     uint64_t tag = 0, h = 0;
-    const char *names[3] = {"OOT_SM86_PROBE", "OOT_SM86_COUNT", "OOT_SM86_FORCE"};
-    for (int i = 0; i < 3; i++) {
+    const char *names[4] = {"OOT_SM86_PROBE", "OOT_SM86_COUNT", "OOT_SM86_FORCE", "OOT_ISBE_SPY"};
+    for (int i = 0; i < 4; i++) {
         const char *e = getenv(names[i]);
         if (!e || !*e) continue;
         if (!h) h = fnv64(code, code_size);
@@ -4095,6 +4118,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
     if (probe.on) for (int i = 0; i < 3; i++) probe_local[i] = c.local[i] ? c.local[i] : 1;
     count_init(code, code_size);
     force_init(code, code_size);
+    isbe_hash = fnv64(code, code_size), isbe_header = header;
     int pass_vs = mesh_vs_marked(control);
     if (pass_vs) {   // a mesh program's pass-through vertex program: generated, the mesh code only lends its header
         l.mesh = 0, l.graphics = 1;

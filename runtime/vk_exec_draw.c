@@ -1903,7 +1903,9 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         uint32_t off = (uint32_t)r->handle * 4;
         if (off == SM86_MESH_C0_TASK) return (VkDescriptorBufferInfo){M.buf, 0, M.task_size};
         if (off == SM86_MESH_C0_MESH) return (VkDescriptorBufferInfo){M.buf, M.task_size, M.mesh_size};
-        if (off >= VK_GW_C0 && off < VK_GW_C0 + 16 * VK_GW_N) {   // the window (gw_select_mesh), else zeros
+        // Not an entry of the storage-held pointers' table (SM86_PTR_C0_MESH, inside this range): until 2026-11-08 those were bound to the zero
+        // buffer here, so the plants' mesh programs read zeros through every pointer (their tint colours came out black).
+        if (off >= VK_GW_C0 && off < VK_GW_C0 + 16 * VK_GW_N && ptr_res(ex, st, r) < 0) {   // the window (gw_select_mesh), else zeros
             uint32_t k = (off - VK_GW_C0) / 16;
             if (k >= gw_n || (off - VK_GW_C0) % 16)
                 return written ? (VkDescriptorBufferInfo){Z.dbuf, 0, max < ZERO_BYTES ? max : ZERO_BYTES} : zero_info(max);
