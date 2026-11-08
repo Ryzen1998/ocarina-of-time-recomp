@@ -537,6 +537,13 @@ costs ~8% there (17.7 vs 16.3 fps). VRAM over budget all the time: 16-18 of 15.1
   picture equal (shot_diff noise 0.74 both, PSNR 34 dB, `build/logs/flush-side.png`). The rest of the upload is pages
   write watch reports written. `OOT_CPU_WATCH` on that range slowed the run to 3.5 fps from the title: not usable.
 - Not the cause: pipeline builds, shader translation, texture uploads, fence pacing (all ~0 in `OOT_TRACE=perf`).
+- **VRAM over budget: released render targets.** The `mem: vram` census (now split by kind) showed 1,995 released
+  texture entries holding 5.2 GiB, every one GPU-written: render targets the game freed and never took back, which
+  `sweep_pressure` never drops (their content is only in the image). **Fix (vk_texture.c sweep_pressure):** under
+  VRAM pressure an entry released `OOT_TEX_REL_AGE` frames ago (default 600, 0 = off) goes too. run-359 vs run-357,
+  same scene: released 5.2 -> 2.1 GiB, VRAM 15.1 -> 13.5 GiB (under budget), GPU 25.3 -> 13.9 ms a frame, **25.3 ->
+  45 fps** (interval 22 ms; replay 16 ms is now the bound); "left uninitialised" aliases 1 in the whole run, no dark
+  frames among the 19 captured, picture noise 0.76 (`build/logs/age-side.png`: same shot, Saria one line further).
 
 Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
 - Full window (run-354, `OOT_GW_SKIP=none`, user-approved, one run): no crash, 0 resets, 15.3 fps, and the SAME bare

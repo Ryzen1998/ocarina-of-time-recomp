@@ -60,6 +60,7 @@ typedef struct Tex {
     uint8_t listed;               // in owned[]
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
+    uint64_t rel_frame;           // while released: the frame it was released in (sweep_pressure's age rule)
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -582,7 +583,7 @@ static void sweep_released(void) {
 // "left uninitialised" aliases a minute).
 #define PRESSURE_STEP 32
 static int vram_pressure = -1;
-static uint64_t n_pressure_drops;
+static uint64_t n_pressure_drops, n_age_drops;   // n_age_drops: GPU-written entries dropped for their age
 
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
@@ -595,10 +596,24 @@ static void sweep_pressure(void) {   // tex_lock held
     uint64_t used, budget;
     int exact;
     if (!vk_mem_vram(&used, &budget, &exact) || used <= budget / 100 * (uint64_t)vram_pressure) return;
+    // OOT_TEX_REL_AGE (frames, default 600; 0 = off): an entry released that long ago goes too, whatever it holds.
+    // 2026-11-10, Kokiri Forest: all 1,995 released entries (5.2 GiB) were GPU-written render targets the game freed
+    // and never took back, kept because their content lives only in the image; with them VRAM stayed over its budget
+    // (15.1 of 15.1 GiB, 16-18 at times) and nothing qualified under the rule above. A target freed 10 s ago and not
+    // re-created since is not read back; the Depths flashes came from targets taken back within frames.
+    static int64_t rel_age = -1;
+    if (rel_age < 0) {
+        const char *s = getenv("OOT_TEX_REL_AGE");
+        rel_age = s && *s ? atoll(s) : 600;
+        if (rel_age < 0) rel_age = 600;
+    }
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     int dropped = 0;
     for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
         next = e->rel_next;
-        if (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty) continue;
+        int old = rel_age && now - e->rel_frame >= (uint64_t)rel_age;
+        if (!old && (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty)) continue;
+        if (old && (e->pub.gpu_owned || e->gpu_dirty)) n_age_drops++;
         destroy_tex(e);
         dropped++, n_pressure_drops++;
     }
@@ -1167,6 +1182,7 @@ void vk_texture_release(const tex_t *t) {
     Tex *e = nvn_hm_get(&by_key, &k);
     if (e && !e->released) {
         e->released = 1;
+        e->rel_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
         nreleased++;
         rel_append(e);
         tex_gen_bump(k.addr);
@@ -1376,9 +1392,10 @@ void vk_texture_new_submit(void) {
                (unsigned long long)f * 60, (unsigned long long)ck, (unsigned long long)n_checks, (unsigned long long)calls,
                (unsigned long long)untr);
         n_checks = 0;
-        rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu", (unsigned long long)f * 60,
-               nreleased, (unsigned long long)n_pressure_drops);
-        n_pressure_drops = 0;
+        rt_log("perf: frame %llu: released textures kept %d, dropped under VRAM pressure %llu (GPU-written, for their age, "
+               "%llu)", (unsigned long long)f * 60, nreleased, (unsigned long long)n_pressure_drops,
+               (unsigned long long)n_age_drops);
+        n_pressure_drops = 0, n_age_drops = 0;
     }
     unlock();
 }
@@ -2137,8 +2154,12 @@ void vk_texture_census(VkTexCensus *s) {
             vmaGetAllocationInfo(c->vma, e->alloc, &ai);
             bytes = ai.size;
         }
-        if (e->released) s->released++, s->own_released += e->alloc != NULL, s->bytes_released += bytes;
-        else s->live++, s->own_live += e->alloc != NULL, s->bytes_live += bytes;
+        if (e->released) {
+            s->released++, s->own_released += e->alloc != NULL, s->bytes_released += bytes;
+            if (e->pub.mirrored && !e->pub.gpu_owned && !e->gpu_dirty) s->rel_drop += bytes, s->n_drop++;   // sweep_pressure's
+            else if (e->pub.gpu_owned || e->gpu_dirty) s->rel_gpu += bytes, s->n_gpu++;
+            else s->rel_other += bytes, s->n_other++;
+        } else s->live++, s->own_live += e->alloc != NULL, s->bytes_live += bytes;
     }
     unlock();
 }

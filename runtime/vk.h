@@ -350,7 +350,7 @@ void vk_texture_range_gone(uint64_t lo, uint64_t size, VmaAllocation alloc);   /
 void vk_texture_stats(uint64_t *images, uint64_t *uploads, uint64_t *reuploads);
 // Entries now, live and released (TextureFinalize, kept until sweep_released), with the bytes of their own memory
 // (images not bound into pool memory).
-typedef struct { uint64_t live, released, own_live, own_released, bytes_live, bytes_released; } VkTexCensus;
+typedef struct { uint64_t live, released, own_live, own_released, bytes_live, bytes_released; uint64_t rel_drop, rel_gpu, rel_other, n_drop, n_gpu, n_other; } VkTexCensus;   // rel_*: released bytes by kind (vk_texture.c sweep_pressure: droppable, GPU-written, not mirrored)
 void vk_texture_census(VkTexCensus *s);
 void vk_texture_shutdown(void);                     // vk_mem_shutdown calls it
 void vk_texture_new_submit(void);                   // a queue submit starts: draw bindings check storage again
