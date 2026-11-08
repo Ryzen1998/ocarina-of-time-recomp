@@ -3622,6 +3622,23 @@ static int count_init(const uint8_t *code, uint32_t code_size) {
     return cnt.on = cnt.n > 0;
 }
 
+// ---- OOT_SM86_FORCE=<code hash, hex>:<offset hex>:<value hex> (diagnostic): the instruction at that byte offset of
+// that compute program becomes "destination register = value" (its predicate kept). For the shadow culling's
+// per-object counter (research report idea 3): e6d5432f's `LD R13, [R14+0xc]` at 0x6a0 forced to 0xff makes every
+// object due every frame, to see whether the chain after the arming works. The program gets its own cache key.
+static struct { int on; uint32_t at, imm; } force;
+static void force_init(const uint8_t *code, uint32_t code_size) {
+    force.on = 0;
+    const char *e = getenv("OOT_SM86_FORCE");
+    if (!e || !*e) return;
+    char *end;
+    unsigned long long want = strtoull(e, &end, 16);
+    if (*end != ':' || fnv64(code, code_size) != want) return;
+    unsigned long at = strtoul(end + 1, &end, 16);
+    if (*end != ':') return;
+    force.at = (uint32_t)at, force.imm = (uint32_t)strtoul(end + 1, NULL, 16), force.on = 1;
+}
+
 const char (*sm86_count_points(uint32_t *n))[16] {
     const char *e = getenv("OOT_SM86_COUNT");
     static uint32_t at[SM86_COUNT_MAX];
@@ -3635,8 +3652,8 @@ const char (*sm86_count_points(uint32_t *n))[16] {
 
 uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
     uint64_t tag = 0, h = 0;
-    const char *names[2] = {"OOT_SM86_PROBE", "OOT_SM86_COUNT"};
-    for (int i = 0; i < 2; i++) {
+    const char *names[3] = {"OOT_SM86_PROBE", "OOT_SM86_COUNT", "OOT_SM86_FORCE"};
+    for (int i = 0; i < 3; i++) {
         const char *e = getenv(names[i]);
         if (!e || !*e) continue;
         if (!h) h = fnv64(code, code_size);
@@ -3830,6 +3847,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
     probe_init(code, code_size);
     if (probe.on) for (int i = 0; i < 3; i++) probe_local[i] = c.local[i] ? c.local[i] : 1;
     count_init(code, code_size);
+    force_init(code, code_size);
     int pass_vs = mesh_vs_marked(control);
     if (pass_vs) {   // a mesh program's pass-through vertex program: generated, the mesh code only lends its header
         l.mesh = 0, l.graphics = 1;
@@ -3863,7 +3881,11 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         if (cnt.on && !l.graphics)
             for (uint32_t k = 0; k < cnt.n; k++)
                 if (cnt.at[k] == header + l.index * 16) count_emit(&l, k);
-        lower_one(&l, &l.in[l.index]);
+        if (force.on && !l.graphics && header + l.index * 16 == force.at) {   // OOT_SM86_FORCE
+            uint32_t p = bits(&l.in[l.index], 12, 4);
+            if (p != 15) l.pred = (uint64_t)p << 16, mov_imm(&l, bits(&l.in[l.index], 16, 8), force.imm);
+        } else
+            lower_one(&l, &l.in[l.index]);
         spill_flush(&l);
         if (l.bw_saved) scratch_restore(&l);
         if (probe.on && !l.graphics && header + l.index * 16 == probe.at) probe_emit(&l, 0);

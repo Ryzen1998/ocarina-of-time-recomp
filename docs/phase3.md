@@ -505,6 +505,26 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   on global memory becomes a compare-and-swap loop (the shape Ryujinx's GlobalToStorage already uses for small
   integer atomics); before, the add was dropped ("Invalid reduction type: F32FtzRn", 70 cached programs). After the
   re-translation no program carries the note. It did not change the crash.
+- **What the workaround costs**: the task-stage indirect mesh draws whose group counts the three culling families
+  write through the window (args at 0x29bc4a000, 0x29bc62000, 0x29bc50000, 0x29bc68000; af7a80ff, ac939523,
+  164d634a) read 0 groups (`OOT_MESH_LOG`, run-288; with the full window, run-290 at frame 3000: 7 and 24 groups).
+  Probably instanced foliage. Those three families are also the research report's top crash suspects (section 14),
+  and their window ranges sit in the region of the crashing records. Skipping only them is the obvious next test,
+  but it is a partial skip (run-273 hung the GPU on one), so it waits for the user's go-ahead.
+- **Shadows, corrected**: the "counters never armed" lead does not apply to this scene. In culling kernel e6d5432f
+  (code hash a2731d1f) the counter/append path is only for object types 0 and 1 (`P5 = counter == 0xff && !P6`, P6 =
+  type >= 2 set at 0x440); the type of a thread comes from prefix counts in c3[0x660..0x6f0], which read 0, 0, 141,
+  286, 360, 360, 614, 652, 675, 675 at frame 4600 (`OOT_DUMP_UBO`, run-286): there are no type 0/1 objects here, so
+  no counter is ever due, and forcing it (`OOT_SM86_FORCE=a2731d1f657383f9:6a0:ff`, new diagnostic, run-284/285)
+  changes nothing (P6 is set in all 1,005,120 threads). After the FSEL fix ~700k threads per 120 frames pass the
+  distance test (0.2M before); `OOT_MEMORY=import` gives the same counts (run-283), so the mirror hides nothing here.
+- **Shadow maps**: the vertex-draw passes of the cascades hold geometry (4-5% of the map), the mesh-only passes
+  (6-7 per cascade, the terrain) are empty with or without the full window (run-286, run-287): their indirect
+  arguments read 0 groups. Characters cast shadows on the ground: `build/logs/mesh072.png` (Mido in Kokiri Forest,
+  his shadow on the grass, normal ground colour: the over-bright speckled ground is gone; noise 0.86).
+- Mesh 072eb70d (`OOT_MESH_IND_SKIP=none`, run-291): its draws (task c7f0444a, args at 0x29bc4a000) get 0 groups
+  under the workaround, so the test says nothing; it stays skipped.
+- Driver resets since the 02:01 boot: 0 (run-274..291).
 
 ### Safety (learned the hard way)
 
