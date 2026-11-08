@@ -517,6 +517,26 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
                 }
             }
         }
+        // OoT's foliage resource manager (`*(main+0x4e22540) + 0x120`: type tables, kind 0 count +0x840 entries +0x848,
+        // kind 1 +0x8a0 / +0x8a8), the tables main+0xc938d0 reads when the game crashes there on a foliage type with no
+        // entry (2026-11-10; research report section 14b). Counts and the entries around types 0x56 and 0xbf.
+        for (int mi = 0; mi < ldr_count(); mi++) {
+            if (strcmp(ldr_module(mi)->name, "main")) continue;
+            uint64_t g = ldr_module(mi)->base + 0x4e22540, m = readable(g, 8) ? LD64(g) : 0;
+            uint64_t f = m && readable(m + 0x120, 8) ? LD64(m + 0x120) : 0;
+            if (!f || !readable(f + 0x840, 0x70)) break;
+            for (int kind = 0; kind < 2; kind++) {
+                uint64_t base = f + (kind ? 0x8a0 : 0x840);
+                int32_t n = *(const int32_t *)(uintptr_t)base;
+                uint64_t t = LD64(base + 8);
+                rt_logf("  foliage manager %#llx kind %d: %d types, table %#llx\n", (unsigned long long)f, kind, n, (unsigned long long)t);
+                static const int around[] = {0x54, 0x55, 0x56, 0x57, 0x58, 0xbd, 0xbe, 0xbf, 0xc0, 0xc1};
+                for (int a = 0; a < 10; a++)
+                    if (t && readable(t + 8ull * around[a], 8))
+                        rt_logf("    [%#x] %#llx\n", around[a], (unsigned long long)LD64(t + 8ull * around[a]));
+            }
+            break;
+        }
         // OOT_CRASH_PEEK=<bytes> widens the peek (up to 16 KiB) to see a whole object.
         const char *pk = cfg_get("OOT_CRASH_PEEK");
         size_t peek = pk ? (size_t)strtoul(pk, NULL, 0) : 160;
