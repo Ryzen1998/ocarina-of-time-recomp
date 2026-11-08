@@ -842,6 +842,20 @@ The save is restored from `build/profile/save-forest-backup-2026-11-10`. The for
 
 One GPU run at a time, always through `tools/run.py`. Count nvlddmkm events after each. On any driver reset stop all GPU work, no retry, diagnose offline; the user must reboot. Never `--fresh-cache`, never partial `OOT_GW_SKIP` bisects. Local commits only, after `tools/check_content.py --staged`; no push and no PR without the user's approval of the text. Never commit `build/`, `dump/`, `notes/`, `fault-vendor.bin` or game data. GPL emulators (Lichii, yuzu, Ryujinx, Eden) for behaviour only, never copied. `tangerineturtle1/NX2navi` is never read, fetched or cloned. The user's rule is that no object is skipped.
 
+#### The grass tufts (2026-11-09, run-734..747)
+
+The tufts are drawn. Two faults hid them; both are in the record of how a mesh program gets its data.
+
+- **Task draws were cut at 64 tasks.** The two grass lists hold 606 and 400 tasks (`OOT_MESH_SERIES`); only the first 64 ran, and each task usually launches one to nine mesh workgroups. Raising the bound to 640 showed the grass, at 29 fps against 37: flat indexing keeps a record and a pass-through instance for 32 workgroups of every task (20480 instances per draw, 670 MB of records). Indirect task draws now run from a packed list: every task clears its count (`task_prologue`), a host compute pass (`shaders/mesh_compact.comp`, `mesh_compact` in `vk_exec_draw.c`) lists the workgroups really launched and writes the dispatch and draw counts, and the mesh program takes its task and index from the list (`mesh_split`, `SM86_MESH_INDEX`, `SM86_MESH_C0_MAPPED`). Only the task bound of `MESH_MAX_TASKS` (4096) and `MI_MAX_GROUPS` (5120) remain, as safety limits; how close the lists come to 5120 has not been measured. `OOT_MESH_MAP=0` restores the bound.
+- **The colour programs put every blade in the wrong place.** With the bound raised, the tufts appeared as white holes with a bloom over the frame: the depth pre-pass (2fbfe761, 7849566c) wrote them, the colour pass (b9bd44f9, a11f465b, depth test EQUAL) painted nothing, and the cleared background showed through. `OOT_MESH_REC` gave the same group's clip position as w = 22.8 in the depth program and 217 in the colour one; the world position was (-508, -506, -508), which is (byte - 127) * 4 with a byte of 0. The colour programs have storage-held pointers, and those programs got no global window because the pointer table (0x480) lay inside it, so their one untraced load (a pointer loaded into R0, which `ptr_load` cannot rewrite) read 0. The table moved to 0x590, above the window (`SM86_PTR_C0_MESH`, at most 14 entries; more go to the window). After the move the two programs' positions agree to every printed digit.
+- `OOT_MESH_IND_SKIP` is empty by default: a11f465b, the program skipped since 2026-11-08 for "black and white blocks", was this same fault.
+
+Measured with default settings (run-747, 0 driver resets): `build/logs/packed.png`, noise 1.0, forest 34.6 fps, 1% low 23.7 (35.6 and 28.4 with the 64-task bound in run-746). All task and mesh programs were re-keyed ("meshvs06").
+
+Ruled out on the way: deferred buffer binds (`BindUniformBuffersDeferred`): read at submit they never differed from record time, so that change was removed. When reading a program's banks, c[n] is bind slot n - 3: c[3] is the camera at slot 0.
+
+`OOT_MESH_REC` takes several hash prefixes now, and `OOT_MESH_TASKS` also logs each draw's uniform banks.
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with

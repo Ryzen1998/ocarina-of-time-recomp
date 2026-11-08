@@ -54,13 +54,21 @@ void sm86_lower_free(Sm86Lowered *out);
 #define SM86_MESH_C0_SHIFT 0x624u   // u32
 #define SM86_MESH_C0_COUNT 0x628u   // u32: a task workgroup at or past it exits at once (sm86_lower.c task_prologue); an
                                     // indirect draw's count, copied there on the GPU, under a dispatch the host bounds
+#define SM86_MESH_C0_MAPPED 0x62cu  // u32: ~0 when the mesh workgroups are a packed list: workgroup g is the one whose (task << SHIFT | index) is
+                                    // the word at SM86_MESH_INDEX of mesh record g (vk_exec_draw.c mesh_compact); 0: g is that value itself
 #define SM86_MESH_C0_END   0x630u
+#define SM86_MESH_INDEX    0x7ff0u  // above the index map: 4 + 12 * 256 primitives from SM86_MESH_MAP ends at 0x7c04
 // The stages' own storage buffer tables in bank 0 ({u64 address, u32 size} per slot), as the game's programs read them
 // (a census of their bank-0 operands: vertex 0x110, fragment 0x510, task 0x670, mesh 0x770); the mesh table ends with
-// the bank at 0x800 (9 slots). Storage-held pointers of these stages go to SM86_PTR_C0_MESH, below both.
+// the bank at 0x800 (9 slots). Storage-held pointers of these stages go to SM86_PTR_C0_MESH, between the global window
+// (VK_GW_C0, ending at 0x590) and the records' entries (0x600): a mesh program with both reads through both. At 0x480
+// the table lay inside the window, so such a program got no window and its other untraced loads read 0: the grass's
+// colour programs placed every blade at the byte value 0, far from where its depth program had put it (2026-11-09).
+// A program with more pointers than SM86_PTR_MESH_MAX leaves the rest to the window.
 #define SM86_TASK_TABLE    0x670u
 #define SM86_MESH_TABLE    0x770u
-#define SM86_PTR_C0_MESH   0x480u
+#define SM86_PTR_C0_MESH   0x590u
+#define SM86_PTR_MESH_MAX  14u
 // The pass-through vertex program of a mesh program (sm86_lower.c mesh_vs): the host hands the lowering the mesh
 // program's code with a copy of its control section whose stage byte (+0x56) is 0 and whose u32 at +0x48 (zero in
 // every program of the game) is SM86_MESH_VS_MAGIC. The lowering then writes a Maxwell vertex program for an

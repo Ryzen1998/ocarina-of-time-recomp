@@ -1,0 +1,37 @@
+// The mesh workgroups an indirect task draw really launched, packed into one list (vk_exec_draw.c mesh_compact).
+//
+// The task records hold, at +4, how many mesh workgroups each task asked for; only the GPU knows these counts. Flat
+// indexing (task << 5 | index) needs room and a pass-through instance for 32 workgroups of every task, about 40 times
+// what the forest's plant draws launch. This writes, into the spare word of mesh record f, the (task << 5 | index) of
+// the f-th launched workgroup (sm86_lower.c mesh_split reads it), then the workgroup count for the mesh dispatch and
+// the instance count for the pass-through draw.
+//
+// Compiled to runtime/mesh_compact_spv.h by tools/build_shaders.py.
+#version 450
+layout(local_size_x = 1) in;
+
+layout(set = 0, binding = 0, std430) buffer Records { uint rec[]; };
+layout(set = 0, binding = 1, std430) buffer Counts { uint mi[]; };
+
+layout(push_constant) uniform Params {
+    uint mesh_base;    // words: the mesh records' start in rec
+    uint slot;         // words: this draw's entry in mi: {x, 1, 1, task count} then a VkDrawIndirectCommand
+    uint max_groups;   // the mesh records there is room for
+    uint max_tasks;    // the task workgroups dispatched
+    uint map_word;     // words into a mesh record: sm86_lower.h SM86_MESH_INDEX
+};
+
+const uint TASK_WORDS = 0x400u;   // SM86_TASK_STRIDE / 4
+const uint MESH_WORDS = 0x2000u;  // SM86_MESH_STRIDE / 4
+const uint PER_TASK = 32u;        // 1 << MESH_SHIFT (vk_exec_draw.c)
+
+void main() {
+    uint tasks = min(mi[slot + 3u], max_tasks), f = 0u;
+    for (uint t = 0u; t < tasks && f < max_groups; t++) {
+        uint n = min(rec[t * TASK_WORDS + 1u], PER_TASK);
+        for (uint i = 0u; i < n && f < max_groups; i++, f++)
+            rec[mesh_base + f * MESH_WORDS + map_word] = t * PER_TASK + i;
+    }
+    mi[slot] = f;
+    mi[slot + 5u] = f;
+}

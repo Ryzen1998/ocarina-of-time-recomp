@@ -1905,7 +1905,7 @@ static int ptr_load(L *l, uint32_t urn, uint32_t offset, uint32_t rd) {
     uint32_t desc = l->cur_def[urn].value, i = 0;
     while (i < l->nptr && (l->ptr_desc[i] != desc || l->ptr_off[i] != offset)) i++;
     if (i == l->nptr) {
-        if (l->nptr == SM86_PTR_MAX) return 0;
+        if (l->nptr == (l->mesh ? SM86_PTR_MESH_MAX : SM86_PTR_MAX)) return 0;
         l->ptr_desc[i] = desc, l->ptr_off[i] = offset, l->nptr++;
     }
     Src s = {0};
@@ -3533,15 +3533,25 @@ static uint32_t mesh_addr(L *l, uint32_t c0off, uint32_t off32, int k) {
     return lo;
 }
 
-// t = g >> SHIFT into rt, i = g - (t << SHIFT) into ri, with g the workgroup id (scratch k..k+1 for the constants).
+// t = v >> SHIFT into rt, i = v - (t << SHIFT) into ri, where v is the workgroup id g, or for a packed draw the word
+// its mesh record holds (SM86_MESH_C0_MAPPED, sm86_lower.h). Scratch k..k+3. No predicate is touched: this runs in the
+// middle of the program, so the choice is v = ((word ^ g) & mapped) ^ g.
 static void mesh_split(L *l, uint32_t g, uint32_t rt, uint32_t ri, int k) {
-    uint32_t sh = S(l, k);
+    uint32_t sh = S(l, k), v = S(l, k + 3);
+    emit(l, SHL_IMM(sh, g, SM86_MESH_STRIDE_LOG2) | l->pred);
+    uint32_t a = mesh_addr(l, SM86_MESH_C0_MESH, sh, k + 1);
+    emit(l, 0xeed0000000000000ull | l->pred | v | ((uint64_t)a << 8) | ((uint64_t)SM86_MESH_INDEX << 20) | ((uint64_t)1 << 45) | ((uint64_t)4 << 48));
     Src s = {0};
-    s.kind = 2, s.cb_bank = 0, s.cb_off = SM86_MESH_C0_SHIFT;
+    s.kind = 2, s.cb_bank = 0, s.cb_off = SM86_MESH_C0_MAPPED;
     mov_cbuf(l, sh, &s);
-    emit(l, SHR_R(rt, g, sh) | l->pred);
+    emit(l, base(l, 0x5c40000000000000ull, v, v) | ((uint64_t)g << 20) | ((uint64_t)1 << 42) | ((uint64_t)PT << 48));    // ^ g
+    emit(l, base(l, 0x5c40000000000000ull, v, v) | ((uint64_t)sh << 20) | ((uint64_t)PT << 48));                         // & mapped
+    emit(l, base(l, 0x5c40000000000000ull, v, v) | ((uint64_t)g << 20) | ((uint64_t)1 << 42) | ((uint64_t)PT << 48));    // ^ g
+    s.cb_off = SM86_MESH_C0_SHIFT;
+    mov_cbuf(l, sh, &s);
+    emit(l, SHR_R(rt, v, sh) | l->pred);
     emit(l, SHL_R(sh, rt, sh) | l->pred);
-    emit(l, IADD_R(ri, g, sh) | l->pred | ((uint64_t)1 << 48));          // g - (t << SHIFT)
+    emit(l, IADD_R(ri, v, sh) | l->pred | ((uint64_t)1 << 48));          // v - (t << SHIFT)
 }
 
 // OOT_ISBE_SPY=<code hash>:<offset>=<register>,... (diagnostic): the ISBEWR at those byte offsets stores that register instead, so that a mesh
@@ -3632,6 +3642,12 @@ static void task_prologue(L *l) {
                 ((uint64_t)PT << 39) | ((uint64_t)6 << 49));
     l->pred = 0;   // @P0
     emit(l, 0xe30000000000000full | l->pred);
+    // A task that runs starts by asking for no meshes: a packed draw (vk_exec_draw.c mesh_compact) does not clear its records.
+    l->pred = (uint64_t)PT << 16;
+    uint32_t rec = S(l, 2);
+    emit(l, SHL_IMM(rec, g, SM86_TASK_STRIDE_LOG2) | l->pred);
+    uint32_t a = mesh_addr(l, SM86_MESH_C0_TASK, rec, 3);
+    emit(l, 0xeed8000000000000ull | l->pred | RZ | ((uint64_t)a << 8) | ((uint64_t)4 << 20) | ((uint64_t)1 << 45) | ((uint64_t)4 << 48));
     l->pred = saved;
 }
 
@@ -3847,7 +3863,7 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
     for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
         uint32_t w0;
         memcpy(&w0, code + i, 4);
-        if ((w0 & 0xfff) == 0x927) { tag ^= 0x6d65736876733034ull; break; }   // "meshvs04"
+        if ((w0 & 0xfff) == 0x927) { tag ^= 0x6d65736876733036ull; break; }   // "meshvs06": pointer table out of the window, packed workgroups
     }
     // A program with a ballot or a shuffle (VOTE, VOTEU, SHFL, REDUX): translator patch 0023 keeps these where they are computed, and a value moved
     // into a branch was wrong (2026-11-08). The translator's identity is left as it was so that the other programs keep their translations.
