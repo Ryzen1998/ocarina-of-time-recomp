@@ -1110,10 +1110,11 @@ static void written_locked(Tex *e) {
     make_fresh(e);   // a partial render keeps what the storage held before
     e->pub.gpu_owned = 1;
     uint64_t f = vk_exec_recording_fence();
+    int again = f && e->wr_fence == f && e->gpu_dirty;   // already written by this submission: its CPU writes were dated then (each query is a GetWriteWatch, 5% of the render thread by Saria)
     if (f > e->wr_fence) e->wr_fence = f;
     if (e->pub.mirrored) {
         e->gpu_dirty = 1;
-        storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
+        if (!again) storage_rewritten(e, 0, &e->gpu_gen);   // CPU writes up to here are older than this render
         e->gpu_seq = ++gpu_writes;
         e->gpu_fence = vk_exec_recording_fence();
         wb_cfg_init();
