@@ -558,6 +558,28 @@ static LONG CALLBACK crash_handler(EXCEPTION_POINTERS *ep) {
                 rt_logf("    +%04zx %s |%s|\n", row, hex, txt);
             }
         }
+        // OOT_CRASH_MEM=<addr>[:<bytes>][:*][,...] (diagnostic): those guest ranges too, hex; with :* the 64-bit word at
+        // <addr> is followed first (a pointer cell).
+        for (const char *e = cfg_get("OOT_CRASH_MEM"); e && *e;) {
+            char *p;
+            uint64_t a = strtoull(e, &p, 16), n = 0x40;
+            int deref = 0;
+            if (*p == ':' && p[1] != '*') n = strtoull(p + 1, &p, 16);
+            if (*p == ':' && p[1] == '*') deref = 1, p += 2;
+            if (n > 0x4000) n = 0x4000;
+            if (deref && readable(a, 8)) a = *(const uint64_t *)(uintptr_t)a;
+            if (readable(a, n)) {
+                rt_logf("  [mem] at %#llx:\n", (unsigned long long)a);
+                for (uint64_t row = 0; row < n; row += 16) {
+                    const uint32_t *w = (const uint32_t *)(uintptr_t)(a + row);
+                    rt_logf("    +%04llx %08x %08x %08x %08x\n", (unsigned long long)row, w[0], w[1], w[2], w[3]);
+                }
+            } else {
+                rt_logf("  [mem] %#llx not readable\n", (unsigned long long)a);
+            }
+            e = strchr(p, ',');
+            e = e ? e + 1 : NULL;
+        }
     } else {
         rt_logf("  not on a guest thread\n");
     }

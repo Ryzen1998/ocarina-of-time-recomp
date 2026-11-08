@@ -3975,7 +3975,9 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
 // dispatches n mesh workgroups. Indirect draws are not run yet: their argument layout is not known, and a wrong
 // guess could launch a huge grid; OOT_MESH_LOG=1 reads their first 16 bytes back instead, and the record heads of
 // the direct draws, the first 40 of each.
-#define MESH_SHIFT 4u
+// 5: the game's task programs launch up to exactly 32 mesh workgroups each (OOT_MESH_TASKS, forest, 2026-11-08); at 4
+// the meshes past the 16th of every large object were cut off. The records and the pass-through draw grow with it.
+#define MESH_SHIFT 5u
 #define MESH_MAX_TASKS 4096u
 static const NVNshaderData *stage_entry(const prog_t *p, int st);
 
@@ -4040,10 +4042,75 @@ static void mesh_rb_done(VkExec *ex, int slot, uint32_t kind, uint32_t a, uint32
     vk_completion_add(vk_sync_issued() + 1, mesh_read, r);   // the submission being recorded (ex->fence is set at its submit)
 }
 
+// OOT_MESH_TASKS=<frame> (diagnostic): for every mesh draw of that frame, its indirect arguments and the mesh workgroup
+// count each of its tasks asked for, read back on the GPU. A slot holds 64 task counts and the 4 argument words.
+#define MTB_SLOT_WORDS 68u
+#define MTB_SLOTS 256u
+static struct { VkBuffer buf; VmaAllocation mem; uint32_t *map; uint32_t next; } MTB;
+typedef struct { uint32_t slot, tasks, shift; uint64_t ht, hm, ind; } MeshTasksRead;
+static void mesh_tasks_read(void *arg) {
+    MeshTasksRead *r = arg;
+    const uint32_t *v = MTB.map + MTB_SLOT_WORDS * r->slot;
+    uint32_t n = r->tasks < 64 ? r->tasks : 64, sum = 0, max = 0, over = 0;
+    char s[640];
+    size_t o = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        sum += v[i], max = v[i] > max ? v[i] : max, over += r->shift < 31 && v[i] > 1u << r->shift;
+        if (v[i] && o < sizeof s - 14) o += (size_t)snprintf(s + o, sizeof s - o, " %u", v[i]);
+    }
+    s[o] = 0;
+    rt_log("meshtasks: task %016llx mesh %016llx args at %#llx: %u %u %u %u; %u tasks ran: sum %u max %u, %u over the limit of %u:%s",
+           (unsigned long long)r->ht, (unsigned long long)r->hm, (unsigned long long)r->ind, v[64], v[65], v[66], v[67], n, sum,
+           max, over, r->shift < 31 ? 1u << r->shift : 0u, s);
+    free(r);
+}
+static void mesh_tasks_note(VkExec *ex, const VkMemSpan *ip, uint64_t ind, uint32_t tasks, uint32_t shift) {
+    static long long at = -2;
+    if (at == -2) { const char *e = getenv("OOT_MESH_TASKS"); at = e ? atoll(e) : -1; }
+    if (at < 0 || (long long)gfx_stats().frames != at || MTB.next >= MTB_SLOTS) return;
+    if (!MTB.buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = MTB_SLOTS * MTB_SLOT_WORDS * 4,
+                                 .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                      .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                      .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        VmaAllocationInfo info;
+        if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &MTB.buf, &MTB.mem, &info) != VK_SUCCESS) { at = -1; return; }
+        MTB.map = info.pMappedData;
+    }
+    uint32_t slot = MTB.next++, n = tasks < 64 ? tasks : 64;
+    VkDeviceSize base = (VkDeviceSize)slot * MTB_SLOT_WORDS * 4;
+    VkBufferCopy cp[64];
+    for (uint32_t i = 0; i < n; i++)
+        cp[i] = (VkBufferCopy){(VkDeviceSize)i * SM86_TASK_STRIDE + 4, base + 4 * i, 4};
+    vk_exec_barrier(ex);
+    vkCmdCopyBuffer(ex->cb, M.buf, MTB.buf, n, cp);
+    ex->recorded++;
+    if (ip && ip->buffer) {
+        VkBufferCopy a = {ip->offset, base + 64 * 4, 16};
+        vkCmdCopyBuffer(ex->cb, ip->buffer, MTB.buf, 1, &a);
+        ex->recorded++;
+    }
+    MeshTasksRead *r = malloc(sizeof *r);
+    if (!r) return;
+    *r = (MeshTasksRead){slot, tasks, shift, 0, 0, ind};
+    for (int m = 0; m < 2; m++) {
+        const NVNshaderData *e = stage_entry(ex->mesh_prog[m], 6 + m);
+        if (!e) continue;
+        uint32_t len;
+        memcpy(&len, (const uint8_t *)e->control + 0x44, 4);
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t i = 0; i < len; i++) h = (h ^ ((const uint8_t *)(uintptr_t)e->data)[i]) * 0x100000001b3ull;
+        if (m) r->hm = h; else r->ht = h;
+    }
+    vk_completion_add(vk_sync_issued() + 1, mesh_tasks_read, r);
+}
+
 static void mesh_release(VkCtx *c) {   // vk_exec_draw_shutdown
     if (M.buf) vmaDestroyBuffer(c->vma, M.buf, M.mem);
     if (MRB.buf) vmaDestroyBuffer(c->vma, MRB.buf, MRB.mem);
-    memset(&M, 0, sizeof M), memset(&MRB, 0, sizeof MRB);
+    if (MTB.buf) vmaDestroyBuffer(c->vma, MTB.buf, MTB.mem);
+    memset(&M, 0, sizeof M), memset(&MRB, 0, sizeof MRB), memset(&MTB, 0, sizeof MTB);
 }
 
 // The record buffer, grown when a draw needs more; the old one goes after the submission being recorded.
@@ -4280,7 +4347,14 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     if (ind_max < 1) ind_max = 1;
     if (ind_max > (int)MESH_MAX_TASKS) ind_max = (int)MESH_MAX_TASKS;
     uint32_t n = indirect ? (uint32_t)ind_max : (uint32_t)d->count;
-    uint32_t tasks = has_task ? n : 1, shift = has_task ? MESH_SHIFT : 31;
+    static int mesh_shift = -1;   // OOT_MESH_SHIFT: log2 of the mesh workgroups a task can launch (test of the bound)
+    if (mesh_shift < 0) {
+        const char *e = getenv("OOT_MESH_SHIFT");
+        mesh_shift = e && *e ? atoi(e) : (int)MESH_SHIFT;
+        if (mesh_shift < 1 || mesh_shift > 10) mesh_shift = (int)MESH_SHIFT;
+        rt_log("vk_exec: a mesh task launches at most %u mesh workgroups (OOT_MESH_SHIFT)", 1u << mesh_shift);
+    }
+    uint32_t tasks = has_task ? n : 1, shift = has_task ? (uint32_t)mesh_shift : 31;
     uint32_t groups = has_task ? tasks << shift : n;
     if (!mesh_buffer((VkDeviceSize)tasks * SM86_TASK_STRIDE, (VkDeviceSize)groups * SM86_MESH_STRIDE))
         return warn_once(W_MESH, "no memory for %u mesh records: mesh draws are skipped", groups);
@@ -4329,6 +4403,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     }
     M.on = 0, M.ind = (VkMemSpan){0};
     vk_exec_barrier(ex);
+    if (ok) mesh_tasks_note(ex, indirect ? &ip : NULL, d->ind, has_task ? tasks : 0, shift);
     if (vk_dump_armed) {   // frame dumps: which task and mesh programs the next pass-through draw stands for
         uint64_t hq[2] = {0, 0};
         for (int m = 0; m < 2; m++) {

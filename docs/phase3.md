@@ -580,6 +580,36 @@ Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
   flushed mirror ranges left to write watch. Regenerate C with `recomp/gen.py` before `tools/build_game.py` after
   a generator change (build_game.py only compiles).
 
+#### Foliage, first findings (2026-11-08 session, run-360..374, 0 driver resets)
+
+- **Correction: the plant draws are not all zero.** The "30 logged draws read 0" above were the first 30 only (the log is
+  capped). A whole frame with `OOT_GW_SKIP=none` (run-360, frame 4600): task draws 12 and 19 groups (0x29bc62000,
+  0x29bc4a000), mesh-only draws up to 21 groups. Some stay 0: 0x29be5e000 / 0x29cb0a000 (and their alternates
+  0x29c4b4000 / 0x29d160000), 0x29d7b6020/40, 0x2a169c0x0.
+- **The skip list does hide the plants.** With the default `OOT_GW_SKIP`, kernel 3d1fdbc3 (hash bf4bf3c7, writes
+  0x29be5e000 / 0x29cb0a000) is dispatched but runs 0 threads (run-367): its group count comes from e6c023a5, whose own
+  count 164d634a writes through the window, and 164d634a is among the 18. Bare ground in both configurations was two
+  separate problems, not proof that the list is innocent.
+- **Fixed: a task launched at most 16 mesh groups** (`MESH_SHIFT` 4 -> 5, `vk_exec_draw.c`). New `OOT_MESH_TASKS=<frame>` logs
+  each mesh draw's arguments and each task's count. Tasks ask for up to exactly 32 (task 5d68723e: 12 tasks of 32), so
+  the meshes past the 16th of every large object were dropped. run-366: noise 0.76, 44.2 fps in the forest, same as
+  before (`build/logs/shift5-default.png`). `OOT_MESH_SHIFT` overrides it; 8 costs 10-14 fps and gains nothing.
+- **Argument words:** word 0 is groups, word 3 the item count (`ceil(items / 16 or 32)` = groups). Kernels add to +0xc
+  atomically and derive word 0 (3d1fdbc3 at 0x7cb0).
+- **What the plant kernel does with the full window** (run-374, `OOT_SM86_COUNT`, per 120 frames): 3d1fdbc3 starts ~36,000
+  threads, ~32,500 pass the item count check, ~31,800 take the culled branch at 0x7c10 (P4), ~1,080 reach the append path
+  at 0x7c20, and **none** get past `@!P2 EXIT` at 0x7e80. Its outputs stay at 0, so the plane tests at 0x79e0..0x7b80
+  (FSETP against c3+0x4d0..0x518 plus c3+0x648/0x64c) reject everything. Next: what those tests compare (position from
+  the TEX at 0x62c0/0x62d0, bindless handles c0+0x80/0x88: NaN or wrong texture?) against the working vertex-draw path.
+- **The crash blocks the full window:** main+0xc938d0 crashed 5 of 12 runs here, always at about frame 1020 on this route,
+  the moment the plants first appear. New `OOT_CRASH_MEM=<addr>[:<bytes>][:*],...` prints guest memory in the crash report.
+  Record list at the crash: a bad entry (type 0x56, `Land_Kokiri_Plant_B_04`, a kind-1 type, kind 0) among good ones
+  (0x4a, 0x1d, 0x15). Cell 0x29bb2b940 -> 0x2a19e9000 lists the 15 live kind-0 types at +0x20 (0x15, 0x3c, 0x1d, ...), no
+  0x56. Cell 0x29bb2b880 -> 0x29bb2d000 reads `0 0 0x200 0x400 1 1 0 0` then 0, 1, 2, ...: looks like a free list, not
+  objects. d0bb3a4c's slot word (+4 of each entry, R29) is its own list index or -1, not a type. Its lane bit test uses thread id X & 31 (R0)
+  and `S2R` lane 0 / LtMask (57, correct); whether the host's lanes equal id & 31 is not tested
+  (no `REQUIRE_FULL_SUBGROUPS` is set on compute pipelines: a candidate).
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with
