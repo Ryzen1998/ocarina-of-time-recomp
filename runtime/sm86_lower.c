@@ -2686,6 +2686,33 @@ static void lower_vote(L *l, const Insn *x) {
                 ((uint64_t)bits(x, 72, 2) << 48));
 }
 
+// MATCH (0x3a1): Maxwell has no warp match. The form the game uses (2026-11-10: three compute kernels from the
+// opening's Link's-house shots on, 02c47c42, 401d3e79, 9bbb91b6) is MATCH.ALL Pd, RZ, Ra: Pd tells whether every
+// active lane holds the same Ra, and the code takes a fast path then (REDUX the values, the first lane does one
+// shared atomic) and otherwise lets each lane do its own atomic. The predicate is written false, so every lane takes
+// the per-lane path: the same result, a little slower. Forms with a register result (MATCH.ANY's lane mask) or
+// other bits are not lowered.
+static void lower_match(L *l, const Insn *x) {
+    uint32_t rd = bits(x, 16, 8), pd = bits(x, 81, 3);
+    if (rd != RZ || x->w[1] || (x->w[2] & ~0x000e0000u)) return (void)fail(l, "MATCH mode");
+    if (pd != PT) emit(l, psetp(l, pd, PT, PT, PT | 8, PT, 0, 0));   // (PT & !PT) & PT
+}
+
+// ATOMS (shared-memory atomics; 2026-11-10: only the seven histogram kernels of the MATCH note above use them, in
+// two forms). 0x38c: ATOMS.ADD Rd, [Ra + imm24 at 40-63, bytes], Rb (32-39), 32-bit, words[2] zero. 0xf8c with
+// words[2] 0x0d00003f (a uniform-register address part at 64-69, here URZ): an increment by one per lane with no
+// data register (ATOMS.POPC.INC, the compiler's form of atomicAdd(&shared, 1)), lowered as an add of a scratch
+// register holding 1 (Maxwell's ATOMS.INC wraps at a limit, so it is not the same). Maxwell ATOMS (Ryujinx
+// InstAtoms): Rd 0-7, Ra 8-15, Rb 20-27, size 28-29 (0 = U32), offset in words at 30-51, operation 52-55 (0 = add).
+static void lower_atoms(L *l, const Insn *x, uint32_t op) {
+    uint32_t rd = bits(x, 16, 8), ra = bits(x, 24, 8), rb = bits(x, 32, 8);
+    int32_t off = (int32_t)(x->w[1] & 0xffffff00u) >> 8;
+    if (op == 0x38c ? x->w[2] != 0 : (x->w[2] != 0x0d00003fu || rb)) return (void)fail(l, "ATOMS mode");
+    if ((off & 3) || off < -(1 << 23) || off >= (1 << 23)) return (void)fail(l, "ATOMS offset");
+    if (op == 0xf8c) mov_imm(l, rb = S(l, 0), 1);
+    emit(l, base(l, 0xec00000000000000ull, rd, ra) | ((uint64_t)rb << 20) | ((uint64_t)((uint32_t)(off >> 2) & 0x3fffffu) << 30));
+}
+
 // FSWZADD (0x022): per-lane add/subtract pattern at 32-39; Maxwell's lane codes 1 and 2 are swapped.
 static void lower_fswzadd(L *l, const Insn *x) {
     uint32_t rd = bits(x, 16, 8), swz = x->w[1];
@@ -3425,6 +3452,8 @@ static void lower_one_inner(L *l, const Insn *x) {
     case 0x81c: return lower_plop3(l, x);
     case 0xf89: case 0x589: case 0x989: return lower_shfl(l, x, op);
     case 0x806: return lower_vote(l, x);
+    case 0x3a1: return lower_match(l, x);
+    case 0x38c: case 0xf8c: return lower_atoms(l, x, op);
     case 0x822: return lower_fswzadd(l, x);
     case 0x3c2: return lower_r2ur(l, x);
     case 0x3c4: return lower_redux(l, x);

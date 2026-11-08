@@ -480,6 +480,37 @@ reboot before the next GPU run.**
   culling kernels), and fix that kernel's address trace. Until then the defaults (window on, pushes kept, views
   reformatted) give the right picture but crash in most runs past frame ~4,000; `OOT_GW_SKIP=<the 18>` ran clean.
 
+### White flicker after Navi appears (2026-11-10, fixed)
+
+The user saw the opening flicker white from Navi's first appearance on. Measured with `OOT_SHOTS=7000-11000:2`
+and `build/logs/a-spam-long.txt` (A every 120 frames to tick 30000; `a-spam.txt` stops at tick 11880, so the dialogue
+in Link's house never advanced and earlier captures missed the scene). 0 driver resets in run-327..344.
+
+- **Symptom:** whole frames at about 240 grey-white with faint shapes (a runaway exposure, not an overlay), mixed
+  with normal frames, through Navi's flight and Link's house: 965 of 1673 captured frames in run-338. In the frames
+  before a white-out, bright areas (window light, bed edges) bloom more and more.
+- **Cause: the CPU running a frame ahead of the GPU** (`OOT_GPU_AHEAD=1`, the default until now). Every frame that
+  waited for the GPU came out normal: frame dumps, and `OOT_SHOT_RING` (it reads back every present) caught no white
+  frame in a whole run. With `OOT_GPU_AHEAD=0`: 0 white frames (run-343). Not the cause, each tested: the occlusion
+  placeholder (`OOT_OQ_VISIBLE=0`: 764), the small-target write-back (`OOT_WB_FENCE_LIMIT=0`: 1004), the
+  histogram kernels below (skipped: 965). Which data the game reads one frame later was not pinned down; the
+  brightness average (1x1 dispatch `17b87652`, 64 bytes at 0x25a4c7fc0, next to a block other passes read) is the lead.
+- **Fix:** `OOT_GPU_AHEAD` defaults to 0 (`nvn_api_obj.c`, nvnWindowAcquireTexture); `=1` brings back the old bound.
+  run-344 (plain defaults): 0 white frames in 7000-11000, 58.1 fps (1% low 40.8) in its second minute; run-343 vs
+  run-332 in the same window: 51.3 / 36.4 vs 48.5 / 29.6, so no cost. Sheet: `build/logs/white-flicker-before-after.png`.
+- **Also fixed on the way: three compute kernels never ran.** `28b1a5a6` and `c173fee3` (code hashes 1a8ccf22,
+  4d9512cd; cache inputs 9bbb91b6, 02c47c42, 401d3e79), from the opening's house shots on: the 32x24x64 bilateral
+  grid of the game's local tone mapping (dump pass 0227: luminance histogram per tile, 64 bins of sum and count; then
+  three blur passes and the final image samples it). Lowering failed on MATCH (0x3a1) and then on ATOMS (0x38c,
+  0xf8c), so every dispatch was skipped and the tone mapper read stale memory. `sm86_lower.c`: `lower_match` (the
+  game's form, MATCH.ALL Pd with RZ, written false: every lane takes the per-lane atomic path, same result) and
+  `lower_atoms` (ATOMS.ADD, and POPC.INC as an add of 1). Only 7 of the 14,576 census programs contain these;
+  all three translate and pass spirv-val. Programs that already lowered are byte-identical, so no KEY_VERSION bump.
+  The partial white of Link's head in the hat close-up (run-328, frames 8332-8350) is gone with both changes.
+- **Diagnostic:** `OOT_DUMP_WHITE_LEVEL` (default 245) for `OOT_DUMP_WHEN=white:`; the flicker frames sit at ~240.
+- **Still open:** the game stops with `rt_dispatch: no function at guest pc main+0x1661690` about 255-268 s into
+  every long replay (run-328, 330-332, 338, 341-344), after the house scene; a lifter gap, not a GPU fault.
+
 ### Partial window test (2026-11-10, morning, user-approved, one run)
 
 run-323: `OOT_GW_SKIP=af7a80ff,ac939523,164d634a` (only the three culling families off the window; the other 15 of
