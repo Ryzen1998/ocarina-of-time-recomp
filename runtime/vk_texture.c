@@ -1523,6 +1523,60 @@ static int image_texels(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t
     return 1;
 }
 
+// A readback in two halves, for batching (vk_texture_write_back_small): rb_record records the image-to-staging copy
+// into the open upload command buffer (as image_texels does for a read); after one vk_upload_flush for all of them,
+// rb_finish copies the staging texels into mem and frees the staging. The same cases as image_texels' read path.
+typedef struct {
+    Tex *e;
+    Region g;
+    NVNcopyRegion r;
+    uint8_t *mem, *stg;
+    VkBuffer sb;
+    VmaAllocation sa;
+    size_t slice, ib;
+    int rgb;
+    int32_t format;   // e->t.d.format at record time (e may be gone by rb_finish)
+} Readback;
+static int rb_record(Tex *e, const Region *g, const NVNcopyRegion *r, uint8_t *mem, Readback *o) {
+    VkImageAspectFlags aspect;
+    if (e->f.astc_bw || !read_aspect(e, &aspect) || g->level >= e->pub.levels) return 0;
+    uint32_t w = (uint32_t)r->width, h = (uint32_t)r->height;
+    int rgb = e->f.expand_rgb;
+    size_t ib = rgb ? (size_t)g->bpb / 3 * 4 : 0, slice = ib ? (size_t)w * h * ib : g->wb * g->hb;
+    *o = (Readback){.e = e, .g = *g, .r = *r, .mem = mem, .slice = slice, .ib = ib, .rgb = rgb, .format = (int32_t)e->t.d.format};
+    o->stg = vk_staging(slice * (size_t)g->nz, &o->sb, &o->sa);
+    VkBufferImageCopy *rg = calloc((size_t)g->nz, sizeof *rg);
+    if (!rg) rt_fatal("vk: out of memory for a texture readback");
+    for (int z = 0; z < g->nz; z++)
+        rg[z] = (VkBufferImageCopy){.bufferOffset = slice * (size_t)z,
+                                    .imageSubresource = {aspect, g->level, g->is3d ? 0 : g->layer0 + (uint32_t)r->zoffset + (uint32_t)z, 1},
+                                    .imageOffset = {r->xoffset, r->yoffset, g->is3d ? r->zoffset + z : 0},
+                                    .imageExtent = {w, h, 1}};
+    VkCommandBuffer cb = vk_upload_begin();
+    barrier(cb, ALL_RW, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+    vkCmdCopyImageToBuffer(cb, e->pub.image, VK_IMAGE_LAYOUT_GENERAL, o->sb, (uint32_t)g->nz, rg);
+    barrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT,
+            VK_ACCESS_2_HOST_READ_BIT);
+    vk_upload_end();
+    free(rg);
+    return 1;
+}
+static void rb_finish(Readback *o) {
+    VkCtx *c = vk_ctx();
+    const Region *g = &o->g;
+    uint32_t w = (uint32_t)o->r.width;
+    vmaInvalidateAllocation(c->vma, o->sa, 0, VK_WHOLE_SIZE);
+    for (int z = 0; z < g->nz; z++) {
+        const uint8_t *s = o->stg + o->slice * (size_t)z;
+        uint8_t *m = o->mem + (size_t)z * g->img;
+        for (size_t y = 0; y < g->hb; y++) {
+            if (o->rgb) shrink_rgb(o->format, s + y * w * o->ib, m + y * g->row, w);
+            else memcpy(m + y * g->row, s + y * g->wb, g->wb);
+        }
+    }
+    vmaDestroyBuffer(c->vma, o->sb, o->sa);
+}
+
 static void zero_rows(const Region *g, uint8_t *dst) {
     for (int z = 0; z < g->nz; z++)
         for (size_t y = 0; y < g->hb; y++) memset(dst + (size_t)z * g->img + y * g->row, 0, g->wb);
@@ -1611,6 +1665,61 @@ static void write_back(Tex *e) {
             free(buf);
         }
     e->gpu_dirty = 0;
+}
+
+// write_back for several textures with one submission and one wait: every level and layer's readback is recorded
+// first (rb_record), then one vk_upload_flush, then the texels go to storage in the given order (2026-11-10: the fence
+// write-back did one submit-and-wait per target, ~3 ms each behind the frame's GPU work, under the texture lock).
+// unlocked (OOT_WB_UNLOCKED=1, default off): tex_lock is held on entry; it is released for the GPU wait only and taken
+// again to write each target's texels, which happens only if its entry is still the one registered for its key (it
+// may have been destroyed meanwhile; its image is not, image destruction waits for the upload batches). gpu_dirty is
+// cleared before the wait, so a GPU write recorded meanwhile marks the target again and the next write-back sends it.
+static void write_back_batch(Tex **hit, int k, int unlocked) {
+    int n = 0, cap = 0;
+    Readback *rb = NULL;
+    for (int i = 0; i < k; i++) {
+        Tex *e = hit[i];
+        const nvn_texdesc *d = &e->t.d;
+        int linear = nvn_tex_is_linear(d), is3d = d->target == NVN_TEXTURE_TARGET_3D;
+        uint32_t levels = linear ? 1 : e->pub.levels, layers = linear || is3d ? 1 : e->pub.layers;
+        for (uint32_t lv = 0; lv < levels; lv++)
+            for (uint32_t ly = 0; ly < layers; ly++) {
+                view_t v = {.set_levels = 1, .set_layers = 1, .base_level = (uint8_t)lv, .min_layer = (uint16_t)ly};
+                NVNcopyRegion r = {.width = (int)mip(d->width, lv),
+                                   .height = d->target == 0 || d->target == 3 ? 1 : (int)mip(d->height, lv),
+                                   .depth = is3d ? (int)mip(d->depth, lv) : 1};
+                Region g;
+                if (!region_of(&e->t, &v, &r, 0, 0, &g)) continue;
+                uint8_t *buf = malloc(g.img * (size_t)g.nz);
+                if (!buf) rt_fatal("vk: out of memory for a texture write-back");
+                if (n == cap) {
+                    cap = cap ? 2 * cap : 16;
+                    rb = realloc(rb, sizeof *rb * (size_t)cap);
+                    if (!rb) rt_fatal("vk: out of memory for a texture write-back");
+                }
+                if (rb_record(e, &g, &r, buf, &rb[n])) n++;
+                else free(buf);
+            }
+    }
+    TexKey *keys = NULL;
+    if (unlocked && n) {
+        keys = malloc(sizeof *keys * (size_t)n);
+        if (!keys) rt_fatal("vk: out of memory for a texture write-back");
+        for (int i = 0; i < n; i++) keys[i] = rb[i].e->key;
+    }
+    for (int i = 0; i < k; i++) hit[i]->gpu_dirty = 0;
+    if (unlocked && n) unlock();
+    if (n) vk_upload_flush(1);
+    if (unlocked && n) lock();
+    for (int i = 0; i < n; i++) {
+        rb_finish(&rb[i]);
+        Tex *e = rb[i].e;
+        if (!unlocked || (nvn_hm_get(&by_key, &keys[i]) == e && !e->released))
+            storage_texels(&e->t, &rb[i].g, &rb[i].r, rb[i].mem, 1);
+        free(rb[i].mem);
+    }
+    free(keys);
+    free(rb);
 }
 
 // Mirrored textures overlapping [addr, addr+size) that the GPU wrote since their last write-back.
@@ -1763,7 +1872,30 @@ void vk_texture_write_back_small(uint64_t fence) {
             Tex *x = hit[j];
             hit[j] = hit[j - 1], hit[j - 1] = x;
         }
-    for (int i = 0; i < k; i++) {
+    static int batch = -1;   // OOT_WB_BATCH=0: one submit and wait per target, as before
+    if (batch < 0) { const char *eb = getenv("OOT_WB_BATCH"); batch = !(eb && eb[0] == '0'); }
+    if (batch && k) {
+        LARGE_INTEGER a, b, f;
+        if (lock_log) QueryPerformanceCounter(&a);
+        // OOT_WB_UNLOCKED=1: release the texture lock for the batch's GPU wait. Off by default: measured no gain
+        // (run-312: the render thread then waits on the upload path's lock, which vk_upload_flush holds while waiting).
+        static int unlocked = -1;
+        if (unlocked < 0) { const char *eu = getenv("OOT_WB_UNLOCKED"); unlocked = eu && eu[0] == '1'; }
+        write_back_batch(hit, k, unlocked);
+        if (lock_log) {
+            static double ms_acc;
+            static uint64_t calls, t_last;
+            QueryPerformanceCounter(&b), QueryPerformanceFrequency(&f);
+            ms_acc += (double)(b.QuadPart - a.QuadPart) * 1000.0 / (double)f.QuadPart, calls++;
+            uint64_t now = GetTickCount64();
+            if (!t_last) t_last = now;
+            if (now - t_last >= 10000) {
+                rt_log("tex lock: batched fence write-backs: %llu calls in 10 s, %.1f ms", (unsigned long long)calls, ms_acc);
+                ms_acc = 0, calls = 0, t_last = now;
+            }
+        }
+    }
+    for (int i = 0; i < k && !(batch && k); i++) {   // the per-target path (OOT_WB_BATCH=0)
         LARGE_INTEGER a, b, f;
         if (lock_log) QueryPerformanceCounter(&a);
         write_back(hit[i]);

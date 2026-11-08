@@ -555,6 +555,14 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   without holding the lock the writer needs, and `gpu_dirty` may only be cleared if `gpu_seq` did not move during
   the readback (a racing GPU write would otherwise be lost); (3) skip targets the CPU never reads (needs a read
   watch to know which).
+  Done: (1), batching (`write_back_batch`, default on, `OOT_WB_BATCH=0` = one submit and wait per target). Level
+  minute of four runs (run-311, 313, 314, with run-312 below): 47.0-47.9 fps, 1% low 29.0-31.2 (before ~46.7 / 26);
+  pictures correct (`build/logs/wbbatch.png`, noise 0.80); runs clean. (2) is in as `OOT_WB_UNLOCKED=1` (off): it
+  releases the texture lock for the one GPU wait and writes texels only for entries still registered under their
+  key, but gains nothing (run-312, 46.9 fps, replay 21.0 ms): `vk_upload_flush` holds the upload path's own lock
+  while it waits, and the render thread uploads too, so it waits there instead. The real fix is the GPU-side copy
+  at the end of the writing submission (design (b) above), so no CPU thread waits on the queue; `OOT_WB_FENCE_LIMIT=0`
+  shows its size (56 fps, 1% low 42).
 - `OOT_CPU_WATCH=<lo>:<hi>` (new diagnostic, `memory.c`): CPU writes into a range by host instruction, via read-only
   pages and a single step. run-301 (safe configuration) over 0x29bc00000..0x29bc20000: the CPU never writes the
   foliage contact records there; the only writes zero two small blocks at 0x29bc1a000 / 0x29bc1d000 each frame. The
