@@ -529,8 +529,13 @@ costs ~8% there (17.7 vs 16.3 fps). VRAM over budget all the time: 16-18 of 15.1
 - New `OOT_WB_LOG=1` (vk_memory.c): per frame the mirror writes back ~90 MiB and uploads ~113 MiB, mostly the SAME
   ranges both ways: 0x29e6eb000 and 0x29d7b6000 (0xf33080 each), 0x25ea76000 (0x980000), 0x29be5e000/0x29c4b4000/
   0x29cb0a000/0x29d160000 (0x654040). A write-back is the whole bound range of a storage binding a shader may write.
-  Open: whether the CPU rewrites them each frame or the upload echoes our own write-back (write-watch seeing the
-  copy). `OOT_CPU_WATCH` on that range slowed the run to 3.5 fps from the title and logged nothing: not usable there.
+  Not an echo: write watch does not see GPU writes (`--probe-vkmem`: 0 of 32 pages). Part of the upload was the
+  game's flushes (`nvnMemoryPoolFlushMappedRange`, 47 MiB a frame, whole buffers), which `mirror_sync` uploaded whole.
+  **Fix (vk_memory.c mirror_sync, de2eb24):** a flushed range in write-watch-tracked regions is left to write watch
+  (the pages the CPU wrote go up anyway); untracked ones still go up whole; `OOT_MIRROR_FLUSH_ALL=1` = old. run-357 vs
+  run-351, same scene: upload 78 -> 66 MiB a frame, GPU 30 -> 25.3 ms, **22.3 -> 25.3 fps, 1% low 14.7 -> 22.0**;
+  picture equal (shot_diff noise 0.74 both, PSNR 34 dB, `build/logs/flush-side.png`). The rest of the upload is pages
+  write watch reports written. `OOT_CPU_WATCH` on that range slowed the run to 3.5 fps from the title: not usable.
 - Not the cause: pipeline builds, shader translation, texture uploads, fence pacing (all ~0 in `OOT_TRACE=perf`).
 
 Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
