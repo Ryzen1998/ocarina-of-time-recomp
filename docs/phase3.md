@@ -508,8 +508,34 @@ in Link's house never advanced and earlier captures missed the scene). 0 driver 
   all three translate and pass spirv-val. Programs that already lowered are byte-identical, so no KEY_VERSION bump.
   The partial white of Link's head in the hat close-up (run-328, frames 8332-8350) is gone with both changes.
 - **Diagnostic:** `OOT_DUMP_WHITE_LEVEL` (default 245) for `OOT_DUMP_WHEN=white:`; the flicker frames sit at ~240.
-- **Still open:** the game stops with `rt_dispatch: no function at guest pc main+0x1661690` about 255-268 s into
-  every long replay (run-328, 330-332, 338, 341-344), after the house scene; a lifter gap, not a GPU fault.
+- **Confirmed by the user** watching run-345 (plain defaults, 250 s, 0 driver resets): "it looks almost perfect".
+- **Open (user, run-345): black particles float around the Deku Tree.** Not looked at yet.
+- **Fixed later the same day (next section):** the stop at `main+0x1661690` after the house scene.
+
+### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
+
+Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with
+`rt_dispatch: no function at guest pc main+0x1661690: not a function start (lr main+0x1661690)`.
+
+- **Cause:** main imports `setjmp` and `longjmp` (resolved to the SDK's, sdk+0xaec40 / +0xaed50); the earlier ports'
+  games did not (MP4's `recomp/regs.py` note). `main+0x1661670` calls `setjmp` through its import stub
+  `main+0x3c44140` (GOT slot 0x4cc0268); later a `longjmp` returns to the instruction after that call. Lifted code
+  mirrors the guest's call stack on the host (a call is a host call, `ret` a host return), so that address is in
+  the middle of a lifted function and the dispatcher has no entry there; the host frames longjmp should drop would
+  also stay.
+- **Fix (generator and runtime, no generated C edited):** `recomp/module.py` finds the setjmp and longjmp
+  definitions and the PLT stubs bound to them (`setjmp_targets`, `longjmp_functions`) and seeds the return address
+  of every call to a setjmp as a function start (`setjmp_returns`: 3 in main, 10 in the SDK, its PNG decoder).
+  `recomp/gen.py` lifts such a call as `rt_setjmp_site(c, setjmp, continuation); return;` and the body of longjmp
+  (and its stubs) as `rt_guest_longjmp(c)`. `runtime/kernel.c`: the site's host frame calls the guest setjmp, then
+  the continuation (the rest of the calling function); `rt_guest_longjmp` restores what the SDK's setjmp saved
+  (x19-x28 at 0x00, x29 0x50, sp 0x68, d8-d15 0x70; x30 at 0x58 is PAC-signed, the site's return address is
+  used), sets x0, and host-longjmps to the newest live site for the buffer (one stack of sites per Cpu); without one
+  it stops with a message naming the buffer.
+- **Check:** run-346 (plain defaults, `a-spam-long.txt`, 330 s): no stop, 14,255 frames, script tick 19,683, 0 driver
+  resets; 57.1 fps (1% low 38.5) in its second minute. Regenerate with `recomp/gen.py --exefs
+  build/extracted/v131072/exefs --out generated/v131072 --modules main,subsdk0,sdk` before `tools/build_game.py`
+  (build_game.py compiles only).
 
 ### Partial window test (2026-11-10, morning, user-approved, one run)
 

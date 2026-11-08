@@ -1581,6 +1581,77 @@ static void thread_finish(RtThread *t) {
 // is offset, and the landing code then reads its locals through the wrong base.)
 static __attribute__((noreturn)) void exit_now(RtThread *t) { longjmp(t->exit_jmp, 1); }
 
+// ---- guest setjmp / longjmp (2026-11-10)
+// Lifted code mirrors the guest's call stack on the host's: a guest call is a host call, a guest ret a host return.
+// longjmp breaks that: it jumps back to the instruction after a setjmp call, in the middle of a lifted function, and
+// unwinds every frame in between. OOT's main imports both (the SDK's, sdk+0xaec40 / +0xaed50); its first longjmp,
+// after the opening's house scene, stopped the game with "no function at guest pc main+0x1661690" (the return address
+// of the setjmp call in main+0x1661670). recomp/gen.py makes the return address of every call to a setjmp a function
+// start and lifts the call as rt_setjmp_site, whose host frame stands in for the rest of the calling function: it
+// calls the guest setjmp, then that continuation. The SDK's longjmp is lifted as rt_guest_longjmp: it restores what the
+// guest setjmp saved (sdk setjmp: x19-x28 at 0x00, x29 at 0x50, sp at 0x68, d8-d15 at 0x70; x30 at 0x58 is PAC-signed,
+// so the site's return address is used) and returns to the site with a host longjmp, which drops the host frames of
+// the guest frames longjmp drops. Sites of one Cpu form a stack; a longjmp drops the sites above its target.
+typedef struct SjSite {
+    jmp_buf jb;
+    struct SjSite *up;   // the next older site of this Cpu
+    Cpu *c;
+    uint64_t buf, ret, sp;
+} SjSite;
+enum { SJ_CPUS = 512 };
+static struct { Cpu *c; SjSite *top; } sj_tab[SJ_CPUS];
+static SRWLOCK sj_lock = SRWLOCK_INIT;
+
+static SjSite **sj_top(Cpu *c) {   // sj_lock held; the slot of c, made if needed
+    int free_i = -1;
+    for (int i = 0; i < SJ_CPUS; i++) {
+        if (sj_tab[i].c == c) return &sj_tab[i].top;
+        if (free_i < 0 && !sj_tab[i].top) free_i = i;
+    }
+    if (free_i < 0) rt_fatal("setjmp: more than %d threads with live setjmp sites", SJ_CPUS);
+    sj_tab[free_i].c = c;
+    return &sj_tab[free_i].top;
+}
+
+void rt_setjmp_site(Cpu *c, GuestFn setjmp_fn, GuestFn cont) {
+    SjSite s = {.c = c, .buf = c->x[0], .ret = c->x[30], .sp = c->sp};
+    AcquireSRWLockExclusive(&sj_lock);
+    SjSite **top = sj_top(c);
+    s.up = *top;
+    *top = &s;
+    ReleaseSRWLockExclusive(&sj_lock);
+    if (!setjmp(s.jb)) setjmp_fn(c);   // the guest setjmp: saves the registers into buf, x0 = 0
+    // Here first after the guest setjmp, again after a longjmp to buf (rt_guest_longjmp set x0 and the registers).
+    cont(c);
+    AcquireSRWLockExclusive(&sj_lock);
+    top = sj_top(c);
+    if (*top == &s) *top = s.up;       // a longjmp to an older site may have dropped it already
+    ReleaseSRWLockExclusive(&sj_lock);
+}
+
+void rt_guest_longjmp(Cpu *c) {
+    uint64_t buf = c->x[0], val = c->x[1];
+    AcquireSRWLockExclusive(&sj_lock);
+    SjSite **top = sj_top(c), *s = *top;
+    char *here = (char *)__builtin_frame_address(0);
+    // The newest live site of this Cpu for buf: its host frame is still on this stack (above the caller's).
+    while (s && !(s->buf == buf && (char *)s > here && LD64(buf + 0x68) == s->sp)) s = s->up;
+    if (s) *top = s;                   // the sites above it belong to the frames longjmp drops
+    ReleaseSRWLockExclusive(&sj_lock);
+    if (!s) {
+        char at[64];
+        rt_fatal("longjmp to %#llx with no live setjmp site for it (lr %s)", (unsigned long long)buf,
+                 rt_guest_name(c->x[30], at, sizeof at));
+    }
+    for (int i = 0; i < 10; i++) c->x[19 + i] = LD64(buf + 8 * (uint64_t)i);
+    c->x[29] = LD64(buf + 0x50);
+    c->x[30] = s->ret;
+    c->sp = LD64(buf + 0x68);
+    for (int i = 0; i < 8; i++) c->v[8 + i] = LD64(buf + 0x70 + 8 * (uint64_t)i);
+    c->x[0] = val ? val : 1;
+    longjmp(s->jb, 1);
+}
+
 // The calling host thread, for ap_try (OOT_ASYNC_PREEMPT only).
 static HANDLE ap_open_self(void) {
     if (!cores_enabled() || !g_ap_int) return NULL;

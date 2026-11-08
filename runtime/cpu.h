@@ -41,6 +41,9 @@ void rt_svc(Cpu *c, uint32_t imm, uint64_t pc);
 void rt_brk(Cpu *c, uint32_t imm, uint64_t pc) __attribute__((noreturn));
 void rt_udf(Cpu *c, uint64_t pc) __attribute__((noreturn));
 uint64_t rt_ticks(void);
+// Guest setjmp/longjmp (kernel.c; recomp/gen.py lifts calls to a setjmp and the body of longjmp as these).
+void rt_setjmp_site(Cpu *c, GuestFn setjmp_fn, GuestFn cont);
+void rt_guest_longjmp(Cpu *c) __attribute__((noreturn));
 
 #if defined(__aarch64__)
 static inline uint64_t rt_get_fpcr(void) { uint64_t v; __asm__ volatile("mrs %0, fpcr" : "=r"(v)); return v; }

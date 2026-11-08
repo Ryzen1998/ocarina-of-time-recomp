@@ -341,6 +341,13 @@ class Emitter:
     def function(self, entry, end):
         """(lines of C, referenced function starts) for the guest function [entry, end)."""
         mod, starts = self.mod, self.starts
+        setjmps = mod.setjmp_targets()
+        if entry in mod.longjmp_functions():
+            # longjmp (the SDK's, and import stubs bound to it): runtime/kernel.c rt_guest_longjmp returns to the
+            # setjmp site with a host longjmp; the lifted body would branch into the middle of a lifted function.
+            self.stats['functions'] += 1
+            self.stats['longjmp_functions'] += 1
+            return [f'void {fname(entry)}(Cpu *c) {{', f'    FN_ENTER({hx(entry)});', '    rt_guest_longjmp(c);', '}'], set()
         insns = [mod.lift(a) for a in range(entry, end, 4)]
         labels, tables = self.scan(insns, entry, end)
         refs = set()
@@ -397,6 +404,15 @@ class Emitter:
                 out.append('    ' + fp.decl())
 
         def call(t, a):
+            if t in setjmps:
+                # A call to a setjmp (runtime/kernel.c rt_setjmp_site): its return address is a function start
+                # (Module.setjmp_returns), the rest of this function; the site's host frame calls the guest setjmp, then
+                # that continuation, whose return is this function's. A longjmp returns to the site.
+                if a + 4 != end or a + 4 not in starts:
+                    raise ValueError(f'{a:#x}: setjmp call is not followed by a function start')
+                refs.update((t, a + 4))
+                self.stats['setjmp_sites'] += 1
+                return f'c->x[30] = {hx(a + 4)}; {spill}rt_setjmp_site(c, {fname(t)}, {fname(a + 4)}); return;'
             if t in starts:
                 refs.add(t)
                 return f'c->x[30] = {hx(a + 4)}; {spill}{fname(t)}(c);{reload_call}'
