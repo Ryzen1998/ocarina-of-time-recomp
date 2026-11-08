@@ -956,6 +956,11 @@ static uint32_t up_fields(const Insn *x) {
         case 0x08c: fields = 0x1d; break;
         case 0x087: fields = 0x10; break;
         case 0x086: fields = 0x04; break;
+        // ULOP3: its predicate output at 81 (and input at 87). Missing until 2026-11-10: in up_swap mode the result went
+        // to the real predicate of that number and the uniform one kept its old value; foliage kernel d0bb3a4c then
+        // wrote its "which list" bit as 0 always, and the game crashed at main+0xc938d0 on a type of the other list.
+        case 0x092: fields = 0x14; break;
+        case 0x085: fields = 0x10; break;   // UIMNMX: its select predicate at 87, the same gap
         case 0x09c: fields = 0x1f; break;
         case 0x083: if (op == 0x883) m |= x->w[1] & 0x7f; break;   // UP2R: the mask names them
         default: break;
@@ -2851,6 +2856,10 @@ static void lower_uniform_alu(L *l, const Insn *x, uint32_t op) {
             if (v != 7) y.w[2] = (y.w[2] & ~(7u << (f - 64))) | (up(l, v) << (f - 64));
         }
     }
+    if (plain == 0x017) {   // UIMNMX: its select predicate at 87 is a uniform one too (2026-11-10)
+        uint32_t v = bits(x, 87, 3);
+        if (v != 7) y.w[2] = (y.w[2] & ~(7u << 23)) | (up(l, v) << 23);
+    }
     uint32_t nop = y.w[0] & 0xfff;
     switch (plain) {
     case 0x017: return lower_imnmx(l, &y);
@@ -3674,6 +3683,15 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
         uint32_t w0, w1;
         memcpy(&w0, code + i, 4), memcpy(&w1, code + i + 4, 4);
         if ((w0 & 0xfff) == 0x808 && w1 && !(w1 & 0xfff)) { tag ^= 0x6673656c696d6d31ull; break; }   // "fselimm1"
+    }
+    // And a program with a ULOP3 that writes a uniform predicate, or a UIMNMX that selects on one (up_fields, 2026-11-10).
+    for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
+        uint32_t w0, w2;
+        memcpy(&w0, code + i, 4), memcpy(&w2, code + i + 8, 4);
+        if (((w0 & 0x1ff) == 0x092 && ((w2 >> 17) & 7) != 7) || ((w0 & 0x1ff) == 0x085 && ((w2 >> 23) & 7) != 7)) {
+            tag ^= 0x756c6f7033757031ull;   // "ulop3up1"
+            break;
+        }
     }
     return tag;
 }

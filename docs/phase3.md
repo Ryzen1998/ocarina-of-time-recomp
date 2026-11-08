@@ -591,6 +591,24 @@ After the reboot (02:01), runs run-274 to run-280, 0 driver resets.
   pool (`OOT_DUMP_BUF` refuses it), so the GPU list is the 0x2000 bytes at 0x29bc1a000. The level-frame snapshot of
   it (frame 3500) did not happen: that run crashed at 32 s (frame ~750). Next: the same snapshot at frame 3500 (or
   `OOT_DUMP=when` armed by the first non-zero header), repeated until a run reaches the frame.
+- **The ULOP3 lowering gap** (research report 14c/14d; fixed in `sm86_lower.c`): `up_fields()` had no case for ULOP3
+  (0x092), so in up_swap mode a ULOP3's uniform-predicate output went to the real predicate of that number and the
+  uniform one kept its old value; UIMNMX (0x085) had the same gap for its select predicate at 87 (and outside swap
+  mode its predicate was not renamed through `up()` at all). Both are in now; programs with such an instruction get
+  their own cache key (`sm86_probe_tag` "ulop3up1"; 37 of 1,706 stored programs per the report, including six of the
+  18 window users and the culling kernels 68e84b77, 75dc8d60, 027a50b7). d0bb3a4c, 289f0e4f, 227f330b, 68e84b77 and
+  1b4d7f5f lower and validate. Default runs (run-317, run-318) are clean.
+- **The crash survives it** (run-315/316, full window, game crash only, 0 resets). `OOT_SM86_COUNT` on d0bb3a4c
+  (code hash 9eed67bcda1aaccf): the kind word at 0x6eb0 is 8 or 0 in every thread, never odd, so its list bit
+  (`USEL UR4 = UP2 ? 1 : 0`, UP2 = `(UR12 & 1) != 0` at 0x450) is still 0. UR12 is R17, loaded at 0x2d0 from
+  **word 3 (+0xc) of row 0x83 of the per-object record** (the same record table the shadow culling reads through
+  the c4 pointer cells, `(index * 4 + 0x83) * 16`). So the list bit is per-object data that reads 0 on our side.
+  Earlier dumps showed the CPU and GPU copies of that table differing (+0x38 set on the GPU only). Next: snapshot
+  that record word on both sides (`OOT_DUMP_BUF` on the table, `cpu_*.bin` vs `buf_*.bin`) and find who sets bit 0.
+- The tensor probe (`--probe-tensor`) fails in every switch configuration tried (window off, pointers off, old FSEL,
+  old push, old views): its test kernel's plain global loads read zeros, so the harness's buffer addressing broke at
+  some point (likely the bank-0 layout changes of 2026-11-06/07), not the tensor path. The game's own HMMA kernels
+  (the upscaler) render correctly. Open, separate.
 - **The crash's precise cause** (crash report now prints the foliage manager, run-296 with `OOT_GW_SKIP=none`):
   kind-0 foliage types: 76; kind-1 types: 203. The crashing record says kind 0 with type 86 (0x56) or 191 (0xbf),
   types that exist only in the kind-1 table (their kind-1 slots are filled; kind-0 slots past 75 are garbage or 0).
