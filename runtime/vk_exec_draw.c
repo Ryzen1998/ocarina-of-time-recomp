@@ -1022,6 +1022,8 @@ static uint32_t ptr_count(int st);
 static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
 static struct { uint64_t addr, size; } GW[VK_GW_N];   // the global window (gw_select, below)
 static uint32_t gw_n;
+// getenv takes the CRT's lock and walks the environment: on a path run per draw it was 7% of the render thread by Saria (2026-11-09).
+#define ENV_ONCE(name) ({ static const char *v_; static int got_; if (!got_) v_ = getenv(name), got_ = 1; v_; })
 static int cnt_on(void);
 static void mesh_c0(const VkExec *ex, uint8_t bank[VK_C0_BYTES]) {
     for (uint32_t k = 0; k < 16 && M.table + 16 * k + 16 <= VK_C0_BYTES; k++) {   // the stage's storage slots
@@ -1454,7 +1456,7 @@ static void gw_select_inner(VkExec *ex, const VkPipeInfo *info) {
     // OOT_GW_TRACE=<input id prefix> (diagnostic): for that kernel, every 300 frames, what its first checks read on the
     // CPU side: uniform block 0 at 0x650..0x6f0 (e6d5432f: per-type thresholds and the count its threads stop at) and
     // each pointer in uniform block 1 followed twice, with the word at + 4 (the per-type object count).
-    const char *tr = getenv("OOT_GW_TRACE");
+    const char *tr = ENV_ONCE("OOT_GW_TRACE");
     char hex[17];
     shader_hex(C1CUR[NVN_STAGE_CS], hex);
     static uint64_t last_tr;
@@ -1953,14 +1955,14 @@ static VkDescriptorBufferInfo ssbo_info(VkExec *ex, int st, const GfxShaderRes *
         if (bind_range(ex, b->addr - lead, b->size ? b->size + lead : 0, align, max, ubo ? VK_MUSE_UBO : VK_MUSE_SSBO,
                        written && !gw, &bi)) {
             if (st == NVN_STAGE_CS && !gw) gwr_note(b->addr, b->size);   // a place pointers in memory can name (gw_select)
-            if (gw && getenv("OOT_GW_TRACE")) {   // the window binding as made (diagnostic)
+            if (gw && ENV_ONCE("OOT_GW_TRACE")) {   // the window binding as made (diagnostic)
                 static uint64_t lastf;
                 static int nthis;
                 uint64_t fr = gfx_stats().frames;
                 char hx[17];
                 shader_hex(C1CUR[st], hx);
                 if (fr != lastf) lastf = fr, nthis = 0;
-                if (!strncmp(hx, getenv("OOT_GW_TRACE"), strlen(getenv("OOT_GW_TRACE"))) && fr % 300 < 2 && nthis++ < 24)
+                if (!strncmp(hx, ENV_ONCE("OOT_GW_TRACE"), strlen(ENV_ONCE("OOT_GW_TRACE"))) && fr % 300 < 2 && nthis++ < 24)
                     rt_log("gwtrace: f%llu %s window c0+%#x -> %#llx+%#llx bound at buffer offset %#llx range %#llx (lead %#llx, written %d)",
                            (unsigned long long)fr, hx, (uint32_t)r->handle * 4, (unsigned long long)b->addr, (unsigned long long)b->size,
                            (unsigned long long)bi.offset, (unsigned long long)bi.range, (unsigned long long)lead, written);
@@ -3782,7 +3784,7 @@ static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t gr
 // id starts with one of the prefixes, or (!) of all but those, are not recorded; for finding the kernel behind a GPU timeout (2026-11-06: the
 // Kokiri Forest level loses the device on its first frames). Logs each shader it skips once.
 static int skip_cs(const GfxShader *cs) {
-    const char *e = getenv("OOT_SKIP_CS");
+    const char *e = ENV_ONCE("OOT_SKIP_CS");
     if (!e || !*e) return 0;
     char hex[17];
     const uint8_t *id = gfx_shader_input_id(cs);
@@ -4069,7 +4071,7 @@ static void mesh_rb_done(VkExec *ex, int slot, uint32_t kind, uint32_t a, uint32
     VkMemSpan sp;
     if (ind && vk_mem_resolve(ind, 16, &sp)) memcpy(r->cpu, (const void *)(uintptr_t)ind, 16);
     (void)ex;
-    if (getenv("OOT_MESH_SYNC")) {
+    if (ENV_ONCE("OOT_MESH_SYNC")) {
         if (mesh_nheld < 64) mesh_held[mesh_nheld++] = r;
         else free(r);
         return;
@@ -4556,7 +4558,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
         }
         // Nothing is skipped by default since 2026-11-09: the mesh program 072eb70d (a11f465b) was drawing at positions from loads that read 0
         // (SM86_PTR_C0_MESH), the black and white blocks of 2026-11-08.
-        const char *skip = getenv("OOT_MESH_IND_SKIP");
+        const char *skip = ENV_ONCE("OOT_MESH_IND_SKIP");
         if (!skip) skip = "";
         for (const char *p = skip; p && *p;) {
             size_t k = strcspn(p, ",");
@@ -4566,7 +4568,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
             p += k + (p[k] == ',');
         }
         // OOT_MESH_IND_ONLY=<hex>[,<hex>...]: only the draws whose mesh (or task) program hash starts with one of these.
-        const char *only = getenv("OOT_MESH_IND_ONLY");
+        const char *only = ENV_ONCE("OOT_MESH_IND_ONLY");
         if (only && *only) {
             int hit = 0;
             for (const char *p = only; *p && !hit;) {
@@ -4673,7 +4675,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     int okt = !has_task || mesh_dispatch(ex, 0, tasks);
     if (okt && mt) mesh_compact(ex), M.mi = 1;
     int ok = okt && mesh_dispatch(ex, 1, groups);
-    if (getenv("OOT_MESH_LOG")) {   // which programs ran, and the task stage's uniform slot 0 as the game left it
+    if (ENV_ONCE("OOT_MESH_LOG")) {   // which programs ran, and the task stage's uniform slot 0 as the game left it
         static volatile LONG n;
         if (InterlockedIncrement(&n) <= 12) {
             uint64_t ht = 0, hm = 0;
@@ -4714,7 +4716,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
         vk_dump_note("mesh draw (%s, %d): task %016llx mesh %016llx, %u groups, stages ran %d", indirect ? "indirect" : "direct",
                      d->count, (unsigned long long)hq[0], (unsigned long long)hq[1], groups, ok);
     }
-    if (ok && !getenv("OOT_MESH_NODRAW")) mesh_draw(ex, mesh, groups);
+    if (ok && !ENV_ONCE("OOT_MESH_NODRAW")) mesh_draw(ex, mesh, groups);
     M.mi = 0, M.map = 0;
     int slot = ok ? mesh_rb_slot() : -1;
     if (slot >= 0) {
