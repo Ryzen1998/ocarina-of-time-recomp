@@ -4444,6 +4444,9 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     vk_exec_barrier(ex);
     vkCmdFillBuffer(ex->cb, M.buf, 0, M.task_size, 0);   // a task record no task wrote asks for no meshes
     ex->recorded++;
+    static int mesh_clear = -1;   // OOT_MESH_CLEAR=1 (diagnostic): the mesh records too, to tell unwritten vertices from wrong ones
+    if (mesh_clear < 0) mesh_clear = getenv("OOT_MESH_CLEAR") != NULL;
+    if (mesh_clear) vkCmdFillBuffer(ex->cb, M.buf, M.task_size, M.mesh_size, 0), ex->recorded++;
     if (!has_task) {
         vk_exec_barrier(ex);   // transfers are not ordered among themselves: the fill could land after the update
         // a mesh-only draw: one stand-in task whose count (+4) asks for every mesh group (an indirect draw: its count).

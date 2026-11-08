@@ -1670,11 +1670,24 @@ static void lower_shf(L *l, const Insn *x, uint32_t op) {
     uint64_t max = (uint64_t)(type == 3 ? 0 : 2) << 37;
     if (imm) {
         if (amount > 63) return (void)fail(l, "SHF immediate");
+        if (amount == 0) return mov_reg(l, rd, right ? low : high);   // the translator's other half would shift by 32
         emit(l, base(l, right ? 0x38f8000000000000ull : 0x36f8000000000000ull, rd, low) | ((uint64_t)amount << 20) |
                     ((uint64_t)high << 39) | max | ((uint64_t)wrap << 50));
     } else {
-        emit(l, base(l, right ? 0x5cf8000000000000ull : 0x5bf8000000000000ull, rd, low) | ((uint64_t)rb << 20) |
+        // A shift of 0 gives the low word (right) or the high word (left), but the translator ORs in the other word
+        // shifted by 32 - 0, which SPIR-V leaves undefined and the host does as a shift by 0. The meshlet indices of the
+        // object programs sit at bit offsets that are sometimes a multiple of 32 (stray triangles, 2026-11-08). So:
+        // nz = (s | -s) >> 31 (all ones unless s == 0), result = (funnel & nz) | (word & ~nz).
+        uint32_t f = S(l, 3), nz = S(l, 4), w = S(l, 5), sh = rb;
+        if (wrap) { sh = S(l, 6); lop_imm(l, sh, rb, type == 3 ? 31 : 63, 0); }
+        emit(l, base(l, right ? 0x5cf8000000000000ull : 0x5bf8000000000000ull, f, low) | ((uint64_t)rb << 20) |
                     ((uint64_t)high << 39) | max | ((uint64_t)wrap << 50));
+        emit(l, base(l, 0x5c10000000000000ull, nz, RZ) | ((uint64_t)sh << 20) | ((uint64_t)1 << 48));   // 0 - s
+        emit(l, base(l, 0x5c40000000000000ull, nz, nz) | ((uint64_t)sh << 20) | ((uint64_t)1 << 41) | ((uint64_t)PT << 48));   // | s
+        emit(l, base(l, 0x3829000000000000ull, nz, nz) | ((uint64_t)31 << 20));   // >> 31, arithmetic
+        emit(l, base(l, 0x5c40000000000000ull, f, f) | ((uint64_t)nz << 20) | ((uint64_t)PT << 48));
+        emit(l, base(l, 0x5c40000000000000ull, w, right ? low : high) | ((uint64_t)nz << 20) | ((uint64_t)1 << 40) | ((uint64_t)PT << 48));
+        emit(l, base(l, 0x5c40000000000000ull, rd, f) | ((uint64_t)w << 20) | ((uint64_t)1 << 41) | ((uint64_t)PT << 48));
     }
 }
 
@@ -3742,7 +3755,7 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
         uint32_t low = w0 >> 24, high = w2 & 0xff, type = (w2 >> 9) & 3, right = (w2 >> 12) & 1, hi = (w2 >> 16) & 1;
         int plain = (!right && !hi && high == 255 && (type == 3 || type == 1)) || (right && hi && low == 255 && (type == 3 || type == 2)) ||
                     (right && !hi && high == 255 && (type == 3 || type == 1)) || (!right && hi && low == 255 && type == 3);
-        if (!plain) { tag ^= 0x7368666d61783031ull; break; }   // "shfmax01"
+        if (!plain) { tag ^= 0x7368666d61783032ull; break; }   // "shfmax02"
     }
     // A mesh or task program (an ISBEWR, 0x927): mesh_vs's macros carried no predicate field until 2026-11-08, so they
     // were @P0 and every vertex of the pass-through draw collapsed; the stand-in vertex programs lower from this code.
