@@ -512,6 +512,36 @@ in Link's house never advanced and earlier captures missed the scene). 0 driver 
 - **Open (user, run-345): black particles float around the Deku Tree.** Not looked at yet.
 - **Fixed later the same day (next section):** the stop at `main+0x1661690` after the house scene.
 
+### Kokiri Forest: speed and missing foliage (2026-11-10, open)
+
+How the forest is reached: the user played run-349 (`--record build/logs/user-forest-1.txt`) and walked Link out of
+the house; A presses alone do not move Link (an earlier note here guessing otherwise was never written). The game's
+autosave from that session (`build/profile/save`, backed up to `build/profile/save-forest-backup-2026-11-10`) makes
+`build/logs/a-continue.txt` (A every 120 ticks to 3000) land in Kokiri Forest in ~60 s at Saria's line "The Great
+Deku Tree is through the tunnel over by Mido": a fixed scene for 150-180 s runs. Replaying the recorded route drifts
+(dialogue timing). Reference: the user's Switch 2 video frames in `build/reference/` (git-ignored).
+
+Speed (run-349 user session, run-350/351/352 replays): 16-17 fps where the user stood (pond), 22 fps at the save's
+spot. GPU 29-48 ms a frame; CPU replay 13 ms (`OOT_GPU_AHEAD=1`) to 32 ms (lock-step, includes waiting); lock-step
+costs ~8% there (17.7 vs 16.3 fps). VRAM over budget all the time: 16-18 of 15.1 GB.
+- `OOT_CS_TIME=1`: compute < 1 ms a frame. New `OOT_PASS_TIME=1` (vk_exec.c): render passes 9.9 ms a frame, 8.5 of it
+  the 58 main 1920x1080 passes. So ~19 of 29 ms of GPU time is neither: the VRAM mirror's copies.
+- New `OOT_WB_LOG=1` (vk_memory.c): per frame the mirror writes back ~90 MiB and uploads ~113 MiB, mostly the SAME
+  ranges both ways: 0x29e6eb000 and 0x29d7b6000 (0xf33080 each), 0x25ea76000 (0x980000), 0x29be5e000/0x29c4b4000/
+  0x29cb0a000/0x29d160000 (0x654040). A write-back is the whole bound range of a storage binding a shader may write.
+  Open: whether the CPU rewrites them each frame or the upload echoes our own write-back (write-watch seeing the
+  copy). `OOT_CPU_WATCH` on that range slowed the run to 3.5 fps from the title and logged nothing: not usable there.
+- Not the cause: pipeline builds, shader translation, texture uploads, fence pacing (all ~0 in `OOT_TRACE=perf`).
+
+Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
+- Full window (run-354, `OOT_GW_SKIP=none`, user-approved, one run): no crash, 0 resets, 15.3 fps, and the SAME bare
+  ground (`build/logs/foliage-default-vs-fullwindow.png`). The 18-program skip is not what hides the plants.
+- Mesh program 072eb70d (`OOT_MESH_IND_SKIP=none`, run-355): its old black/white blocks are gone (fixed by later
+  lowering work), but it adds no plants.
+- All 30 logged indirect mesh draws read 0 groups, on the GPU and in guest memory (args at 0x29d7b6000+0x00..0x40,
+  0x29fd80000, 0x2a0e04000.., 0x29bc62000, ...). So the GPU culling that fills those args counts nothing: that is
+  where the ground cover goes. 28 of 50 direct mesh draws fill only group 7 of 0-7 (66 primitives); unexplained.
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with

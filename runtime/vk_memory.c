@@ -1326,8 +1326,11 @@ void vk_mem_mirror_begin(void) {
 
 int vk_mem_mirror_pending(void) { return npend; }
 
+static int wbl_on(void);
+static void wbl_note(int up, const MRange *a, int n);
 void vk_mem_mirror_prologue(VkCommandBuffer cb) {
     if (!npend) return;
+    if (wbl_on()) wbl_note(1, pend, npend);
     mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
@@ -1426,9 +1429,59 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
     return j->n + 2;
 }
 
+// OOT_WB_LOG=1 (diagnostic, 2026-11-10): the guest ranges the mirror writes back (GPU -> guest) and uploads (guest ->
+// GPU) per submission, summed per (address, size) and logged every WBL_REPORT submissions, the largest first. In Kokiri
+// Forest the mirror moves 65 MiB back and 78 MiB up a frame and the GPU spends ~19 ms of 29 outside passes and
+// dispatches; which buffers those are decides what can be left out.
+enum { WBL_N = 256, WBL_REPORT = 600 };
+typedef struct { uint64_t addr, size, n, bytes; } WblEnt;
+static WblEnt wbl_tab[2][WBL_N];
+static int wbl_cnt[2], wbl_subs;
+static void wbl_note(int up, const MRange *a, int n) {
+    for (int i = 0; i < n; i++) {
+        uint64_t addr = a[i].r->import_lo + a[i].off, size = a[i].size;
+        int k = 0;
+        while (k < wbl_cnt[up] && !(wbl_tab[up][k].addr == addr && wbl_tab[up][k].size == size)) k++;
+        if (k == wbl_cnt[up]) {
+            if (k == WBL_N) continue;
+            wbl_tab[up][wbl_cnt[up]++] = (WblEnt){addr, size, 0, 0};
+        }
+        wbl_tab[up][k].n++, wbl_tab[up][k].bytes += size;
+    }
+}
+static int wbl_cmp(const void *x, const void *y) {
+    uint64_t a = ((const WblEnt *)x)->bytes, b = ((const WblEnt *)y)->bytes;
+    return a < b ? 1 : a > b ? -1 : 0;
+}
+static void wbl_report(void) {
+    for (int up = 0; up < 2; up++) {
+        qsort(wbl_tab[up], (size_t)wbl_cnt[up], sizeof(WblEnt), wbl_cmp);
+        uint64_t all = 0;
+        for (int k = 0; k < wbl_cnt[up]; k++) all += wbl_tab[up][k].bytes;
+        rt_log("mem: OOT_WB_LOG: %s over %d submissions: %.1f MiB in %d distinct ranges%s", up ? "upload" : "write-back",
+               wbl_subs, all / 1048576.0, wbl_cnt[up], wbl_cnt[up] == WBL_N ? " (table full)" : "");
+        for (int k = 0; k < wbl_cnt[up] && k < 14; k++) {
+            const WblEnt *e = &wbl_tab[up][k];
+            rt_log("mem:   %#llx size %#llx: x%llu, %.1f MiB (%.1f%%)", (unsigned long long)e->addr,
+                   (unsigned long long)e->size, (unsigned long long)e->n, e->bytes / 1048576.0, all ? 100.0 * e->bytes / all : 0.0);
+        }
+    }
+    memset(wbl_cnt, 0, sizeof wbl_cnt);
+    wbl_subs = 0;
+}
+static int wbl_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("OOT_WB_LOG"); on = e && e[0] == '1'; }
+    return on;
+}
+
 int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (!vk_mirror_on) return 0;
     int rec = 0;
+    if (wbl_on()) {
+        wbl_note(0, wbl, nwbl);
+        if (++wbl_subs >= WBL_REPORT) wbl_report();
+    }
     if (nwbl) {
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_READ_BIT);
