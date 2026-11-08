@@ -1007,10 +1007,15 @@ static struct {
     uint32_t shift;
     uint32_t count;   // task workgroups that run (bank 0 SM86_MESH_C0_COUNT); an indirect draw's comes from ind
     VkMemSpan ind;    // an indirect draw's arguments (ind.buffer set): word 0 is its count, copied on the GPU
+    int mi;           // a mesh-only indirect draw run from its real count (op_draw_mesh): dispatch and draw take their counts from MI.buf + mi_off
+    VkDeviceSize mi_off;
     VkBuffer buf;
     VmaAllocation mem;
     VkDeviceSize cap, task_size, mesh_size;   // the mesh records follow the task records
 } M;
+// The counts of the mesh-only indirect draws (op_draw_mesh): {x, 1, 1, 0} then a VkDrawIndirectCommand, per draw.
+static struct { VkBuffer buf; VmaAllocation mem; uint32_t next; } MI;
+enum { MI_SLOTS = 16384, MI_MAX_GROUPS = 5120 };   // the game's lists stop at 0x21c00 items, 4320 groups of 32
 
 static uint32_t ptr_count(int st);
 static uint64_t ptr_value(const VkExec *ex, int st, uint32_t i);
@@ -3554,7 +3559,8 @@ static void op_draw(VkExec *ex, const p_draw *d) {
         free(ix);
         vkCmdDrawIndexed(ex->cb, n + 1, inst, 0, 0, (uint32_t)d->base_instance);
     } else {
-        EQ_SPLIT(ex, vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance));
+        if (M.drawing && M.mi) EQ_SPLIT(ex, vkCmdDrawIndirect(ex->cb, MI.buf, M.mi_off + 16, 1, sizeof(VkDrawIndirectCommand)));
+        else EQ_SPLIT(ex, vkCmdDraw(ex->cb, n, inst, first, (uint32_t)d->base_instance));
     }
     ex->recorded++;
     if (vk_dump_armed) vk_dump_after_draw(ex);
@@ -4142,6 +4148,64 @@ static void mesh_tasks_note(VkExec *ex, const VkMemSpan *ip, uint64_t ind, uint3
     vk_completion_add(vk_sync_issued() + 1, mesh_tasks_read, r);
 }
 
+// OOT_MESH_SERIES=<first frame>:<frames> (diagnostic): the indirect mesh draws' arguments, read back on the GPU, per argument address and frame,
+// printed once as one row per address: groups of each frame ('.' when that address was not drawn), then the sum of the items.
+enum { MS_ROWS = 96, MS_FRAMES = 240, MS_SLOTS = 8192 };
+static struct { VkBuffer buf; VmaAllocation mem; uint32_t *map; uint32_t next; long long from, n; int on, printed;
+                struct { uint64_t ind; int32_t g[MS_FRAMES]; uint64_t items; } row[MS_ROWS]; int nrow; } MS;
+typedef struct { uint32_t slot; uint64_t ind; long long frame; } MsRead;
+static void ms_read(void *arg) {
+    MsRead *r = arg;
+    const uint32_t *v = MS.map + 4 * r->slot;
+    int k = 0;
+    while (k < MS.nrow && MS.row[k].ind != r->ind) k++;
+    if (k == MS.nrow && MS.nrow < MS_ROWS) { MS.row[k].ind = r->ind; for (int i = 0; i < MS_FRAMES; i++) MS.row[k].g[i] = -1; MS.nrow++; }
+    long long f = r->frame - MS.from;
+    if (k < MS.nrow && f >= 0 && f < MS.n) { if (MS.row[k].g[f] < 0) MS.row[k].g[f] = 0; MS.row[k].g[f] += (int32_t)v[0]; MS.row[k].items += v[3]; }
+    free(r);
+}
+static void ms_print(void) {
+    MS.printed = 1;
+    rt_log("meshseries: %d argument addresses, frames %lld..%lld", MS.nrow, MS.from, MS.from + MS.n - 1);
+    for (int k = 0; k < MS.nrow; k++) {
+        char b[1600];
+        size_t o = 0;
+        for (long long i = 0; i < MS.n && o < sizeof b - 8; i++)
+            o += MS.row[k].g[i] < 0 ? (size_t)snprintf(b + o, sizeof b - o, " .") : (size_t)snprintf(b + o, sizeof b - o, " %d", MS.row[k].g[i]);
+        b[o] = 0;
+        rt_log("meshseries: %#llx items %llu:%s", (unsigned long long)MS.row[k].ind, (unsigned long long)MS.row[k].items, b);
+    }
+}
+static void ms_note(VkExec *ex, const VkMemSpan *ip, uint64_t ind) {
+    static int init;
+    if (!init) {
+        init = 1;
+        const char *e = getenv("OOT_MESH_SERIES");
+        long long a = 0, n = 0;
+        if (e && sscanf(e, "%lld:%lld", &a, &n) == 2 && n > 0) MS.from = a, MS.n = n > MS_FRAMES ? MS_FRAMES : n, MS.on = 1;
+        if (MS.on) {
+            VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = MS_SLOTS * 16, .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+            VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST, .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT,
+                                          .requiredFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+            VmaAllocationInfo info;
+            if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &MS.buf, &MS.mem, &info) == VK_SUCCESS) MS.map = info.pMappedData; else MS.on = 0;
+        }
+    }
+    if (!MS.on) return;
+    long long f = (long long)gfx_stats().frames;
+    if (f >= MS.from + MS.n + 8 && !MS.printed) ms_print();
+    if (f < MS.from || f >= MS.from + MS.n || !ip || !ip->buffer || MS.next >= MS_SLOTS) return;
+    uint32_t slot = MS.next++;
+    vk_exec_barrier(ex);
+    VkBufferCopy a = {ip->offset, (VkDeviceSize)slot * 16, 16};
+    vkCmdCopyBuffer(ex->cb, ip->buffer, MS.buf, 1, &a);
+    ex->recorded++;
+    MsRead *r = malloc(sizeof *r);
+    if (!r) return;
+    *r = (MsRead){slot, ind, f};
+    vk_completion_add(vk_sync_issued() + 1, ms_read, r);
+}
+
 // OOT_MESH_REC=<frame>:<mesh hash prefix> (diagnostic): the mesh records of up to 8 such draws of that frame are written
 // to build/logs/meshrec/<hash>_<n>.bin (a u32 header: groups, stride, map offset, mesh count of bytes; then the records).
 #define MREC_BYTES (4u << 20)
@@ -4283,7 +4347,8 @@ static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
         }
         if (cs && p && info) {
             int tp = cst_begin(ex);   // OOT_CS_TIME: the task and mesh stages' GPU time, with the kernels'
-            vkCmdDispatch(ex->cb, groups, 1, 1);
+            if (m == 1 && M.mi) vkCmdDispatchIndirect(ex->cb, MI.buf, M.mi_off);
+            else vkCmdDispatch(ex->cb, groups, 1, 1);
             cst_end(ex, tp, cs, (const uint32_t[3]){groups, 1, 1});
             ex->recorded++;
             ok = 1;
@@ -4446,7 +4511,18 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     }
     if (ind_max < 1) ind_max = 1;
     if (ind_max > (int)MESH_MAX_TASKS) ind_max = (int)MESH_MAX_TASKS;
-    uint32_t n = indirect ? (uint32_t)ind_max : (uint32_t)d->count;
+    // A mesh-only indirect draw takes its count from the GPU for both the dispatch and the pass-through draw (2026-11-08): the plant lists reach
+    // 1592 groups, and a bound that large on every one of a frame's draws cost 10x the frame (4 fps). OOT_MESH_MI=0: the bound, as task draws still do.
+    static int mi_on = -1;
+    if (mi_on < 0) { const char *e = getenv("OOT_MESH_MI"); mi_on = !(e && e[0] == '0'); }
+    int mi = mi_on && indirect && !has_task;
+    if (mi && !MI.buf) {
+        VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = MI_SLOTS * 32,
+                                 .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+        VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+        if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &MI.buf, &MI.mem, NULL) != VK_SUCCESS) mi = mi_on = 0;
+    }
+    uint32_t n = mi ? (uint32_t)MI_MAX_GROUPS : indirect ? (uint32_t)ind_max : (uint32_t)d->count;
     static int mesh_shift = -1;   // OOT_MESH_SHIFT: log2 of the mesh workgroups a task can launch (test of the bound)
     if (mesh_shift < 0) {
         const char *e = getenv("OOT_MESH_SHIFT");
@@ -4473,6 +4549,20 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
         if (indirect) {
             VkBufferCopy cp = {ip.offset, 4, 4};
             vkCmdCopyBuffer(ex->cb, ip.buffer, M.buf, 1, &cp);
+            if (mi) {   // the group count into the dispatch's x and the draw's instance count
+                uint32_t prims;
+                memcpy(&prims, (const uint8_t *)stage_entry(mesh, 7)->control + 0x60, 4);
+                prims >>= 16;
+                M.mi_off = (VkDeviceSize)(MI.next++ % MI_SLOTS) * 32;
+                vkCmdFillBuffer(ex->cb, MI.buf, M.mi_off + 4, 8, 1);
+                vkCmdFillBuffer(ex->cb, MI.buf, M.mi_off + 12, 4, 0);
+                vkCmdFillBuffer(ex->cb, MI.buf, M.mi_off + 16, 4, 3 * prims);
+                vkCmdFillBuffer(ex->cb, MI.buf, M.mi_off + 24, 8, 0);
+                VkBufferCopy c2[2] = {{ip.offset, M.mi_off, 4}, {ip.offset, M.mi_off + 20, 4}};
+                vkCmdCopyBuffer(ex->cb, ip.buffer, MI.buf, 2, c2);
+                ex->recorded += 5;
+                M.mi = 1;
+            }
         } else {
             vkCmdFillBuffer(ex->cb, M.buf, 4, 4, ~0u);
         }
@@ -4507,6 +4597,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     M.on = 0, M.ind = (VkMemSpan){0};
     vk_exec_barrier(ex);
     if (ok) mesh_tasks_note(ex, indirect ? &ip : NULL, d->ind, has_task ? tasks : 0, shift);
+    if (ok && indirect) ms_note(ex, &ip, d->ind);
     if (ok) mesh_rec_note(ex, groups);
     if (vk_dump_armed) {   // frame dumps: which task and mesh programs the next pass-through draw stands for
         uint64_t hq[2] = {0, 0};
@@ -4523,6 +4614,7 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
                      d->count, (unsigned long long)hq[0], (unsigned long long)hq[1], groups, ok);
     }
     if (ok && !getenv("OOT_MESH_NODRAW")) mesh_draw(ex, mesh, groups);
+    M.mi = 0;
     int slot = ok ? mesh_rb_slot() : -1;
     if (slot >= 0) {
         VkBufferCopy cp[13];

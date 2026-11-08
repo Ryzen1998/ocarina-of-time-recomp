@@ -1,0 +1,18 @@
+--- a/src/Ryujinx.Graphics.Shader/StructuredIr/AstOptimizer.cs
++++ b/src/Ryujinx.Graphics.Shader/StructuredIr/AstOptimizer.cs
+@@ -90,6 +90,15 @@
+ 
+             Instruction inst = op.Inst & Instruction.Mask;
+ 
++            // OoT (2026-11-08): a ballot or a shuffle depends on which invocations are active where it runs: moved into a
++            // branch, it sees only that branch's invocations. The foliage kernels (3d1fdbc3, ac939523, the small mesh
++            // programs 27a40ad7) count their lanes before a one-lane branch and use the count inside it.
++            if (inst == Instruction.Ballot || inst == Instruction.Shuffle || inst == Instruction.ShuffleDown ||
++                inst == Instruction.ShuffleUp || inst == Instruction.ShuffleXor)
++            {
++                return true;
++            }
++
+             if (inst == Instruction.ImageLoad ||
+                 (inst == Instruction.Load && op.StorageKind is not (StorageKind.None or StorageKind.ConstantBuffer) &&
+                  !op.StorageKind.IsInputOrOutput()))

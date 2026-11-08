@@ -3826,6 +3826,14 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
         memcpy(&w0, code + i, 4);
         if ((w0 & 0xfff) == 0x927) { tag ^= 0x6d65736876733034ull; break; }   // "meshvs04"
     }
+    // A program with a ballot or a shuffle (VOTE, VOTEU, SHFL, REDUX): translator patch 0023 keeps these where they are computed, and a value moved
+    // into a branch was wrong (2026-11-08). The translator's identity is left as it was so that the other programs keep their translations.
+    for (uint32_t i = 0; i + 16 <= code_size; i += 16) {
+        uint32_t w0;
+        memcpy(&w0, code + i, 4);
+        uint32_t f = w0 & 0xfff;
+        if (f == 0x806 || f == 0x886 || f == 0x589 || f == 0x989 || f == 0xf89 || f == 0x3c4) { tag ^= 0x62616c6c6f746b31ull; break; }   // "ballotk1"
+    }
     // A program with a predicated atomic whose result is not its data register (lower_atomg, 2026-11-08).
     for (uint32_t i = 0; atom_keep_on() && i + 16 <= code_size; i += 16) {
         uint32_t w0, w1;

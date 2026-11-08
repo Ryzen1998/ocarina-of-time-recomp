@@ -650,6 +650,21 @@ Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
 - **Pictures:** `build/logs/shf0-default.png` (default, noise 0.76): no spikes, the tunnel's stone arch is back. `build/logs/shf0-full.png` (`OOT_GW_SKIP=none`, noise 0.77): tree leaves at the left, a dark fern by the sign, more fireflies. The default's `OOT_GW_SKIP` still starves the plant chain, so leaves need the full window, so the crash is what stands between the default and this picture.
 - Next: compare other forest spots with `build/reference/` (the canopy is largely above this shot), then the crash at main+0xc938d0, then drop `OOT_GW_SKIP`.
 
+#### Foliage: the plants' counts were wrong and cut off, the flicker's cause (2026-11-08, run-698..702, 0 driver resets)
+
+The bug behind the crash was general. The translator's AST optimizer moved a one-use ballot into the branch that used it, where only the branch's invocations are active. The
+plant culling kernel 3d1fdbc3 counts its kept items with VOTE/POPC before a leader-only branch; inside it the count was the leader's own 0 or 1, so each warp added 0 or 1 items
+and the mesh-only draw counts swung with one thread's result: 12, 4, 12, 14, 2, 10 groups on consecutive frames (`OOT_MESH_SERIES=<first frame>:<frames>`), matching whole objects appearing and vanishing in the user's recording.
+
+Translator patch 0023 keeps ballots and shuffles where they are computed. With it the same lists read 1592 groups, stable from frame to frame. The small mesh programs 27a40ad7 and 8a59f4a8 (POPC under `@!P0`) were the same case.
+**build/v131072/oot_xlate.id is left at c0e112ed on purpose**, while build/xlate has the patched identity ca58cd02: programs with a VOTE, VOTEU, SHFL or REDUX are re-keyed by the tag "ballotk1", the others keep translations that
+cannot differ. Copying the new .id there, or a fresh install, retranslates everything.
+
+The real counts then ran into our own bound: indirect mesh draws dispatched `OOT_MESH_IND_MAX` (64) groups. 2048 shows the rest of the plants but runs at 4 fps (about 50 draws x 2048). Mesh-only indirect draws now take their count from the
+GPU (`vkCmdDispatchIndirect`, `vkCmdDrawIndirect`, buffer `MI`, `OOT_MESH_MI=0` for the old bound): 36-37 fps, same plants (`build/logs/mi.png`, noise 0.93). Task draws keep the bound.
+
+Still wrong: the near plants render too dark (bushes almost black); grass tufts are still sparser than on the Switch 2.
+
 #### Foliage: the crash at main+0xc938d0 is fixed, and nothing is skipped from the window by default (2026-11-08, 2dcd44e, 0 driver resets through run-695)
 
 Cause: the slot reservation of the list writers ac939523 and 358beb27 (code hash d4088949) is `@P4 ATOMG R23 = add(R18)`, with R18 the population count of the active lanes and P4 true in one
