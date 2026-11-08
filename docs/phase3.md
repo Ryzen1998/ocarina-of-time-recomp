@@ -631,6 +631,19 @@ Foliage: the forest lacks the Switch 2's grass tufts, ferns and ground plants.
   % 32) made no difference (1 of 4 either way): not the cause, off by default. The crashing list mixes kind 0 and
   kind 1 entries of the same types (0x10, 0x26, 0x56); `+4` of an entry is the type on the CPU side.
 
+#### Foliage: mesh draws reach the screen for the first time (2026-11-08, run-422..449, 0 driver resets; 1a8c960)
+
+- **No mesh draw produced a pixel** (dump-422, `OOT_DUMP_PNG_MB=6000`): colour passes of the mesh draws changed 0 pixels, also with `OOT_DEPTH_EQ_LE=1` and
+  with the new `OOT_MESH_NODEPTH=1`, though `OOT_MESH_TASKS` shows real primitive counts. Causes, in the order found:
+  1. `mesh_vs`, `task_prologue`, `mesh_prologue` built instructions without `l->pred`, so they were `@P0` (false at the start; the `OpBranchConditional %false` blocks in the SPIR-V): every vertex collapsed. (The spiky terrain in older notes came from earlier states of this.)
+  2. Index bytes of the mesh map went through the host's byte store, a read-modify-write of the word: neighbouring threads lost bytes. Each index now has its own word (`lower_isbe` map_word, `mesh_vs`).
+  3. `lower_shf` had MaxShift swapped (Ryujinx: 2 = U64): the packed meshlet indices came out wrong (198 programs use the 64-bit funnel; tag "shfmax01").
+  4. The mesh prologue now zeroes every record's primitive count first. Cache tag "meshvs04".
+- **Picture:** `build/logs/shf-default.png` (noise 0.70), `meshidx-default.png`, `meshvs2-full.png`: the mesh ground, moss and more detail appear in the default configuration, Link and Saria in the near shots.
+  **White spikes remain** (default too): holes where the depth pre-pass drew a stray triangle. `OOT_MESH_REC=<frame>:<mesh hash>` writes records to `build/logs/meshrec/` (analysis: per-group index words and positions): the bad triangles use vertex 62/63 of a meshlet, which holds another mesh's position or (0,0,0,w). Open: why those last vertices are wrong (task 5d68723e direct draws, mesh 41ae9548/c67fb1a6 first).
+- **Crash** main+0xc938d0 not fixed. `OOT_FOLIAGE_GUARD=1` (generator hook, runtime/main.c, off by default) answers a bad kind-0 lookup as "no object" and logs it (2 hits per run seen, in the plants' first frames); used only to make full-window diagnostic runs reach their frames. The records are real plant positions with resource types (16, 38, 86, 191 of kind 1), some marked kind 0.
+- The 14 graphics programs with the "callfal1" tag and 198 "shfmax01" programs have only been checked in the running game, not one by one.
+
 ### setjmp/longjmp: the stop at main+0x1661690 (2026-11-10, fixed)
 
 Every long replay stopped about 255-268 s in (run-328, 330-332, 338, 341-345, script tick ~15000) with
