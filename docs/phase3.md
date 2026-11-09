@@ -1988,3 +1988,19 @@ texel offsets (2D: x and y in Ra, Rb the LOD then the offsets; seen on 40 fetche
 holds the uniform predicates could not be register 0 before. Corpus: 14,332 of 14,363 lower; left are the mesh and
 task stages (12), six compute programs stopped by one more opcode, ten vertex shaders short of a register for the
 uniform predicates and three short of a uniform register pair.
+
+## The black-frame flicker (2026-11-09, the user's play test)
+
+The user's recording of run-772 had 116 sudden black flashes of the whole 3D picture in 124 s, with the HUD still drawn. The cause was b6c2366: `sweep_pressure` dropped released render targets 30 frames after their release, and the game keeps sampling some finalized targets through their old descriptor slots (`slot_resolve` hands back the released entry). A dropped target lives only in its image, so it came back black, about every 30 frames.
+
+Measured with `build/logs/saria-route.txt`, 170 s, flashes counted on a `tools/play.py` recording (mean luma without the HUD under 4, bright before and after). With the current save that script's A presses start Saria's dialogue and Link stands there for the run, so this is the standing scene, not a walk:
+
+| Run | Rule | Flashes | VRAM peak in the level | GPU at the end |
+|---|---|---|---|---|
+| 773 | age 30 from the release (b6c2366) | 150 | 13.3 GiB | 12.5 ms |
+| 774 | age 600 from the release | 2 | 15.9 GiB | about 6 fps in all |
+| 776 | age 30 from the last read | 0 | 14.7 GiB | 59 ms |
+| 777 | age 8 from the last read | 1 | 14.0 GiB | 12.5 ms |
+| 778 | the same, as the default | 0 | 13.8 GiB | 12.5 ms |
+
+`vk_texture_by_id_locked` now renews `rel_frame` when a draw reads a released entry, and the default age is 8 frames. Age 30 from the last read keeps the old scene's targets too long at the scene change into the Saria area and the GPU time does not recover, as before. Run-778, in that dialogue, ran at 46.4 fps (1% low 33.3) in its second minute and 49.6 (34.5) in the last 50 s, with 0 driver resets. The blocky black staircase after a near tree leaves the view (`build/reference/user-rec-2/burst-110.68.png`, +2, +3) was not reproduced in this scene, so whether this fixes it is open.

@@ -60,7 +60,7 @@ typedef struct Tex {
     uint8_t listed;               // in owned[]
     uint32_t wt_n;                // WriteTexels into the storage since the last upload
     struct Tex *rel_prev, *rel_next;   // while released: the list of released entries, oldest first
-    uint64_t rel_frame;           // while released: the frame it was released in (sweep_pressure's age rule)
+    uint64_t rel_frame;           // while released: the frame it was released or last read in (sweep_pressure's age rule)
 } Tex;
 
 // A slot keeps what vk_texture_by_id resolved for it, so a draw binding skips the key lookup and the address chain: the
@@ -588,7 +588,7 @@ static uint64_t n_pressure_drops, n_age_drops;   // n_age_drops: GPU-written ent
 static void sweep_pressure(void) {   // tex_lock held
     if (vram_pressure < 0) {
         const char *s = cfg_get("OOT_TEX_VRAM_PRESSURE");
-        vram_pressure = s && *s ? atoi(s) : 80;   // 80 and an age of 30 frames: see the age rule below
+        vram_pressure = s && *s ? atoi(s) : 80;   // 80 and an age of 8 frames: see the age rule below
         if (vram_pressure < 0 || vram_pressure > 100) vram_pressure = 80;
         rt_log("vk: released textures under VRAM pressure: %s%d%%", vram_pressure ? "dropped above " : "off", vram_pressure);
     }
@@ -596,7 +596,8 @@ static void sweep_pressure(void) {   // tex_lock held
     uint64_t used, budget;
     int exact;
     if (!vk_mem_vram(&used, &budget, &exact) || used <= budget / 100 * (uint64_t)vram_pressure) return;
-    // OOT_TEX_REL_AGE (frames, default 600; 0 = off): an entry released that long ago goes too, whatever it holds.
+    // OOT_TEX_REL_AGE (frames, default 8; 0 = off): an entry released and not read for that long goes too, whatever it
+    // holds; a draw reading it through its slot renews rel_frame (vk_texture_by_id_locked).
     // 2026-11-10, Kokiri Forest: all 1,995 released entries (5.2 GiB) were GPU-written render targets the game freed
     // and never took back, kept because their content lives only in the image; with them VRAM stayed over its budget
     // (15.1 of 15.1 GiB, 16-18 at times) and nothing qualified under the rule above. A target freed 10 s ago and not
@@ -604,11 +605,15 @@ static void sweep_pressure(void) {   // tex_lock held
     // 2026-11-09, walking to Saria: at 90% and 600 frames VRAM still reached 15.9 of 15.2 GiB when the scene changed. The driver then moved
     // device-local memory out, and the frame's GPU time went from 13 to 80 ms and stayed there for as long as a minute, after VRAM had come back
     // (run-764, 765). At 80% and 30 frames it peaked at 14.7 and the GPU time stayed at 14 ms for the whole walk (run-766).
+    // But the age then counted from the release alone, and the game keeps sampling some finalized targets through their
+    // old slots: dropping those at 30 frames blacked out the whole 3D picture about every 30 frames (run-773: 150 flashes
+    // in a 170 s walk). Counted from the last read there are none (run-776), and 8 frames rather than 30 clears the
+    // targets of the old scene before the new one fills the VRAM: peak 14.0 GiB, GPU 12.5 ms, 1 flash (run-777).
     static int64_t rel_age = -1;
     if (rel_age < 0) {
         const char *s = getenv("OOT_TEX_REL_AGE");
-        rel_age = s && *s ? atoll(s) : 30;
-        if (rel_age < 0) rel_age = 30;
+        rel_age = s && *s ? atoll(s) : 8;
+        if (rel_age < 0) rel_age = 8;
     }
     uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     int dropped = 0;
@@ -616,7 +621,7 @@ static void sweep_pressure(void) {   // tex_lock held
         next = e->rel_next;
         int old = rel_age && now - e->rel_frame >= (uint64_t)rel_age;
         if (!old && (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty)) continue;
-        if (old && (e->pub.gpu_owned || e->gpu_dirty)) n_age_drops++;
+        if (old && (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty)) n_age_drops++;
         destroy_tex(e);
         dropped++, n_pressure_drops++;
     }
@@ -1323,6 +1328,9 @@ const VkTexImage *vk_texture_by_id_locked(int id, view_t *view, int *has_view) {
         s->cepoch = 0;
     }
     Tex *e = s->ce;
+    // A finalized texture a draw still reads (slot_resolve's own): sweep_pressure's age counts from its last use, not
+    // from its release. A released entry that a bound slot kept reading was dropped and came back black.
+    if (e && e->released) e->rel_frame = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     // Bindings of one submit share one check, answered from the submit's write-watch snapshot (guest writes during a
     // replay race the GPU read on hardware too). After one check an entry is either uploaded or never uploads (not
     // mirrored, GPU-owned or no CPU layout), so a slot that checked its entry in this submit has nothing left to do.
