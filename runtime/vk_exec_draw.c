@@ -4496,8 +4496,28 @@ static void mesh_draw(VkExec *ex, const prog_t *mesh, uint32_t groups) {
     if (nodepth < 0) nodepth = getenv("OOT_MESH_NODEPTH") != NULL;
     extern int vk_force_no_depth;
     if (nodepth) vk_force_no_depth = 1, B.st_valid = 0;
+    // The colour draws of the plants test depth EQUAL against the depth program's pre-pass. The two programs compute the
+    // same positions through different code, and about 0.6% of the vertices come out a rounding step apart (at most
+    // 1.5e-5 in clip space, 2026-11-09), which changes with the wind each frame: those blades fail the test and leave the
+    // bright sky behind them, the white flickering grass. OOT_MESH_EQ_BIAS=<depth bias units> (default 64, 0 off) turns
+    // the test of a mesh draw into LESS_OR_EQUAL with that much bias towards the camera.
+    extern int vk_mesh_eq_tolerant;
+    static float eq_bias = -1;
+    if (eq_bias < 0) { const char *e = getenv("OOT_MESH_EQ_BIAS"); eq_bias = e && *e ? (float)atof(e) : 64.0f; }
+    uint32_t bias_dirty = ex->dirty & VK_EXEC_DIRTY_DEPTH_BIAS;
+    if (eq_bias > 0) {
+        vk_mesh_eq_tolerant = 1, B.st_valid = 0;
+        ex->dirty &= ~VK_EXEC_DIRTY_DEPTH_BIAS;
+        vkCmdSetDepthBias(ex->cb, -eq_bias, 0.0f, 0.0f);
+        ex->recorded++;
+    }
     p_draw d = {4, 0, (int32_t)(3 * prims), 0, (int32_t)groups};   // NVN triangles
     op_draw(ex, &d);
+    if (eq_bias > 0) {
+        vk_mesh_eq_tolerant = 0, B.st_valid = 0;
+        ex->dirty |= VK_EXEC_DIRTY_DEPTH_BIAS;   // the next draw gets the game's own values back
+    }
+    (void)bias_dirty;
     if (nodepth) vk_force_no_depth = 0, B.st_valid = 0;
     M.drawing = 0;
     ex->prog = sprog, bind_gen++;

@@ -2508,6 +2508,7 @@ void vk_pipeline_async_enable(void) {
 }
 
 int vk_force_no_depth;
+int vk_mesh_eq_tolerant;   // mesh_draw (vk_exec_draw.c): a depth EQUAL test of this draw takes LESS_OR_EQUAL with a small bias
 int vk_pipeline_async_on(void) { return A.on; }
 
 // A draw needs a pipeline a prebuild job owns: the job moves to the draw queue, or its worker to normal priority.
@@ -3386,7 +3387,8 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
     vk_depth_eq_split = eq_le == 3 && d->dt && d->df == 3;
     vk_depth_eq_now = d->dt && d->df == 3;
     VkCompareOp eq_op = eq_le == 2 ? VK_COMPARE_OP_GREATER_OR_EQUAL : VK_COMPARE_OP_LESS_OR_EQUAL;   // =2: the other side
-    vkCmdSetDepthCompareOp(cb, (eq_le == 1 || eq_le == 2) && d->df == 3 ? eq_op : compare_op(d->df));
+    if (vk_mesh_eq_tolerant && d->df == 3 && !eq_le) eq_op = VK_COMPARE_OP_LESS_OR_EQUAL;
+    vkCmdSetDepthCompareOp(cb, ((eq_le == 1 || eq_le == 2) || (vk_mesh_eq_tolerant && !eq_le)) && d->df == 3 ? eq_op : compare_op(d->df));
     vkCmdSetStencilTestEnable(cb, d->st);
     vkCmdSetStencilOp(cb, VK_STENCIL_FACE_FRONT_BIT, stencil_op(d->fail_f), stencil_op(d->zpass_f), stencil_op(d->zfail_f),
                       compare_op(d->sf_f));
@@ -3394,7 +3396,7 @@ void vk_pipeline_set_dynamic(VkCommandBuffer cb, const VkPipeState *s) {
                       compare_op(d->sf_b));
     // NVN_POLYGON_OFFSET_ENABLE_* bit of the polygon mode in use: point 1, line 2, fill 4
     unsigned mode = pl->mode <= NVN_POLYGON_MODE_FILL ? pl->mode : NVN_POLYGON_MODE_FILL;
-    vkCmdSetDepthBiasEnable(cb, (pl->offset_en >> mode & 1) != 0);
+    vkCmdSetDepthBiasEnable(cb, (pl->offset_en >> mode & 1) != 0 || (vk_mesh_eq_tolerant && d->df == 3));
     vkCmdSetRasterizerDiscardEnable(cb, s->raster_discard != 0);
     vkCmdSetPrimitiveRestartEnable(cb, s->prim_restart != 0);
     if (P.dyn_vi && s->vs) {

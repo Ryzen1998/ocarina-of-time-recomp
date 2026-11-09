@@ -2007,6 +2007,28 @@ Measured with `build/logs/saria-route.txt`, 170 s, flashes counted on a `tools/p
 
 With Link really walking (`tools/play.py`, run-779, 150 s) there are 0 flashes too, at 48.3 fps (1% low 33.1) in the second minute, with the GPU at 11 to 15 ms and a VRAM peak of 13.9 GiB.
 
+## The white flickering grass (2026-11-09, runs 855..864, 0 driver resets)
+
+The user saw small pure-white blades on the moss, flickering "like a light bulb", some with a glow.
+
+**They are holes, not white paint.** At the pixels that end up white (frame dump, `build/logs/dump-moss`, since deleted), the main colour target still holds the bright sky clear when geometry should have covered them. The depth image at those pixels changes at the depth draw of the grass tufts, mesh 7849566c (task c7f0444a): 85% of those pixels against 3.5% of the image. The colour twin, a11f465b, tests depth EQUAL with no depth write, so a blade that fails leaves the sky behind it, bright enough to feed the bloom.
+
+**Why it fails.** `OOT_MESH_REC` of both programs in one frame (5800, run-857 or so): the same 221 groups, the same indices, 16,134 vertices, no NaN, of which 104 differ, by at most 1.5e-5 in clip space. The two programs compute the same positions through different code and those vertices round differently. No bad value or texture is involved. Which blades round differently depends on the wind, so the set would change from frame to frame; that part is an inference, as the set was not compared between frames.
+
+`OOT_DEPTH_EQ_LE=1` and `=2` (one direction of tolerance each) gave 195 and 119 white pixels against 321 at default, about half each as expected, though those are three runs and three cameras.
+
+**Fix.** `mesh_draw` (`vk_exec_draw.c`) sets `vk_mesh_eq_tolerant` for mesh draws: a depth EQUAL test becomes LESS_OR_EQUAL with a depth bias of 64 units towards the camera (`OOT_MESH_EQ_BIAS=<units>`, 0 is the old behaviour). The bias is set for the draw only and the game's values come back on the next draw.
+
+Evidence: at the moss rock of the user's picture, the fixed build shows no white flecks in nine consecutive frames (`build/reference/play/20261109-161106-eqfix/burst-149.03.png`), with the grass present; the same spot without it had many (`20261109-153731-memocheck/burst-126.75.png`). Default-settings walk (run-864): 0 shader failures, 0 draws skipped, VRAM peak 13.4 GiB, 51.9 fps and 55.7 in the last 30 s, with capture.
+
+Not settled:
+
+- The speck counter over whole videos does not separate the builds: 106.3 specks per sample with the fix and 106.3 without. It also counts title-screen and other bright details. After the first minute the fixed walk reads 19.1 and 7.3 per 30 s bin, the unfixed one 90.3, 19.4 and 31.3, on differing routes. Only the same-spot sheets are direct evidence, and they are one spot.
+- Sunlit patches on the moss looked weaker in the fixed sheet. It is 22 s later in that run, and the control run ended up elsewhere, so whether that is time of day was not settled.
+- Whether it existed before c0a0943 and 2e994f9 was not run. By its mechanism it needs the tuft draws, which c0a0943 introduced, so it should not predate that.
+- Hookshot's renaming bug (PRs 759, 922, 905) does not apply: the lowering has no renaming with placeholder numbers, and the positions here are correct to rounding.
+- Two walks had capture faults, not game faults: run-862's video froze on the title until 142 s, and run-864's has a solid purple second at 99 s (the frame before it is the one "sudden black" frame reported for that run) and ends at 113 s, while the game log shows no frame over 50 ms beyond the usual load.
+
 ## Forest speed: what bounds the frame (2026-11-09, runs 840..854, 0 driver resets)
 
 Walk: `build/logs/move1-input.txt` (the run-779 walk, from the title, 150 s), judged on runs without capture, second minute and last 30 s.
