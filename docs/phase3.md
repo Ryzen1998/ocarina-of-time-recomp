@@ -2079,3 +2079,15 @@ That check, as far as it went (runs 826..829, 0 driver resets):
 - Default settings on the rebuilt game (run-832): 0 shader failures, 0 draws skipped, 0 driver resets.
 
 Next: the crown's close-up leaves are not in 4eea96ed. Find out what pass 9 (46edda32) wrote for crown objects 2706..2741, which of its six written buffers holds it, and which draw reads that buffer.
+
+Following it (2026-11-09, run-833, 0 driver resets). With base c0+0x40, pass 9 writes slot 3 (0x2a3281000, probably `SsboLieState`; no compute dispatch or vertex-stage binding other than pass 9's own names it, and mesh programs' bindings are not in the dump), 4 (0x29d7b6000, the leaf list), 5 (0x29faac000), 6 (0x29fd80000, the stalk list), 7 (0x29bc7a000) and 8 (0x29bb9c000); which is which by name is inferred from the bind order. Pass 5's stalk list is filled every frame while the input to pass 9 is usually empty, which fits bare branches, but the earlier reading of `SsboMeshTemp` as a build queue is now in doubt. The test at 0x79a0 is `(1 << lane) & UR8`, a subgroup compaction mask rather than per-object state, so that test does not support a queue. Nothing here has settled queue against per-frame list.
+
+Where pass 5 stops queuing, on the still frames 3168..3408: 60 leader threads per frame, one entry per frame in total, and P2 at 0x7b10 (skip) set for 97% of threads. R42, the radius in the view test (`R42 = R30 * UR18` at 0x5070), reads zero for 61% of threads near and 59% far, so it is not specific to being close. Whether those zeros are empty slots or a fault is unknown; R30's source is not traced.
+
+Other projects' notes checked against this (Hookshot, behaviour only, relayed by the coordinating session; none explains the tree):
+
+1. Task and mesh banks reading past their bound range: our bank is 0x800 bytes and the mesh words sit at 0x590..0x630, inside it. Not seen here; not exhaustively checked for every generated table.
+2. Bare-pointer tables with no size: pass 9's six written slots all have sizes in the dump, so it does not apply to it. Bare pointers elsewhere go through the global window (`gws_found`).
+3. Group counts for indirect dispatches: **a real mismatch in our code, not the tree's cause.** `op_dispatch_ind` copies them to c0+0x200 and leaves c0+0 at zero, but `nvn2_c0_fill_cs` puts the dispatch size at c0+0. Of the 233 stored compute programs, 16 read c0+0/4/8, none is foliage, and none of them appears among the indirect launches logged in run-825 (only 16 or 17 frames were logged). It is harmless on this route, and worth fixing if such a program is ever launched indirectly.
+4. Storage descriptors located from c0's descriptor area: `nvn2_cs_layout` takes the table from the control section, and every slot pass 9 writes resolved. No sign of a problem; not examined further.
+5. A rule that drops textures when a handle word looks like a storage address: no such rule in our binding code. Pass 5 has no texture fetch at all.
