@@ -1169,8 +1169,44 @@ static size_t pack_answers(uint8_t *o, const GfxShaderAnswers *a) {
 }
 
 // sha256 over the stage, the control section (its own size) and the whole code block (its c1 included).
+// Asked on every draw and dispatch: a SHA-256 over the whole program was about 11% of the replay in the forest
+// (2026-11-09). A per-thread memo keyed by the addresses; the program's bytes are compared with a copy, since a program
+// can be replaced at the same address, and a memcmp costs a fraction of the hash.
+static int code_hash_slow(int stage, const uint8_t *control, uint32_t ctl_size, const uint8_t *code, uint64_t code_size,
+                          uint8_t hash[32]);
 static int build_code_hash(int stage, const uint8_t *control, uint32_t ctl_size, const uint8_t *code, uint64_t code_size,
                            uint8_t hash[32]) {
+    enum { N = 1024 };
+    typedef struct {
+        const uint8_t *control, *code;
+        uint8_t *copy;
+        uint64_t code_size;
+        uint32_t ctl_size;
+        int stage;
+        uint8_t hash[32];
+    } Memo;
+    static __thread Memo *memo;   // allocated on a thread's first use: a table in TLS would be paid by every thread
+    if (!memo && !(memo = calloc(N, sizeof *memo))) return code_hash_slow(stage, control, ctl_size, code, code_size, hash);
+    uintptr_t k = ((uintptr_t)code >> 4 ^ (uintptr_t)control >> 3 ^ (uintptr_t)code_size ^ (uintptr_t)stage) * 0x9E3779B1u;
+    Memo *m = &memo[(k >> 12) % N];
+    if (m->copy && m->code == code && m->control == control && m->code_size == code_size && m->ctl_size == ctl_size &&
+        m->stage == stage && !memcmp(m->copy, control, ctl_size) && !memcmp(m->copy + ctl_size, code, (size_t)code_size)) {
+        memcpy(hash, m->hash, 32);
+        return 1;
+    }
+    if (!code_hash_slow(stage, control, ctl_size, code, code_size, hash)) return 0;
+    uint8_t *copy = malloc((size_t)ctl_size + (size_t)code_size);
+    if (copy) {
+        memcpy(copy, control, ctl_size), memcpy(copy + ctl_size, code, (size_t)code_size);
+        free(m->copy);
+        m->copy = copy, m->control = control, m->code = code, m->code_size = code_size, m->ctl_size = ctl_size, m->stage = stage;
+        memcpy(m->hash, hash, 32);
+    }
+    return 1;
+}
+
+static int code_hash_slow(int stage, const uint8_t *control, uint32_t ctl_size, const uint8_t *code, uint64_t code_size,
+                          uint8_t hash[32]) {
     size_t total = 4 + 4 + ctl_size + 8 + (size_t)code_size;
     uint8_t *buf = malloc(total), *p = buf;
     if (!buf) return 0;
@@ -1213,8 +1249,39 @@ static void key_of_input(const uint8_t iid[32], uint8_t key[32]) {
 }
 
 // The input id and cache key (m given), or the provisional key (m NULL: full answers; iid untouched).
+static void build_key_slow(const uint8_t code_hash[32], const GfxShaderAnswers *a, const UseMask *m, uint8_t key[32],
+                           uint8_t iid[32]);
+// Two SHA-256 calls per draw: the same per-thread memo, compared on everything the result depends on.
 static void build_key(const uint8_t code_hash[32], const GfxShaderAnswers *a, const UseMask *m, uint8_t key[32],
                       uint8_t iid[32]) {
+    enum { N = 2048 };
+    typedef struct {
+        uint8_t used, has_mask, has_answers;
+        uint8_t code_hash[32], key[32], iid[32];
+        GfxShaderAnswers a;
+        UseMask m;
+    } Memo;
+    static __thread Memo *memo;
+    if (!memo && !(memo = calloc(N, sizeof *memo))) { build_key_slow(code_hash, a, m, key, iid); return; }
+    uint32_t h;
+    memcpy(&h, code_hash, 4);
+    if (a) h ^= (uint32_t)a->shared_bytes * 0x9E3779B1u ^ (uint32_t)a->local[0] ^ (uint32_t)a->tex_type[0] << 8 ^ (uint32_t)a->attr_type[0] << 16;
+    Memo *e = &memo[h % N];
+    if (e->used && e->has_mask == (m != NULL) && e->has_answers == (a != NULL) && !memcmp(e->code_hash, code_hash, 32) &&
+        (!a || !memcmp(&e->a, a, sizeof *a)) && (!m || !memcmp(&e->m, m, sizeof *m))) {
+        memcpy(key, e->key, 32);
+        if (m) memcpy(iid, e->iid, 32);
+        return;
+    }
+    build_key_slow(code_hash, a, m, key, iid);
+    e->used = 1, e->has_mask = m != NULL, e->has_answers = a != NULL;
+    memcpy(e->code_hash, code_hash, 32), memcpy(e->key, key, 32);
+    if (m) memcpy(e->iid, iid, 32), e->m = *m;
+    if (a) e->a = *a;
+}
+
+static void build_key_slow(const uint8_t code_hash[32], const GfxShaderAnswers *a, const UseMask *m, uint8_t key[32],
+                           uint8_t iid[32]) {
     GfxShaderAnswers masked;
     uint8_t buf[8 + 32 + 32 + 256], *p = buf;
     if (m) {

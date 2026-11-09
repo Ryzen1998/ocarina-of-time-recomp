@@ -210,6 +210,7 @@ static DWORD WINAPI completion_main(void *arg) {
             vk_mem_collect();
             AcquireSRWLockExclusive(&st_lock);
             __atomic_store_n(&done, reached, __ATOMIC_RELEASE);
+            perf_tl("gpu-done", reached);
             WakeAllConditionVariable(&cv_done);
         }
     }
@@ -396,6 +397,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     vk_crumb(s->cb, VK_CRUMB_SUBMIT, fence);
     ts_begin(s->cb);
     rec_begin(s->cb);
+    perf_tl("record-begin", fence);
     int recorded = vk_exec_record(s->cb, handles, n, fence);
     s = &slots[cur_slot];   // the last part (vk_sync_split)
     if (recorded) ts_end(s->cb, fence);
@@ -403,6 +405,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
     // The recorder is done with the part: the end-of-submission crumb, then the end, by the recorder when it records.
     if (!rec_end_cb(s->cb, VK_CRUMB_SUBMIT_END, fence)) vkEndCommandBuffer(s->cb);
     perf_replay(t0);
+    perf_tl("record-end", fence);
     // After the recording: the uploads it asked for (and every earlier one) precede it in queue order.
     vk_upload_flush(0);
     VkCommandBuffer pro = prologue(c, fence);
@@ -435,6 +438,7 @@ uint64_t vk_sync_submit(const uint64_t *handles, int n) {
         vk_queue_lock();
         VkResult r = vkQueueSubmit2(c->gfx_queue, 1, &si, VK_NULL_HANDLE);
         vk_queue_unlock();
+        perf_tl("submitted", fence);
         if (r != VK_SUCCESS) {
             vk_device_fault_report(r);
             rt_fatal("vk: vkQueueSubmit2 of value %llu failed (%d)", (unsigned long long)fence, (int)r);
@@ -472,11 +476,27 @@ void vk_completion_add(uint64_t fence, void (*fn)(void *), void *arg) {
     ReleaseSRWLockExclusive(&st_lock);
 }
 
+// OOT_TIMELINE=<frame> (diagnostic): from that frame on, up to 2500 lines of CPU and GPU events with the time in
+// microseconds, the thread and a fence value or frame number: to see which waits and recordings overlap.
+void perf_tl(const char *what, uint64_t value) {
+    static long long from = -2;
+    static volatile LONG lines;
+    static LARGE_INTEGER freq;
+    if (from == -2) { const char *e = cfg_get("OOT_TIMELINE"); QueryPerformanceFrequency(&freq); from = e && *e ? atoll(e) : -1; }
+    if (from < 0 || (long long)gfx_stats().frames < from || lines > 2500) return;
+    InterlockedIncrement(&lines);
+    LARGE_INTEGER n;
+    QueryPerformanceCounter(&n);
+    rt_log("tl: %llu %lu %s %llu", (unsigned long long)(n.QuadPart * 1000000 / freq.QuadPart), GetCurrentThreadId(), what, (unsigned long long)value);
+}
+
 static int fence_wait_impl(uint64_t value, uint64_t timeout_ns);
 
 int vk_sync_fence_wait(uint64_t value, uint64_t timeout_ns) {
     uint64_t p0 = perf_begin();
+    perf_tl("wait-begin", value);
     int ok = fence_wait_impl(value, timeout_ns);
+    perf_tl("wait-end", value);
     perf_end(PERF_FENCE, p0);
     perf_gpu_wait(p0);
     return ok;

@@ -847,6 +847,7 @@ NVN_API(nvnWindowAcquireTexture) {
         ahead = e && *e ? atoi(e) : 0;
         if (ahead < 0 || ahead > 3) ahead = 0;
     }
+    perf_tl("acquire", nvn_fence_last());
     uint64_t now_f = nvn_fence_last();
     if (o->acquires >= (uint64_t)ahead) {
         uint64_t g = o->acq[(o->acquires - (uint64_t)ahead) & 3];   // 0 for "at this acquire"
@@ -863,6 +864,7 @@ NVN_API(nvnWindowAcquireTexture) {
         }
         b->cpu_synced(f);
     }
+    perf_tl("acquired", f);
     if (s) {
         s->fenced = f ? 1 : 3;
         s->fence = f;

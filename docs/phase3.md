@@ -2007,6 +2007,26 @@ Measured with `build/logs/saria-route.txt`, 170 s, flashes counted on a `tools/p
 
 With Link really walking (`tools/play.py`, run-779, 150 s) there are 0 flashes too, at 48.3 fps (1% low 33.1) in the second minute, with the GPU at 11 to 15 ms and a VRAM peak of 13.9 GiB.
 
+## Forest speed: what bounds the frame (2026-11-09, runs 840..854, 0 driver resets)
+
+Walk: `build/logs/move1-input.txt` (the run-779 walk, from the title, 150 s), judged on runs without capture, second minute and last 30 s.
+
+**The forest is mostly GPU-bound; the log's `bound: cpu` is wrong here.** `nvidia-smi` read 83 to 90% at full clock (2857 MHz, P0) through the walk (run-853), while the `perf:` line reports 12.7 ms of a 20 ms frame, about 63%. That line sums timestamps of the replay's command buffers only, so GPU work outside them is not counted. What the difference is has not been measured; `vk_upload_flush` submits (the mirrors move about 65 MiB up and 65 MiB back per frame) are the first suspect.
+
+| Test | Second minute | Last 30 s | Replay | Note |
+|---|---|---|---|---|
+| Baseline (run-840) | 46.7 fps, 1% low 31.7 | 49.3, 36.7 | 7.23 ms | profile running |
+| `OOT_GPU_AHEAD=1` (run-841) | 43.0, 25.0 | 49.8, 26.1 | | not faster, and 1% lows worse |
+| `OOT_WB_FENCE_LIMIT=0` (run-844) | 48.1, 31.7 | 51.2, 40.8 | 5.97 ms | about +1.5 fps; the 56 fps of run-299 no longer holds |
+| `OOT_SPLIT_DRAWS=4 OOT_SPLIT_US=250` (run-846) | 44.6, 29.6 | 47.1, 34.5 | 9.28 ms | finer splitting costs and gains nothing |
+| Shader hash memo (run-851) | 46.8, 30.1 | 49.0, 40.4 | 5.38 ms | CPU saved, no frame rate |
+
+The timeline (`OOT_TIMELINE=<frame>`, median of about 90 frames, run-845): a frame of 19.7 ms has a 7.2 ms wait at `nvnWindowAcquireTexture`, 2.2 ms until the biggest submission starts recording, 8.7 ms recording it, and its GPU work ends about 8 ms after that. Allowing the CPU a frame ahead moves the wait to the game's own `nvnSyncWait` (lr 0x700040cde0 and 0x700040ce34, its frame throttle), so loosening our side alone cannot help.
+
+Kept: `build_code_hash` and `build_key` remember their result per thread (`gfx_shader.c`), comparing the program's bytes with a copy. Hashing every program at every draw was 18% of the active recording. Replay falls from 7.2 to 5.4 ms a frame, but the frame rate does not move, as the frame is limited by the GPU. Diagnostics added, off by default: `OOT_SYNC_LOG=<frame>`, `OOT_TIMELINE=<frame>`. Check with capture (run-854, `tools/play.py`, 150 s): 0 sudden black frames in 8,947 video frames, VRAM peak 13.4 GiB, 51.0 fps (1% low 32.0) in the second minute against 48.3 (33.1) in run-779, which is within the spread between runs, picture noise 0.74, 0 shader failures, 0 draws skipped.
+
+Next, for real gains: find the GPU time the `perf:` line misses (time the `vk_upload_flush` submissions and the present), then decide between less mirror traffic and cheaper GPU passes. CPU items such as `gw_scan`, `written_pages` and Hookshot's 853, 854 and fences per queue will not raise the frame rate while the GPU sets the pace, although they may help 1% lows.
+
 ## The leafless tree (2026-11-09, parked, not fixed)
 
 **Where it stands (parked by the user's decision; everything below is the record).** The crown is bare close up on default settings. The far leaf cards are dropped on purpose inside about 20 units (the game's own limit, docked; 10 handheld), so close up the crown must come from another path, and that path shows nothing here. Workaround seen, not adopted: `OOT_SM86_FORCE=7c683d82d6ae881a:51d0:447a0000` restores a full crown and adds black flecks in the sky.

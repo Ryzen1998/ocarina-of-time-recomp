@@ -566,6 +566,33 @@ NVN_API(nvnQueueFenceSync) {
     s->fenced = 1;
     s->fence = nvn_fence_last();
 }
+// OOT_SYNC_LOG=<frame> (diagnostic): from that frame on, one line per nvnSyncWait, at most 3000: the game's return
+// address, the fence, how far behind the newest submit it was, the wait for the GPU and then cpu_synced (the small-target
+// write-back), in microseconds.
+static long long sync_log_from(void) {
+    static long long v = -2;
+    if (v == -2) { const char *e = cfg_get("OOT_SYNC_LOG"); v = e && *e ? atoll(e) : -1; }
+    return v;
+}
+static int sync_log_on(void) {
+    long long f = sync_log_from();
+    return f >= 0 && (long long)gfx_stats().frames >= f;
+}
+static uint64_t sync_log_us(void) {
+    static LARGE_INTEGER freq;
+    if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER n;
+    QueryPerformanceCounter(&n);
+    return (uint64_t)(n.QuadPart * 1000000 / freq.QuadPart);
+}
+static void sync_log_line(const Cpu *c, uint64_t fence, uint64_t done0, uint64_t t0, uint64_t t1, uint64_t t2) {
+    static volatile LONG lines;
+    if (InterlockedIncrement(&lines) > 3000) return;
+    rt_log("synclog: f%llu t%llu lr %#llx fence %llu newest %llu done-at-entry %llu wait %llu us synced %llu us",
+           (unsigned long long)gfx_stats().frames, (unsigned long long)t0, (unsigned long long)c->x[30], (unsigned long long)fence,
+           (unsigned long long)nvn_fence_last(), (unsigned long long)done0, (unsigned long long)(t1 - t0), (unsigned long long)(t2 - t1));
+}
+
 // NVNsyncWaitResult nvnSyncWait(const NVNsync *s, uint64_t timeout_ns): a sync never fenced reports a timeout at once;
 // a fenced one is released only after the back end completed that fence value
 NVN_API(nvnSyncWait) {
@@ -578,13 +605,22 @@ NVN_API(nvnSyncWait) {
         return;
     }
     const GfxBackend *b = gfx_backend();
-    if (b->fence_done() >= s->fence) { b->cpu_synced(s->fence); ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED); return; }
+    int log = sync_log_on();
+    uint64_t t0 = log ? sync_log_us() : 0, done0 = log ? b->fence_done() : 0;
+    if (b->fence_done() >= s->fence) {
+        b->cpu_synced(s->fence);
+        if (log) sync_log_line(c, s->fence, done0, t0, t0, sync_log_us());
+        ret_x(c, NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED);
+        return;
+    }
     int ok;
     {
         NVN_BLOCKING();
         ok = b->fence_wait(s->fence, timeout);
     }
+    uint64_t t1 = log ? sync_log_us() : 0;
     if (ok) b->cpu_synced(s->fence);
+    if (log) sync_log_line(c, s->fence, done0, t0, t1, sync_log_us());
     else if (timeout) {
         // A blocking wait that gave up: on hardware such waits (the game's frame throttle, say) end in time; here a
         // GPU far behind (pipeline builds) lets the CPU run on, which this game's timer-query pool does not survive.

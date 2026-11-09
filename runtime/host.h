@@ -53,6 +53,7 @@ void perf_count(int kind);
 void perf_present(uint64_t frame);
 void perf_summary_flush(void);                  // prints the frame-time summary of the running period (exit); the 60 s lines come from perf_present
 void gfx_exit_log(void);                        // back end's lines for the exit summary (weak no-op in prof_win.c)
+void perf_tl(const char *what, uint64_t value);   // OOT_TIMELINE=<frame>: one timeline line (vk_sync.c)
 void perf_gpu_wait(uint64_t t0);                // a wait for a GPU fence ended (any thread; the render thread's also counts as PERF_FENCE)
 // GPU side of the 60-frame perf line, filled by the graphics back end when it set perf_gpu_stats. gpu_ns: GPU busy time
 // since the previous call (timestamp queries, overlaps counted once), have_gpu 0 when the device has no timestamps.
