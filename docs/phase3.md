@@ -2007,7 +2007,15 @@ Measured with `build/logs/saria-route.txt`, 170 s, flashes counted on a `tools/p
 
 With Link really walking (`tools/play.py`, run-779, 150 s) there are 0 flashes too, at 48.3 fps (1% low 33.1) in the second minute, with the GPU at 11 to 15 ms and a VRAM peak of 13.9 GiB.
 
-## The leafless tree (2026-11-09, open)
+## The leafless tree (2026-11-09, parked, not fixed)
+
+**Where it stands (parked by the user's decision; everything below is the record).** The crown is bare close up on default settings. The far leaf cards are dropped on purpose inside about 20 units (the game's own limit, docked; 10 handheld), so close up the crown must come from another path, and that path shows nothing here. Workaround seen, not adopted: `OOT_SM86_FORCE=7c683d82d6ae881a:51d0:447a0000` restores a full crown and adds black flecks in the sky.
+
+Closed, each by measurement below: occlusion, list caps, view-edge radius in 7c683d82, the plant list, buckets 0x2a169c010 and 0x2a0ccc010, virtual-pool backing, `DirectoryEntry`, the "loaded pointer reads zeros, positions go NaN" failure from Lichii (not seen in a75873e1, 9eed67bc, fd390b6a or 46edda32), the 140 foliage programs that never run (they look like option variants: an inference), the fifth leaf bucket (only for fading), 4eea96ed's cut-out (forced open, crown still bare), the zero radius in 9eed67bc (unused slots), and Hookshot's notes 1, 2, 4 and 5.
+
+Known: `BancLeafMesh(LowTree)` is passes 5 (9eed67bc) and 9 (46edda32) by order and bindings. 35 crown objects reach pass 5 close up, and its inputs look right.
+
+Open, in the order to pick up: (1) with the crown fully in view, does pass 5 reject its slots (filter `OOT_SM86_COUNT_RANGE` on a height register)? Pass 9's input is usually empty, and whether that is a per-frame list or a queue is unsettled. (2) What pass 9 writes for objects 2706..2741. (3) Which draw should show it; 4eea96ed does not form this crown. Tools are in `notes/tree-tools/`, and a harmless mismatch to fix someday is `op_dispatch_ind` writing the group counts to c0+0x200 where NVN2 programs read c0+0.
 
 The big tree left of the shop on the mossy rock has a full crown on the Switch 2 (`build/reference/user-rec-2/tree-compare.png`) and bare branches here when Link is near it; from farther away the crown is there and fills in as he backs off. `build/logs/bare-tree-route.txt` (`tools/play.py run --route-file ... --from none --seconds 105`) shows it from about 80 s and backs away from about 91 s with the current save.
 
