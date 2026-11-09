@@ -2084,6 +2084,15 @@ Following it (2026-11-09, run-833, 0 driver resets). With base c0+0x40, pass 9 w
 
 Where pass 5 stops queuing, on the still frames 3168..3408: 60 leader threads per frame, one entry per frame in total, and P2 at 0x7b10 (skip) set for 97% of threads. R42, the radius in the view test (`R42 = R30 * UR18` at 0x5070), reads zero for 61% of threads near and 59% far, so it is not specific to being close. Whether those zeros are empty slots or a fault is unknown; R30's source is not traced.
 
+The zero radius, followed to its end (runs 834..839, 0 driver resets): **not a fault.**
+
+- R42's only zero factor is one byte (R36, `OOT_SM86_COUNT`, run-834). It comes from a table in slot 0 of pass 5 at +0x49000: 234 rows of 0x490 bytes, one per plant type, each with 32 slot entries of 12 bytes at +0x190, indexed by the thread's subgroup lane; the byte is at +7.
+- The table holds real data and the GPU copy equals the CPU copy byte for byte (`OOT_DUMP_BUF=cs:512a2cb2:0`, run-835). A type fills its first N slots and leaves the rest zero; 115 of the 234 rows have none at all. 62.7% of all slots are zero, which accounts for the 61%.
+- The crown's own types have data. From the object table at 0x2a19e9000 (run-838; word at +0x850 + id * 0x40, then the type at +0x20 + (w & 0xfffc) * 4 + (w & 3) * 4): objects 2689..2741 are types 29 (35 objects), 60 (14), 21 (2) and 70 (2), and c5 maps them to table rows 48, 40, 74 and 4, with 12, 17, 7 and 6 active slots.
+- What the view test sees is plausible. Positions at 0x5090 average height 118, the crown's (run-839). The planes are unit length and the crown's centre is inside all of them, but only by 0.95 units for the top plane (0x500) in that capture. Active slots read R11 above zero and about 8 on average, against a radius near 0.6. That is what slots above the top of the view would give, so the rejection may be correct for that camera. These are averages over all objects in the list, not the crown alone.
+
+So nothing wrong has been found in pass 5's inputs. Still unknown: whether pass 5 rejects correctly for a camera that has the crown fully in view, what pass 9 produces for these objects, and which draw should show it.
+
 Other projects' notes checked against this (Hookshot, behaviour only, relayed by the coordinating session; none explains the tree):
 
 1. Task and mesh banks reading past their bound range: our bank is 0x800 bytes and the mesh words sit at 0x590..0x630, inside it. Not seen here; not exhaustively checked for every generated table.
