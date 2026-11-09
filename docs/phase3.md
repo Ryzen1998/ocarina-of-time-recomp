@@ -2063,6 +2063,44 @@ Kept: `build_code_hash` and `build_key` remember their result per thread (`gfx_s
 
 Next, for real gains: find the GPU time the `perf:` line misses (time the `vk_upload_flush` submissions and the present), then decide between less mirror traffic and cheaper GPU passes. CPU items such as `gw_scan`, `written_pages` and Hookshot's 853, 854 and fences per queue will not raise the frame rate while the GPU sets the pace, although they may help 1% lows.
 
+## Forest speed: the account of a frame (2026-11-09, runs 874..894, 0 driver resets)
+
+**Tool.** `OOT_GPU_ACCT=<first>:<frames>:<every>` (`runtime/vk_gpu_acct.c`, read with `tools/gpu_acct.py build/logs/gpu-acct.csv`) stamps every command buffer of every submission (replay parts, mirror uploads, upload batches, the present) and, inside the replay, every render pass, dispatch and mesh stage, on one clock. The first version (run-874) billed the rendering to the next barrier: the driver writes a timestamp without waiting for work still in flight. Every stamp is now preceded by a full barrier (`OOT_GPU_ACCT_DRAIN=0` removes it), which the replay nearly always has at that point anyway. Windows of 60 frames, every 600 frames, walk `build/logs/move1-input.txt`, median of frames per window.
+
+| ms per frame | Before the fix (run-875, 5 windows) | After the fix (run-890, 8 windows) | Measured how |
+|---|---|---|---|
+| Frame period | 19.6-20.9 | 16.7-17.4 | present to present |
+| Queue busy | 17.9-18.9 | 12.2-15.4 | union of all command buffers |
+| Queue idle | 1.7-2.1 | 1.8-4.5 | the rest |
+| Mirror up (CPU to GPU) | 5.0-5.5 (65 MiB) | 0.23-0.27 (1.1 MiB) | stamped, 12-13 MiB/ms |
+| Mirror down (GPU back to CPU) | 5.9-6.6 (65 MiB) | 5.8-6.2 (65 MiB) | stamped, 10-11 MiB/ms |
+| Render passes (all targets) | 2.2-2.6 | 2.4-4.6 | stamped |
+| Game compute (culling, lighting, upscaler kernels) | 1.3-1.4 | 1.3-1.5 | stamped |
+| Mesh stages run as compute (task + mesh + compact) | 0.7-0.8 | 0.7-0.9 | stamped |
+| Copies and clears | 0.04-0.06 | 0.03-0.05 | stamped |
+| Replay, other (barriers, mesh setup, unbilled) | 1.7-1.8 | 1.6-1.9 | part time minus what is inside it |
+| Upload batches | 0.04-0.6 | 0.03-0.4 | stamped |
+| Present | 0.01 | 0.01 | stamped |
+
+Not accounted for: the replay's "other" is everything in a part between stamps, mostly barriers and the fills and copies of the mesh setup; it is not split further. The queue-idle line is time the GPU had nothing submitted. The upscaling network is inside "game compute" and its share is not separated (every single compute program costs at most about 0.15 ms). Render passes are not split into depth and colour beyond the pass table of `tools/gpu_acct.py`. The timed runs have a slower frame (the barriers); the frame-rate figures below come from runs without the switch.
+
+**The cost found.** The GPU's storage writes were stamped (vk_exec_draw `cb_done`, the copy callback) with the generation the mirror reads, so `mirror_sync` took them for CPU writes and uploaded the same bytes back: 65 MiB up a frame, for ranges that had just come down (`OOT_WB_LOG=1`, run-876: upload ranges are the write-back ranges rounded to pages; the earlier note that this was not an echo looked only at write watch). Fix: `cgen_chunk`, generations of non-GPU stamps only, read by `mirror_sync`; the texture checks still see the GPU's stamps. `OOT_MIRROR_ECHO=1` is the old behaviour.
+
+Before and after, same walk, no capture, second minute (`build/logs/move1-input.txt`, 150 s, two runs each):
+
+| Build | Second minute fps | 1% low | Over 25 ms |
+|---|---|---|---|
+| Old behaviour, runs 878, 880 | 48.1, 43.6 | 30.5, 28.4 | 367, 533 |
+| Fix, runs 877, 879 | 58.0, 56.5 | 38.1, 36.0 | 59, 97 |
+
+Mirror upload per frame fell from about 51 MiB to about 3.6 MiB. Checks: still scene (`a-continue.txt`, 100 s, `tools/shot_diff.py`) noise 1.02 to 1.15 on both builds, all under the limit; the screenshots at the end of the walk are one of 1.31 (a close-up full of moss, a real picture by eye, others 0.65 to 0.85). Captured walk (`play.py`, run-889, `build/reference/play/20261109-190039-echofix`): 57.2 fps second minute, 59.2 last 30 s, 0 sudden black frames in 8,943 video frames, 0 driver resets. Moss rock bursts at 88 and 140 s show no white flecks and no cut-off grass. VRAM in the `stays imported` lines peaked at 14,583 of 14,837 MiB in that capture run and 13.3 GiB in the uncaptured ones; 14.9 GiB was seen once before the fix (run-874), and no 13-to-80 ms slowdown appeared in any run.
+
+**Native mesh shaders are not worth it for speed.** The emulation's compute stages cost 0.7-0.9 ms of a 17 ms frame; that includes the game's own task and mesh programs, which native mesh shaders would still run. Passes that hold only mesh draws are 0.6 ms, mixed passes another 0.7 (run-875). Whatever a native path would save is at most about 1 ms, out of a frame where 6 ms is write-back. Recommendation: keep the compute emulation unless missing geometry or a later measurement says otherwise.
+
+**The remaining big item: write-back, 6 ms a frame.** The game asks to read back (nvnMemoryPoolInvalidateMappedRange, `OOT_WB_LOG=1`, run-890) about 22 of the 65 MiB; the largest ranges are never invalidated, in pools marked CPU_CACHED. `OOT_MIRROR_WB_SKIP=<KiB>` (experiment, off by default: write-backs of at least that size in cached pools the game has never invalidated are not copied home) gives, skipping ranges of 1 MiB and more, runs 891..894: second minute 59.1 and 58.5 fps against 57.7 and 57.3, 1% low 41.7 and 40.4 against 38.1 and 38.1, frames over 25 ms 22 and 29 against 68 and 75. A shipped version has to write the skipped bytes back when the game invalidates them and when host code reads guest memory (uniform snapshots `vk_usnap`, texture checks, the storage-held pointer tables); that was not built, and the experiment does not show what would go stale without it. With the frame already near the 60 fps limit it buys about 1.5 fps and a few frames of 1% low, so whether to build it is a decision to make.
+
+Not settled: the frames over 25 ms that set the 1% low (about 2% of frames) are rare events the 60-frame windows did not catch; in those windows the slowest 5% are at most 22 ms, with no single category behind them (`scratchpad` analysis: passes +0.4, upload +0.6, other within noise). What triggers the occasional longer frames (asset streaming, pipeline builds, a texture copy) was not traced. The first minute of the walk (the load and first steps) is 44 fps on both builds and is set by loading.
+
 ## The leafless tree (2026-11-09, parked, not fixed)
 
 **Where it stands (parked by the user's decision; everything below is the record).** The crown is bare close up on default settings. The far leaf cards are dropped on purpose inside about 20 units (the game's own limit, docked; 10 handheld), so close up the crown must come from another path, and that path shows nothing here. Workaround seen, not adopted: `OOT_SM86_FORCE=7c683d82d6ae881a:51d0:447a0000` restores a full crown and adds black flecks in the sky.

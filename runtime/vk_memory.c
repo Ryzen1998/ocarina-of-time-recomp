@@ -1479,9 +1479,10 @@ static int verify_record(VkCommandBuffer cb, uint64_t fence) {
 // Forest the mirror moves 65 MiB back and 78 MiB up a frame and the GPU spends ~19 ms of 29 outside passes and
 // dispatches; which buffers those are decides what can be left out.
 enum { WBL_N = 256, WBL_REPORT = 600 };
-typedef struct { uint64_t addr, size, n, bytes; } WblEnt;
-static WblEnt wbl_tab[2][WBL_N];
-static int wbl_cnt[2], wbl_subs;
+typedef struct { uint64_t addr, size, n, bytes; uint32_t flags; } WblEnt;
+static WblEnt wbl_tab[3][WBL_N];   // [2]: the ranges the game invalidated (nvnMemoryPoolInvalidateMappedRange), the CPU reads them
+static int wbl_cnt[3], wbl_subs;
+static SRWLOCK wbl_lock = SRWLOCK_INIT;
 static void wbl_note(int up, const MRange *a, int n) {
     for (int i = 0; i < n; i++) {
         uint64_t addr = a[i].r->import_lo + a[i].off, size = a[i].size;
@@ -1489,7 +1490,7 @@ static void wbl_note(int up, const MRange *a, int n) {
         while (k < wbl_cnt[up] && !(wbl_tab[up][k].addr == addr && wbl_tab[up][k].size == size)) k++;
         if (k == wbl_cnt[up]) {
             if (k == WBL_N) continue;
-            wbl_tab[up][wbl_cnt[up]++] = (WblEnt){addr, size, 0, 0};
+            wbl_tab[up][wbl_cnt[up]++] = (WblEnt){addr, size, 0, 0, a[i].r->flags};
         }
         wbl_tab[up][k].n++, wbl_tab[up][k].bytes += size;
     }
@@ -1498,17 +1499,54 @@ static int wbl_cmp(const void *x, const void *y) {
     uint64_t a = ((const WblEnt *)x)->bytes, b = ((const WblEnt *)y)->bytes;
     return a < b ? 1 : a > b ? -1 : 0;
 }
+static int wbl_on(void);
+// OOT_MIRROR_WB_SKIP=<KiB> (experiment): write-back ranges of at least that size in cached pools that the game has
+// never invalidated (read back) so far are not copied home. What the mirror is costing.
+enum { INV_N = 4096 };
+static struct { uint64_t lo, hi; } inv_seen[INV_N];
+static int inv_n;
+static SRWLOCK inv_lock = SRWLOCK_INIT;
+static uint64_t wb_skip_min(void) {
+    static long long v = -1;
+    if (v < 0) { const char *e = getenv("OOT_MIRROR_WB_SKIP"); v = e && *e ? atoll(e) * 1024 : 0; }
+    return (uint64_t)v;
+}
+static int inv_overlaps(uint64_t lo, uint64_t hi) {
+    AcquireSRWLockShared(&inv_lock);
+    int hit = 0;
+    for (int i = 0; i < inv_n && !hit; i++) hit = inv_seen[i].lo < hi && lo < inv_seen[i].hi;
+    ReleaseSRWLockShared(&inv_lock);
+    return hit;
+}
+void nvn_pool_invalidated_note(uint64_t addr, uint64_t size) {
+    if (wb_skip_min()) {
+        AcquireSRWLockExclusive(&inv_lock);
+        int k = 0;
+        while (k < inv_n && !(inv_seen[k].lo == addr && inv_seen[k].hi == addr + size)) k++;
+        if (k == inv_n && inv_n < INV_N) inv_seen[inv_n].lo = addr, inv_seen[inv_n].hi = addr + size, inv_n++;
+        ReleaseSRWLockExclusive(&inv_lock);
+    }
+    if (!wbl_on()) return;
+    AcquireSRWLockExclusive(&wbl_lock);
+    int k = 0;
+    while (k < wbl_cnt[2] && !(wbl_tab[2][k].addr == addr && wbl_tab[2][k].size == size)) k++;
+    if (k == wbl_cnt[2] && k < WBL_N) wbl_tab[2][wbl_cnt[2]++] = (WblEnt){addr, size, 0, 0, 0};
+    if (k < wbl_cnt[2]) wbl_tab[2][k].n++, wbl_tab[2][k].bytes += size;
+    ReleaseSRWLockExclusive(&wbl_lock);
+}
 static void wbl_report(void) {
-    for (int up = 0; up < 2; up++) {
+    for (int up = 0; up < 3; up++) {
         qsort(wbl_tab[up], (size_t)wbl_cnt[up], sizeof(WblEnt), wbl_cmp);
         uint64_t all = 0;
         for (int k = 0; k < wbl_cnt[up]; k++) all += wbl_tab[up][k].bytes;
-        rt_log("mem: OOT_WB_LOG: %s over %d submissions: %.1f MiB in %d distinct ranges%s", up ? "upload" : "write-back",
+        rt_log("mem: OOT_WB_LOG: %s over %d submissions: %.1f MiB in %d distinct ranges%s", up == 2 ? "invalidated by the game" : up ? "upload" : "write-back",
                wbl_subs, all / 1048576.0, wbl_cnt[up], wbl_cnt[up] == WBL_N ? " (table full)" : "");
         for (int k = 0; k < wbl_cnt[up] && k < 14; k++) {
             const WblEnt *e = &wbl_tab[up][k];
-            rt_log("mem:   %#llx size %#llx: x%llu, %.1f MiB (%.1f%%)", (unsigned long long)e->addr,
-                   (unsigned long long)e->size, (unsigned long long)e->n, e->bytes / 1048576.0, all ? 100.0 * e->bytes / all : 0.0);
+            char f[160] = "";
+            if (e->flags) flag_names(e->flags, f, sizeof f);
+            rt_log("mem:   %#llx size %#llx: x%llu, %.1f MiB (%.1f%%) %s", (unsigned long long)e->addr,
+                   (unsigned long long)e->size, (unsigned long long)e->n, e->bytes / 1048576.0, all ? 100.0 * e->bytes / all : 0.0, f);
         }
     }
     memset(wbl_cnt, 0, sizeof wbl_cnt);
@@ -1526,6 +1564,17 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
     if (wbl_on()) {
         wbl_note(0, wbl, nwbl);
         if (++wbl_subs >= WBL_REPORT) wbl_report();
+    }
+    if (wb_skip_min()) {   // OOT_MIRROR_WB_SKIP
+        static uint64_t skipped, kept;
+        int k = 0;
+        for (int i = 0; i < nwbl; i++) {
+            uint64_t a = wbl[i].r->import_lo + wbl[i].off, b = a + wbl[i].size;
+            if (wbl[i].size >= wb_skip_min() && (wbl[i].r->flags & NVN_MEMORY_POOL_FLAGS_CPU_CACHED) && !inv_overlaps(a, b)) skipped += wbl[i].size;
+            else wbl[k++] = wbl[i], kept += wbl[i].size;
+        }
+        nwbl = k;
+        if ((msub & 0xfff) == 0) rt_log("mem: OOT_MIRROR_WB_SKIP: %.1f MiB skipped, %.1f MiB kept so far", skipped / 1048576.0, kept / 1048576.0);
     }
     if (nwbl) {
         uint64_t ga_b0 = mrep.wb_bytes, ga_n = (uint64_t)nwbl;
