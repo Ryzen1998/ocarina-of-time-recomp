@@ -4608,7 +4608,8 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     int mi = mi_on && indirect && !has_task, mt = mi_on && indirect && has_task && mc_ready();
     if ((mi || mt) && !MI.buf) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = MI_SLOTS * 32,
-                                 .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+                                 .usage = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
         VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
         if (vmaCreateBuffer(vk_ctx()->vma, &bi, &ai, &MI.buf, &MI.mem, NULL) != VK_SUCCESS) mi = mt = mi_on = 0;
     }
@@ -4638,9 +4639,10 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
         vkCmdCopyBuffer(ex->cb, ip.buffer, MI.buf, 1, &c1);
         ex->recorded += 4;
     }
-    static int mesh_clear = -1;   // OOT_MESH_CLEAR=1 (diagnostic): the mesh records too, to tell unwritten vertices from wrong ones
-    if (mesh_clear < 0) mesh_clear = getenv("OOT_MESH_CLEAR") != NULL;
-    if (mesh_clear) vkCmdFillBuffer(ex->cb, M.buf, M.task_size, M.mesh_size, 0), ex->recorded++;
+    static long long mesh_clear = -1;   // OOT_MESH_CLEAR=1 (diagnostic): the mesh records too, to tell unwritten vertices from wrong ones; a frame number above 1: only in that frame
+    if (mesh_clear < 0) { const char *e = getenv("OOT_MESH_CLEAR"); mesh_clear = e ? (atoll(e) > 1 ? atoll(e) : 1) : 0; }
+    if (mesh_clear == 1 || (mesh_clear > 1 && (long long)gfx_stats().frames == mesh_clear))
+        vkCmdFillBuffer(ex->cb, M.buf, M.task_size, M.mesh_size, 0), ex->recorded++;
     if (!has_task) {
         vk_exec_barrier_compute(ex);   // transfers are not ordered among themselves: the fill could land after the update
         // a mesh-only draw: one stand-in task whose count (+4) asks for every mesh group (an indirect draw: its count).
@@ -4701,6 +4703,11 @@ static void op_draw_mesh(VkExec *ex, const p_draw_mesh *d, int indirect) {    //
     vk_exec_barrier(ex);
     if (ok) mesh_tasks_note(ex, indirect ? &ip : NULL, d->ind, has_task ? tasks : 0, shift);
     if (ok && indirect) ms_note(ex, &ip, d->ind);
+    if (ok && mt) {   // OOT_MESH_SERIES: a task draw also gets a row at its address + 1 with the mesh workgroups mesh_compact packed (capped at MI_MAX_GROUPS)
+        VkMemSpan packed = ip;
+        packed.buffer = MI.buf, packed.offset = M.mi_off;
+        ms_note(ex, &packed, d->ind + 1);
+    }
     if (ok) mesh_rec_note(ex, groups);
     if (vk_dump_armed) {   // frame dumps: which task and mesh programs the next pass-through draw stands for
         uint64_t hq[2] = {0, 0};
