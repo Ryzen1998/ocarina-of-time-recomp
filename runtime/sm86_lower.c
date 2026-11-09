@@ -3788,7 +3788,8 @@ static int count_init(const uint8_t *code, uint32_t code_size) {
 }
 
 // ---- OOT_SM86_FORCE=<code hash, hex>:<offset hex>:<value hex> (diagnostic): the instruction at that byte offset of
-// that compute program becomes "destination register = value" (its predicate kept). For the shadow culling's
+// that program, of any stage (for a graphics stage the offset counts its 0x80 header, as tools/kernel.py dis prints
+// it), becomes "destination register = value" (its predicate kept). For the shadow culling's
 // per-object counter (research report idea 3): e6d5432f's `LD R13, [R14+0xc]` at 0x6a0 forced to 0xff makes every
 // object due every frame, to see whether the chain after the arming works. The program gets its own cache key.
 static struct { int on; uint32_t at, imm; } force;
@@ -4204,7 +4205,7 @@ static int lower_attempt(const uint8_t *code, uint32_t code_size, const uint8_t 
         if (cnt.on && !l.graphics)
             for (uint32_t k = 0; k < cnt.n; k++)
                 if (cnt.at[k] == header + l.index * 16) count_emit(&l, k);
-        if (force.on && !l.graphics && header + l.index * 16 == force.at) {   // OOT_SM86_FORCE
+        if (force.on && header + l.index * 16 == force.at) {   // OOT_SM86_FORCE
             uint32_t p = bits(&l.in[l.index], 12, 4);
             if (p != 15) l.pred = (uint64_t)p << 16, mov_imm(&l, bits(&l.in[l.index], 16, 8), force.imm);
         } else
