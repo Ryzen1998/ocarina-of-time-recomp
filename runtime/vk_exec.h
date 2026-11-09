@@ -224,4 +224,5 @@ void vk_exec_xfb_pass_end(VkExec *ex, int after);
 // when counting and none is active), and the open pass about to end (ends the active query).
 void vk_exec_oq_draw(VkExec *ex);
 void vk_exec_oq_pass_end(VkExec *ex);
+void vk_guest_written_gpu(uint64_t addr, uint64_t size);   // vk_memory.c: vk_guest_written for a write the GPU made into a mirror
 void vk_exec_pool_feedback(VkExec *ex);   // vk_exec_draw.c: copies the pool sets' sampling feedback for the host

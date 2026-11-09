@@ -23,6 +23,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
+#include "vk_gpu_acct.h"
 
 #define WEAK __attribute__((weak))
 
@@ -143,9 +144,12 @@ static void ts_close(VkCommandBuffer cb, int pair, uint64_t fence) {
 }
 
 // The pair of the part being recorded.
-static void ts_begin(VkCommandBuffer cb) { ts_cur = ts_open(cb); }
+static int ga_cur = -1;   // OOT_GPU_ACCT: the part being recorded
+static void ts_begin(VkCommandBuffer cb) { ts_cur = ts_open(cb); ga_cur = vk_ga_open(cb); }
 
 static void ts_end(VkCommandBuffer cb, uint64_t fence) {
+    vk_ga_close(cb, ga_cur, GA_PART, 0, fence, 0);
+    ga_cur = -1;
     ts_close(cb, ts_cur, fence);
     ts_cur = -1;
 }

@@ -32,6 +32,7 @@
 #include "nvn_api.h"
 #include "ui/menu.h"
 #include "vk.h"
+#include "vk_gpu_acct.h"
 
 #define FRAMES 2
 #define MAX_IMAGES 16
@@ -879,6 +880,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
     vkBeginCommandBuffer(cb, &bi);
     uint64_t crumb = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
     vk_crumb(cb, VK_CRUMB_PRESENT, crumb);
+    int ga = vk_ga_open(cb);
     VkImage dst = g_sc_img[idx];
     sync_barrier(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,
                  VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
@@ -953,6 +955,7 @@ static void present_image(VkImage src, VkImageLayout layout, VkFormat fmt, int w
         record_thumb(cb, dst, slot);
     }
     sync_barrier(cb, dst, last, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR, last_stage, last_write, VK_PIPELINE_STAGE_2_NONE, 0);
+    vk_ga_close(cb, ga, GA_PRESENT, 0, 0, 0);
     vk_crumb(cb, VK_CRUMB_PRESENT_END, crumb);
     vkEndCommandBuffer(cb);
 

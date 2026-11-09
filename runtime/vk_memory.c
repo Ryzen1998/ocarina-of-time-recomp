@@ -24,6 +24,7 @@
 #include "nvn_api.h"
 #include "nvn_pool_index.h"
 #include "vk.h"
+#include "vk_gpu_acct.h"
 
 // Raw performance counter ticks for the tracking cost (no division on the replay's path); qpc_ms converts.
 static uint64_t qpc(void) {
@@ -581,6 +582,12 @@ int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact) {
 #define GEN_CHUNKS (RT_ADDRESS_LIMIT >> GEN_CHUNK_SHIFT)
 #define GEN_PER_CHUNK (1u << (GEN_CHUNK_SHIFT - GEN_PAGE_SHIFT))
 static uint32_t *gen_chunk[GEN_CHUNKS];
+// The generation of the last stamp that did not come from the GPU's own writes: what the mirror must upload
+// (mirror_sync). gen_chunk also holds the stamps of vk_guest_written_gpu, for the texture checks, and a mirror already
+// holds those bytes: uploading them again was the "CPU writes" of Kokiri Forest (65 MiB up a frame, the same ranges
+// the mirror wrote back; docs/phase3.md "Forest speed: the account").
+static uint32_t *cgen_chunk[GEN_CHUNKS];
+static int stamp_gpu;                    // gen_lock: the stamps being made are the GPU's own writes
 static uint32_t gen_now;                 // last generation handed out
 static SRWLOCK gen_lock = SRWLOCK_INIT;
 static uint64_t gen_pages[1024];
@@ -635,12 +642,34 @@ static void stamp_page(uint64_t a, uint32_t g) {
     uint32_t *s = gen_slot(a, 1);
     if (!s) return;
     *s = g;
+    if (!stamp_gpu) {
+        uint64_t ci = a >> GEN_CHUNK_SHIFT;
+        if (!cgen_chunk[ci]) {
+            cgen_chunk[ci] = calloc(GEN_PER_CHUNK, sizeof(uint32_t));
+            if (!cgen_chunk[ci]) rt_fatal("vk: out of memory for page generations");
+        }
+        cgen_chunk[ci][(a >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] = g;
+    }
     reg_max[a >> REG_SHIFT] = g;
     reg_last[a >> REG_SHIFT] = ww_ep;
 }
 
 static void stamp_range(uint64_t lo, uint64_t hi, uint32_t g) {
     for (uint64_t a = lo; a < hi; a += 1ull << GEN_PAGE_SHIFT) stamp_page(a, g);
+}
+
+// What the GPU wrote into a mirror and the write-back copied home: the texture checks must see it, the mirror holds it
+// already. OOT_MIRROR_ECHO=1: treated as any other write, so the mirror uploads it again (the old behaviour).
+void vk_guest_written_gpu(uint64_t addr, uint64_t size) {
+    static int echo = -1;
+    if (echo < 0) { const char *e = getenv("OOT_MIRROR_ECHO"); echo = e && e[0] == '1'; }
+    if (!size || nvn_gpu_only(addr)) return;
+    uint64_t lo = addr & ~0xfffull, hi = (addr + size + 0xfff) & ~0xfffull;
+    AcquireSRWLockExclusive(&gen_lock);
+    stamp_gpu = !echo;
+    stamp_range(lo, hi, ++gen_now);
+    stamp_gpu = 0;
+    ReleaseSRWLockExclusive(&gen_lock);
 }
 
 void vk_guest_written(uint64_t addr, uint64_t size) {
@@ -1200,7 +1229,7 @@ static void mirror_sync(PoolRec *r) {
         uint64_t a = k << SNAP_SHIFT, b = a + (1ull << SNAP_SHIFT);
         if (a < lo) a = lo;
         if (b > hi) b = hi;
-        const uint32_t *ch = gen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
+        const uint32_t *ch = cgen_chunk[a >> GEN_CHUNK_SHIFT];   // a 2 MiB region lies in one chunk
         if (!ch) continue;
         for (uint64_t x = a; x < b; x += 1ull << GEN_PAGE_SHIFT)
             if (ch[(x >> GEN_PAGE_SHIFT) & (GEN_PER_CHUNK - 1)] > since)
@@ -1344,11 +1373,14 @@ static void wbl_note(int up, const MRange *a, int n);
 void vk_mem_mirror_prologue(VkCommandBuffer cb) {
     if (!npend) return;
     if (wbl_on()) wbl_note(1, pend, npend);
+    uint64_t ga_b0 = mrep.upload_bytes, ga_n = (uint64_t)npend;
+    int ga = vk_ga_open(cb);
     mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
              VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     copy_ranges(cb, pend, npend, 1, &mrep.upload_bytes, &mrep.upload_copies);
     mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
              VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+    vk_ga_close(cb, ga, GA_MIRROR_UP, 0, mrep.upload_bytes - ga_b0, ga_n);
     npend = 0;
     mrep.prologues++;
 }
@@ -1496,6 +1528,8 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         if (++wbl_subs >= WBL_REPORT) wbl_report();
     }
     if (nwbl) {
+        uint64_t ga_b0 = mrep.wb_bytes, ga_n = (uint64_t)nwbl;
+        int ga = vk_ga_open(cb);
         mbarrier(cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_READ_BIT);
         for (int i = 0; i < nwbl; i++) wbl[i].r->wb_sub = msub;
@@ -1504,6 +1538,7 @@ int vk_mem_mirror_end(VkCommandBuffer cb, uint64_t fence) {
         mbarrier(cb, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
                  VK_PIPELINE_STAGE_2_HOST_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
                  VK_ACCESS_2_HOST_READ_BIT | VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT);
+        vk_ga_close(cb, ga, GA_MIRROR_DOWN, 0, mrep.wb_bytes - ga_b0, ga_n);
         nwbl = 0;
     }
     if (mirror_verify) rec += verify_record(cb, fence);
@@ -1645,6 +1680,7 @@ static INIT_ONCE cmd_once = INIT_ONCE_STATIC_INIT;
 static VkCommandPool cmd_pool;
 static Batch open_b;
 static int open_active;
+static int open_ga = -1;   // OOT_GPU_ACCT: the open batch
 static Batch *inflight;
 static int ninflight, cap_inflight;
 static Batch *spare;                  // completed batches whose command buffer and fence are reused
@@ -1738,6 +1774,7 @@ VkCommandBuffer vk_upload_begin(void) {
     vkBeginCommandBuffer(open_b.cb, &bi);
     open_b.seq = ++next_seq;
     vk_crumb(open_b.cb, VK_CRUMB_UPLOAD, open_b.seq);
+    open_ga = vk_ga_open(open_b.cb);
     open_active = 1;
     return open_b.cb;
 }
@@ -1798,6 +1835,8 @@ uint64_t vk_upload_flush(int wait) {
     uint64_t seq = next_seq;
     if (c && open_active) {
         for (int i = 0; i < open_b.nstg; i++) vmaFlushAllocation(c->vma, open_b.stg[i].alloc, 0, VK_WHOLE_SIZE);
+        vk_ga_close(open_b.cb, open_ga, GA_UPLOAD, 0, 0, 0);
+        open_ga = -1;
         vk_crumb(open_b.cb, VK_CRUMB_UPLOAD_END, open_b.seq);
         vkEndCommandBuffer(open_b.cb);
         VkSubmitInfo si = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO, .commandBufferCount = 1, .pCommandBuffers = &open_b.cb};

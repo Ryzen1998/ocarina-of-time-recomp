@@ -29,6 +29,7 @@
 #include "platform/platform.h"
 #include "tex.h"
 #include "vk.h"
+#include "vk_gpu_acct.h"
 #include "vk_exec.h"
 
 #define WEAK __attribute__((weak))
@@ -698,7 +699,9 @@ static void pt_read(void *arg) {   // completion thread
     free(r);
 }
 
+static int ga_pass = -1, ga_pass_draws, ga_pass_mesh;   // OOT_GPU_ACCT: the open pass and its draws
 static void pt_begin(VkExec *ex) {   // outside the pass, before vkCmdBeginRendering
+    ga_pass = vk_ga_open(ex->cb), ga_pass_draws = ga_pass_mesh = 0;
     pt_open = -1;
     if (!pt_on()) return;
     uint32_t p = pt_next++ % PT_PAIRS;
@@ -709,6 +712,12 @@ static void pt_begin(VkExec *ex) {   // outside the pass, before vkCmdBeginRende
 }
 
 static void pt_end(VkExec *ex) {   // after vkCmdEndRendering
+    if (ga_pass >= 0) {
+        vk_ga_close(ex->cb, ga_pass, GA_PASS, ex->pass_ncolor > 0 && ex->color[0].image ? (uint32_t)ex->color[0].nvn_format : 0,
+                    (uint64_t)ex->pass_w << 16 | ex->pass_h, (uint64_t)(uint32_t)ga_pass_draws << 32 | (uint64_t)(uint32_t)ga_pass_mesh << 16 |
+                    (uint64_t)ex->pass_ncolor << 8 | (ex->pass_depth != 0));
+        ga_pass = -1;
+    }
     if (pt_open < 0) return;
     uint32_t p = (uint32_t)pt_open;
     pt_open = -1;
@@ -1061,6 +1070,8 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
         case OP_BIND_PROGRAM: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF:
         case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_SAMP: case OP_BIND_IMG:
             vk_exec_op_draw(ex, h->op, a);
+            if (h->op == OP_DRAW || h->op == OP_DRAW_IDX || h->op == OP_DRAW_IDX_IND || h->op == OP_DRAW_IND) ga_pass_draws++;
+            else if (h->op == OP_DRAW_MESH || h->op == OP_DRAW_MESH_IND) ga_pass_draws++, ga_pass_mesh++;
             break;
         case OP_XFB_BIND: case OP_XFB_BEGIN: case OP_XFB_END:
             if (vk_dump_armed) vk_dump_xfb(ex, h->op, a);
@@ -1071,9 +1082,14 @@ static void walk(VkExec *ex, const op_hdr *h, int depth) {
             if (vk_dump_armed) vk_dump_copy(ex, h->op, a);
             // fall through
         case OP_SIGNAL_EVENT: case OP_REPORT_COUNTER: case OP_RESET_COUNTER: case OP_RENDER_ENABLE: case OP_RENDER_COND:
-        case OP_CLEAR_BUF:
+        case OP_CLEAR_BUF: {
+            int ga_x = -1;   // OOT_GPU_ACCT: copies and texture clears; they end any open pass themselves
+            if (h->op == OP_COPY_B2B || h->op == OP_COPY_B2T || h->op == OP_COPY_T2B || h->op == OP_COPY_T2T || h->op == OP_CLEAR_TEX || h->op == OP_CLEAR_BUF)
+                if (vk_ga_on()) vk_exec_pass_end(ex), ga_x = vk_ga_open(ex->cb);
             vk_exec_op_xfer(ex, h->op, a);
+            vk_ga_close(ex->cb, ga_x, GA_XFER, h->op, 0, 0);
             break;
+        }
         default: rt_fatal("vk: op %s has no replay handler", nvn_op_name(h->op));
         }
         if (split_draws >= split_n) maybe_split(ex);

@@ -31,6 +31,7 @@
 #include "host.h"
 #include "nvn_api.h"
 #include "vk.h"
+#include "vk_gpu_acct.h"
 #include "vk_exec.h"
 
 #define WEAK __attribute__((weak))
@@ -109,6 +110,7 @@ static void present_image(const tex_t *t, const int crop[4], uint64_t at_ns, uin
     static volatile long n_skipped;
     vk_exec_frame_log(t, frame);
     vk_mem_census(frame);
+    vk_ga_frame(frame);
     if (vk_dump_armed) vk_dump_present(frame);
     __atomic_store_n(&gfx_counters.validation_errors, (uint64_t)vk_validation_errors_total(), __ATOMIC_RELAXED);
     const VkTexImage *img = vk_texture_get(t);

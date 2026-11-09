@@ -32,6 +32,7 @@
 #include "nvn_hmap.h"
 #include "sm86_lower.h"
 #include "vk.h"
+#include "vk_gpu_acct.h"
 #include "vk_exec.h"
 
 #define MAX_BINDINGS 128
@@ -185,7 +186,7 @@ static uint64_t bind_gen = 1;            // bumped by every bind op that writes 
 static void cb_done(void *arg) {   // completion thread
     CbRes *r = arg;
     VkCtx *c = vk_ctx();
-    for (int i = 0; i < r->nwritten; i++) vk_guest_written(r->written[i].addr, r->written[i].size);
+    for (int i = 0; i < r->nwritten; i++) vk_guest_written_gpu(r->written[i].addr, r->written[i].size);   // storage, xfb and uniform updates: all into the mirror
     for (int i = 0; i < r->npools; i++) {
         vkResetDescriptorPool(c->device, r->pools[i], 0);
         AcquireSRWLockExclusive(&spare_lock);
@@ -3795,6 +3796,14 @@ static void cst_end(VkExec *ex, int pair, const GfxShader *cs, const uint32_t gr
     vk_completion_add(ex->fence, cst_read, r);
 }
 
+// OOT_GPU_ACCT: the input id of a compute program as one number for the CSV.
+static uint64_t ga_id(const GfxShader *cs) {
+    const uint8_t *iid = gfx_shader_input_id(cs);
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = v << 8 | iid[i];
+    return v;
+}
+
 // OOT_SKIP_CS=all|<hex>[,<hex>...]|!<hex>[,...] (diagnostic): compute dispatches of every shader, of those whose input
 // id starts with one of the prefixes, or (!) of all but those, are not recorded; for finding the kernel behind a GPU timeout (2026-11-06: the
 // Kokiri Forest level loses the device on its first frames). Logs each shader it skips once.
@@ -3908,8 +3917,9 @@ static void op_dispatch(VkExec *ex, const p_dispatch *d) {
     bind_resources(ex, info);
     twin_dispatch = 0;
     gw_n = 0;
-    int tp = cst_begin(ex);
+    int tp = cst_begin(ex), ga = vk_ga_open(ex->cb);
     vkCmdDispatch(ex->cb, (uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z);
+    vk_ga_close(ex->cb, ga, GA_CS, ga_id(cs), (uint64_t)(uint32_t)d->x << 32 | (uint32_t)d->y, (uint32_t)d->z);
     cst_end(ex, tp, cs, (const uint32_t[3]){(uint32_t)d->x, (uint32_t)d->y, (uint32_t)d->z});
     ex->recorded++;
     if (vk_dump_armed) vk_dump_dispatch(ex, cs, p, info, d), dump_push(ex);
@@ -4013,7 +4023,9 @@ static void op_dispatch_ind(VkExec *ex, const p_dispatch_ind *d) {
     }
     ind_log(ex, &ip, cs, d->ind);
     mwatch_add(d->ind);   // OOT_MESH_WATCH: who writes the indirect dispatch's group counts too
+    int ga = vk_ga_open(ex->cb);
     vkCmdDispatchIndirect(ex->cb, ip.buffer, ip.offset);
+    vk_ga_close(ex->cb, ga, GA_CS, ga_id(cs), 0, 1);
     ex->recorded++;
     vk_mem_count(ip.cls, VK_MUSE_IND, sizeof(VkDispatchIndirectCommand));
     VK_MEM_BOUND(ip);
@@ -4399,9 +4411,10 @@ static int mesh_dispatch(VkExec *ex, int m, uint32_t groups) {
             }
         }
         if (cs && p && info) {
-            int tp = cst_begin(ex);   // OOT_CS_TIME: the task and mesh stages' GPU time, with the kernels'
+            int tp = cst_begin(ex), ga = vk_ga_open(ex->cb);   // OOT_CS_TIME: the task and mesh stages' GPU time, with the kernels'
             if (m == 1 && M.mi) vkCmdDispatchIndirect(ex->cb, MI.buf, M.mi_off);
             else vkCmdDispatch(ex->cb, groups, 1, 1);
+            vk_ga_close(ex->cb, ga, m ? GA_MESH : GA_TASK, ga_id(cs), groups, M.mi ? 1 : 0);
             cst_end(ex, tp, cs, (const uint32_t[3]){groups, 1, 1});
             ex->recorded++;
             ok = 1;
@@ -4486,7 +4499,9 @@ static void mesh_compact(VkExec *ex) {
     rec_push(MC.push, ex->cb, VK_PIPELINE_BIND_POINT_COMPUTE, MC.layout, 0, 2, w);
     uint32_t pc[5] = {(uint32_t)(M.task_size / 4), (uint32_t)(M.mi_off / 4), MI_MAX_GROUPS, MESH_MAX_TASKS, SM86_MESH_INDEX / 4};
     vkCmdPushConstants(ex->cb, MC.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
+    int ga = vk_ga_open(ex->cb);
     vkCmdDispatch(ex->cb, 1, 1, 1);
+    vk_ga_close(ex->cb, ga, GA_COMPACT, 0, 0, 0);
     ex->recorded += 3;
     vk_exec_barrier_compute(ex);   // the list and the counts, for the mesh stage and as indirect arguments
 }

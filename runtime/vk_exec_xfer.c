@@ -69,7 +69,7 @@ typedef struct { uint64_t addr, size; } Range;
 
 static void guest_written_cb(void *arg) {
     Range *r = arg;
-    vk_guest_written(r->addr, r->size);
+    vk_guest_written_gpu(r->addr, r->size);   // copies and fills: VK_MEM_PICK chose the mirror
     free(r);
 }
 
