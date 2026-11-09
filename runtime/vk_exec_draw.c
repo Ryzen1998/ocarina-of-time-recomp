@@ -4235,7 +4235,7 @@ static void ms_note(VkExec *ex, const VkMemSpan *ip, uint64_t ind) {
 
 // OOT_MESH_REC=<frame>:<mesh hash prefix> (diagnostic): the mesh records of up to 8 such draws of that frame are written
 // to build/logs/meshrec/<hash>_<n>.bin (a u32 header: groups, stride, map offset, mesh count of bytes; then the records).
-#define MREC_BYTES (4u << 20)
+#define MREC_BYTES (24u << 20)   // 768 groups: the largest plant list seen is 562 (the crown list 0x2a031c000, 2026-11-09)
 static struct { VkBuffer buf; VmaAllocation mem; uint8_t *map; uint32_t next; } MREC;
 typedef struct { uint32_t slot, groups, bytes; uint64_t hm; } MeshRecRead;
 static void mesh_rec_read(void *arg) {
