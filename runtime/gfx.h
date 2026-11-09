@@ -97,6 +97,10 @@ typedef struct {
     uint8_t bindless;           // TEX/IMG: a pool-indexed array (Ryujinx BindlessElimination: handle 0x40000000, cbuf 0)
     uint8_t pool;               // TEX: GFX_POOL_* binding + 1 of that array in the pool set; 0: not one, or unsupported
 } GfxShaderRes;
+// A variant of a mesh fragment program that discards what lies clearly in front of the stored depth (gfx_shader.c spirv_eq_band); its extra
+// sampled image is reported with this slot, and the replay binds the depth attachment there (vk_exec_draw.c).
+#define GFX_EQ_DEPTH_SLOT 127
+const struct GfxShader *gfx_shader_eq_variant(const struct GfxShader *base);
 // Pool-indexed (bindless) sampling. The translator turns a sample through a handle loaded from a constant buffer into an
 // index into arrays standing for the bound pools: texture id (handle & 0xfffff) into an array of GFX_POOL_TEXTURES
 // separate images per view type, sampler id (handle >> 20) into an array of GFX_POOL_SAMPLERS samplers

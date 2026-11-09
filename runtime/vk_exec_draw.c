@@ -2148,6 +2148,8 @@ static void feedback_written(VkExec *ex, const VkPipeState *s) {
         if (ex->color[i].image && !(ex->fb_dirty >> i & 1) && vk_pipeline_target_wmask(s, (int)i)) ex->fb_dirty |= 1u << i;
 }
 
+static VkImageView eq_depth_view;   // the depth attachment for the variant fragment program of this draw (gfx_shader_eq_variant), or none
+
 static void tex_info_full(VkExec *ex, const GfxShaderRes *r, uint64_t h, int storage, int separate,
                           VkDescriptorImageInfo *out, VkImage *image);
 
@@ -3081,6 +3083,11 @@ static void bind_resources(VkExec *ex, const VkPipeInfo *info) {
                     if (r->cbuf_slot >= 3 || (r->cbuf_slot == 0 && slot < 0)) h = cbuf_handle(ex, st, r, k);
                     else if (img) h = slot >= 0 && slot < 32 ? ex->img[st][slot] : 0;
                     else h = slot >= 0 && slot < 128 ? ex->tex[st][slot] : 0;
+                    if (slot == GFX_EQ_DEPTH_SLOT && eq_depth_view && st == NVN_STAGE_FS) {   // the depth attachment, read-only in this draw (gfx_shader_eq_variant)
+                        o[k].image = (VkDescriptorImageInfo){VK_NULL_HANDLE, eq_depth_view, VK_IMAGE_LAYOUT_GENERAL};
+                        o[k].w[2] = (uint32_t)o[k].image.imageLayout;
+                        continue;
+                    }
                     {   // OOT_CS_DUMMY_TEX=1 (diagnostic, 2026-11-06): compute shaders read the dummy texture instead of
                         // the bound ones, to tell a texture read from the rest when a kernel loses the device
                         static int dummy_cs = -1;
@@ -3436,6 +3443,14 @@ static int prepare_draw(VkExec *ex, int prim, int32_t count, int restart) {
     uint32_t fbl = feedback_prepare(ex, fs);
     VkPipeState s = ex->pipe;
     s.vs = vs, s.fs = fs;
+    extern int vk_mesh_eq_tolerant;
+    eq_depth_view = VK_NULL_HANDLE;
+    if (vk_mesh_eq_tolerant && s.ds.dt && s.ds.df == 3 && ex->depth.img && (ex->depth.aspect & VK_IMAGE_ASPECT_DEPTH_BIT) && ex->depth.layers == 1 && fs) {
+        // mesh_draw: the test is tolerant, and this variant of the fragment program removes what a strict EQUAL would have cut
+        const GfxShader *eqfs = gfx_shader_eq_variant(fs);
+        VkImageView v = eqfs ? vk_exec_target_view(ex->depth.img, ex->depth.format, VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_ASPECT_DEPTH_BIT, ex->depth.level, ex->depth.base_layer, 1, 0) : VK_NULL_HANDLE;
+        if (v) s.fs = fs = eqfs, eq_depth_view = v;
+    }
     s.feedback = (uint8_t)((fbl & 0xff ? 1 : 0) | (fbl & 0x100 ? 2 : 0));
     s.prim = (uint8_t)prim;
     s.depth_minus_w = (uint8_t)(nvn_depth_minus_w() != 0);
@@ -4499,13 +4514,18 @@ static void mesh_draw(VkExec *ex, const prog_t *mesh, uint32_t groups) {
     // The colour draws of the plants test depth EQUAL against the depth program's pre-pass. The two programs compute the
     // same positions through different code, and about 0.6% of the vertices come out a rounding step apart (at most
     // 1.5e-5 in clip space, 2026-11-09), which changes with the wind each frame: those blades fail the test and leave the
-    // bright sky behind them, the white flickering grass. OOT_MESH_EQ_BIAS=<depth bias units> (default 64, 0 off) turns
-    // the test of a mesh draw into LESS_OR_EQUAL with that much bias towards the camera.
+    // bright sky behind them, the white flickering grass. OOT_MESH_EQ_BIAS=<depth bias units> (default 16, 0 off; the bias counts against OOT_MESH_EQ_BAND, so 64 at z near 1 discarded everything) turns
+    // the test of a mesh draw into LESS_OR_EQUAL with that much bias towards the camera, and prepare_draw gives the fragment program a
+    // depth check (gfx_shader_eq_variant), or the card outside the blade shape would be painted too: the colour programs have no discard of their own.
     extern int vk_mesh_eq_tolerant;
     static float eq_bias = -1;
-    if (eq_bias < 0) { const char *e = getenv("OOT_MESH_EQ_BIAS"); eq_bias = e && *e ? (float)atof(e) : 64.0f; }
+    if (eq_bias < 0) { const char *e = getenv("OOT_MESH_EQ_BIAS"); eq_bias = e && *e ? (float)atof(e) : 16.0f; }
     uint32_t bias_dirty = ex->dirty & VK_EXEC_DIRTY_DEPTH_BIAS;
-    if (eq_bias > 0) {
+    // OOT_MESH_EQ_AB=<frames> (diagnostic): this tolerance on and off in alternating spans of that many frames, so one run shows both at one spot.
+    static int eq_ab = -1;
+    if (eq_ab < 0) { const char *e = getenv("OOT_MESH_EQ_AB"); eq_ab = e && *e ? atoi(e) : 0; }
+    int eq_on = eq_bias > 0 && (!eq_ab || (gfx_stats().frames / (uint64_t)eq_ab & 1));
+    if (eq_on) {
         vk_mesh_eq_tolerant = 1, B.st_valid = 0;
         ex->dirty &= ~VK_EXEC_DIRTY_DEPTH_BIAS;
         vkCmdSetDepthBias(ex->cb, -eq_bias, 0.0f, 0.0f);
@@ -4513,7 +4533,7 @@ static void mesh_draw(VkExec *ex, const prog_t *mesh, uint32_t groups) {
     }
     p_draw d = {4, 0, (int32_t)(3 * prims), 0, (int32_t)groups};   // NVN triangles
     op_draw(ex, &d);
-    if (eq_bias > 0) {
+    if (eq_on) {
         vk_mesh_eq_tolerant = 0, B.st_valid = 0;
         ex->dirty |= VK_EXEC_DIRTY_DEPTH_BIAS;   // the next draw gets the game's own values back
     }

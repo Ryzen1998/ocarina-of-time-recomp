@@ -876,6 +876,174 @@ enum { OP_ENTRY_POINT = 15, OP_EXECUTION_MODE = 16, OP_TYPE_INT = 21, OP_TYPE_FL
        OP_TYPE_ARRAY = 28, OP_TYPE_POINTER = 32, OP_VARIABLE = 59, OP_DECORATE = 71,
        DEC_BUILTIN = 11, DEC_LOCATION = 30, DEC_COMPONENT = 31, SC_INPUT = 1, SC_OUTPUT = 3, EM_LOCAL_SIZE = 17 };
 
+// ---- mesh colour draws that test depth EQUAL (vk_exec_draw.c mesh_draw)
+//
+// A plant's depth program and its colour program are different programs: the colour program has no alpha discard and relies on the
+// EQUAL test to keep to the shape the depth program carved. A colour vertex can round one step away from its depth twin, so a strict
+// EQUAL leaves holes, and a plain LESS_OR_EQUAL paints the whole card. So the test stays tolerant, and a variant of the fragment
+// program discards, at the head of its entry function, what lies clearly in front of the stored depth:
+//     if (texelFetch(depth, ivec2(gl_FragCoord.xy), 0).r - gl_FragCoord.z > band) discard;
+// The depth attachment is read-only in these draws. band: OOT_MESH_EQ_BAND.
+static uint32_t *spirv_eq_band(const uint32_t *w, uint64_t words, uint32_t binding, float band, uint64_t *out_words) {
+    enum { OP_TYPE_BOOL = 20, OP_TYPE_IMAGE = 25, OP_LABEL = 248, OP_FUNCTION = 54, OP_LOAD = 61, OP_LINE = 8, OP_NOLINE = 317, OP_PHI = 245 };
+    if (words < 6 || w[0] != 0x07230203) return NULL;
+    uint32_t bound = w[3], entry = 0, frag = 0, tfloat = 0, tint = 0, tbool = 0, tv4 = 0, tv2i = 0, timg = 0, pv4 = 0, pimg = 0;
+    uint64_t ep_at = 0, types_at = 0, funcs_at = 0;
+    for (uint64_t i = 5; i < words;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > words) return NULL;
+        if (op == OP_ENTRY_POINT && !ep_at && w[i + 1] == 4) ep_at = i, entry = w[i + 2];
+        else if (op == OP_DECORATE && len == 4 && w[i + 2] == DEC_BUILTIN && w[i + 3] == 15) frag = w[i + 1];
+        else if (op == OP_TYPE_FLOAT && w[i + 2] == 32) tfloat = w[i + 1];
+        else if (op == OP_TYPE_INT && w[i + 2] == 32 && w[i + 3] == 1) tint = w[i + 1];
+        else if (op == OP_TYPE_BOOL) tbool = w[i + 1];
+        int section = op == 17 || op == 10 || op == 11 || op == 14 || op == 15 || op == 16 || op == 331 || (op >= 3 && op <= 8) || op == 330 ||
+                      (op >= 71 && op <= 75) || op == 332 || op == 5632 || op == 5633;
+        if (!section && !types_at) types_at = i;
+        if (op == OP_FUNCTION && !funcs_at) funcs_at = i;
+        i += len;
+    }
+    if (!ep_at || !types_at || !funcs_at || !tfloat) return NULL;
+    for (uint64_t i = types_at; i < funcs_at;) {   // composites over the scalars just found
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == OP_TYPE_VECTOR && w[i + 2] == tfloat && w[i + 3] == 4) tv4 = w[i + 1];
+        else if (op == OP_TYPE_VECTOR && tint && w[i + 2] == tint && w[i + 3] == 2) tv2i = w[i + 1];
+        else if (op == OP_TYPE_IMAGE && len == 9 && w[i + 2] == tfloat && w[i + 3] == 1 && !w[i + 4] && !w[i + 5] && !w[i + 6] && w[i + 7] == 1 && !w[i + 8]) timg = w[i + 1];
+        i += len;
+    }
+    for (uint64_t i = types_at; i < funcs_at;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (op == OP_TYPE_POINTER && w[i + 2] == SC_INPUT && tv4 && w[i + 3] == tv4) pv4 = w[i + 1];
+        else if (op == OP_TYPE_POINTER && !w[i + 2] && timg && w[i + 3] == timg) pimg = w[i + 1];
+        i += len;
+    }
+    uint64_t fn_at = 0, label_at = 0, code_at = 0;
+    for (uint64_t i = funcs_at; i < words;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!fn_at && op == OP_FUNCTION && w[i + 2] == entry) fn_at = i;
+        else if (fn_at && op == OP_LABEL && !label_at) label_at = i, code_at = i + len;
+        else if (label_at) {
+            if (op != OP_VARIABLE && op != OP_LINE && op != OP_NOLINE) break;
+            code_at = i + len;
+        }
+        i += len;
+    }
+    if (!label_at) return NULL;
+    uint32_t label0 = w[label_at + 1];
+    uint32_t *o = malloc((size_t)(words + 200) * 4);
+    if (!o) return NULL;
+    uint64_t n = 0;
+#define INS(OP, ...) do { uint32_t t_[] = {__VA_ARGS__}; o[n++] = (uint32_t)(OP) | (uint32_t)(sizeof t_ / 4 + 1) << 16; memcpy(o + n, t_, sizeof t_); n += sizeof t_ / 4; } while (0)
+    int new_frag = !frag;
+    if (new_frag) frag = bound++;
+    uint32_t var = bound++, cont = bound++, kill = bound++;
+    int new_int = !tint, new_bool = !tbool, new_v4 = !tv4, new_v2i = !tv2i, new_img = !timg, new_pv4 = !pv4, new_pimg = !pimg;
+    if (new_int) tint = bound++;
+    if (new_bool) tbool = bound++;
+    if (new_v4) tv4 = bound++;
+    if (new_v2i) tv2i = bound++;
+    if (new_img) timg = bound++;
+    if (new_pv4) pv4 = bound++;
+    if (new_pimg) pimg = bound++;
+    uint32_t c_band = bound++, c_zero = bound++, fc = bound++, x = bound++, y = bound++, z = bound++, xi = bound++, yi = bound++, xy = bound++,
+             img = bound++, tx = bound++, d = bound++, diff = bound++, cond = bound++;
+    uint32_t bandbits;
+    memcpy(&bandbits, &band, 4);
+    memcpy(o, w, 20), n = 5;
+    for (uint64_t i = 5; i < types_at;) {   // up to the types: the entry point gains the input, the decorations gain the new ones
+        uint32_t len = w[i] >> 16;
+        memcpy(o + n, w + i, len * 4);
+        if (i == ep_at && new_frag) o[n] += 1u << 16, n += len, o[n++] = frag;
+        else n += len;
+        i += len;
+    }
+    INS(OP_DECORATE, var, 34, 0);
+    INS(OP_DECORATE, var, 33, binding);
+    if (new_frag) INS(OP_DECORATE, frag, DEC_BUILTIN, 15);
+    memcpy(o + n, w + types_at, (size_t)(funcs_at - types_at) * 4), n += funcs_at - types_at;
+    if (new_int) INS(OP_TYPE_INT, tint, 32, 1);
+    if (new_bool) INS(OP_TYPE_BOOL, tbool);
+    if (new_v4) INS(OP_TYPE_VECTOR, tv4, tfloat, 4);
+    if (new_v2i) INS(OP_TYPE_VECTOR, tv2i, tint, 2);
+    if (new_img) INS(OP_TYPE_IMAGE, timg, tfloat, 1, 0, 0, 0, 1, 0);
+    if (new_pv4) INS(OP_TYPE_POINTER, pv4, SC_INPUT, tv4);
+    if (new_pimg) INS(OP_TYPE_POINTER, pimg, 0, timg);
+    INS(OP_CONSTANT, tfloat, c_band, bandbits);
+    INS(OP_CONSTANT, tint, c_zero, 0);
+    if (new_frag) INS(OP_VARIABLE, pv4, frag, SC_INPUT);
+    INS(OP_VARIABLE, pimg, var, 0);
+    memcpy(o + n, w + funcs_at, (size_t)(code_at - funcs_at) * 4), n += code_at - funcs_at;
+    INS(OP_LOAD, tv4, fc, frag);
+    INS(81, tfloat, x, fc, 0);
+    INS(81, tfloat, y, fc, 1);
+    INS(81, tfloat, z, fc, 2);
+    INS(110, tint, xi, x);
+    INS(110, tint, yi, y);
+    INS(80, tv2i, xy, xi, yi);
+    INS(OP_LOAD, timg, img, var);
+    INS(95, tv4, tx, img, xy, 2, c_zero);          // OpImageFetch, Lod 0
+    INS(81, tfloat, d, tx, 0);
+    INS(131, tfloat, diff, d, z);                  // OpFSub: positive when the fragment is in front of the stored depth
+    INS(186, tbool, cond, diff, c_band);           // OpFOrdGreaterThan
+    INS(247, cont, 0);                             // OpSelectionMerge
+    INS(250, cond, kill, cont);                    // OpBranchConditional
+    INS(OP_LABEL, kill);
+    o[n++] = 252u | 1u << 16;                      // OpKill
+    INS(OP_LABEL, cont);
+    for (uint64_t i = code_at; i < words;) {   // the rest: a phi that named the entry block now names the block after the test
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        memcpy(o + n, w + i, len * 4);
+        if (op == OP_PHI) for (uint32_t k = 4; k < len; k += 2) if (o[n + k] == label0) o[n + k] = cont;
+        n += len, i += len;
+    }
+    o[3] = bound;
+    *out_words = n;
+    return o;
+#undef INS
+}
+
+static SRWLOCK eqv_lock = SRWLOCK_INIT;
+static struct { const GfxShader *base, *variant; } eqv[4096];
+
+const GfxShader *gfx_shader_eq_variant(const GfxShader *base) {
+    static float band = -1;
+    if (band < 0) { const char *e = getenv("OOT_MESH_EQ_BAND"); band = e && *e ? (float)atof(e) : 3e-6f; }
+    uint32_t h = (uint32_t)(((uintptr_t)base >> 4) * 0x9E3779B1u) >> 20;
+    AcquireSRWLockShared(&eqv_lock);
+    for (uint32_t i = 0; i < 4096 && eqv[(h + i) & 4095].base; i++)
+        if (eqv[(h + i) & 4095].base == base) { const GfxShader *v = eqv[(h + i) & 4095].variant; ReleaseSRWLockShared(&eqv_lock); return v; }
+    ReleaseSRWLockShared(&eqv_lock);
+    uint32_t span = 1;
+    for (int k = 0; k < GFX_RES_KINDS; k++)
+        for (int i = 0; i < base->nres[k]; i++) {
+            const GfxShaderRes *r = &base->res[k][i];
+            uint32_t e = r->binding + (uint32_t)(r->count ? r->count : 1);
+            if (!r->pool && e > span) span = e;
+        }
+    uint64_t n2 = 0;
+    uint32_t *code = spirv_eq_band(base->spirv, base->words, span, band, &n2);
+    GfxShader *v = NULL;
+    GfxShaderRes *res = code ? malloc(sizeof *res * (size_t)(base->nres[GFX_RES_TEX] + 1)) : NULL;
+    if (res && (v = malloc(sizeof *v))) {
+        *v = *base;
+        memcpy(res, base->res[GFX_RES_TEX], sizeof *res * (size_t)base->nres[GFX_RES_TEX]);
+        res[base->nres[GFX_RES_TEX]] = (GfxShaderRes){.binding = (uint16_t)span, .slot = GFX_EQ_DEPTH_SLOT, .type = 3, .cbuf_slot = 2, .count = 1, .separate = 1};
+        v->res[GFX_RES_TEX] = res, v->nres[GFX_RES_TEX]++;
+        v->spirv = code, v->words = n2, v->next = NULL;
+        v->key[0] ^= 0x5a;   // not the base program in the keys of pipelines and libraries
+    }
+    if (!v) rt_log("gfx_shader: the depth band variant of a mesh fragment program failed; the draw keeps its plain program");
+    const GfxShader *ret = v;
+    AcquireSRWLockExclusive(&eqv_lock);
+    for (uint32_t i = 0; i < 4096; i++) {
+        if (eqv[(h + i) & 4095].base == base) { ret = eqv[(h + i) & 4095].variant; break; }   // another thread won
+        if (!eqv[(h + i) & 4095].base) { eqv[(h + i) & 4095].base = base, eqv[(h + i) & 4095].variant = v; break; }
+    }
+    ReleaseSRWLockExclusive(&eqv_lock);
+    return ret;
+}
+
+
 // Interface Locations and the compute workgroup size from the module. Ids beyond 2^20 are ignored (Ryujinx modules stay
 // far below).
 static void reflect_spirv(GfxShader *s) {
