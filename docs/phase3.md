@@ -2067,7 +2067,7 @@ Next, for real gains: find the GPU time the `perf:` line misses (time the `vk_up
 
 **Tool.** `OOT_GPU_ACCT=<first>:<frames>:<every>` (`runtime/vk_gpu_acct.c`, read with `tools/gpu_acct.py build/logs/gpu-acct.csv`) stamps every command buffer of every submission (replay parts, mirror uploads, upload batches, the present) and, inside the replay, every render pass, dispatch and mesh stage, on one clock. The first version (run-874) billed the rendering to the next barrier: the driver writes a timestamp without waiting for work still in flight. Every stamp is now preceded by a full barrier (`OOT_GPU_ACCT_DRAIN=0` removes it), which the replay nearly always has at that point anyway. Windows of 60 frames, every 600 frames, walk `build/logs/move1-input.txt`, median of frames per window.
 
-| ms per frame | Before the fix (run-875, 5 windows) | After the fix (run-890, 8 windows) | Measured how |
+| ms per frame | Before the fix (run-875, first 4 windows) | After the fix (run-890, first 4 windows) | Measured how |
 |---|---|---|---|
 | Frame period | 19.6-20.9 | 16.7-17.4 | present to present |
 | Queue busy | 17.9-18.9 | 12.2-15.4 | union of all command buffers |
