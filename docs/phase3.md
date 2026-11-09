@@ -2004,3 +2004,13 @@ Measured with `build/logs/saria-route.txt`, 170 s, flashes counted on a `tools/p
 | 778 | the same, as the default | 0 | 13.8 GiB | 12.5 ms |
 
 `vk_texture_by_id_locked` now renews `rel_frame` when a draw reads a released entry, and the default age is 8 frames. Age 30 from the last read keeps the old scene's targets too long at the scene change into the Saria area and the GPU time does not recover, as before. Run-778, in that dialogue, ran at 46.4 fps (1% low 33.3) in its second minute and 49.6 (34.5) in the last 50 s, with 0 driver resets. The blocky black staircase after a near tree leaves the view (`build/reference/user-rec-2/burst-110.68.png`, +2, +3) was not reproduced in this scene, so whether this fixes it is open.
+
+With Link really walking (`tools/play.py`, run-779, 150 s) there are 0 flashes too, at 48.3 fps (1% low 33.1) in the second minute, with the GPU at 11 to 15 ms and a VRAM peak of 13.9 GiB.
+
+## The leafless tree (2026-11-09, open)
+
+The big tree left of the shop on the mossy rock has a full crown on the Switch 2 (`build/reference/user-rec-2/tree-compare.png`) and bare branches here when Link is near it; from farther away the crown is there and fills in as he backs off. `build/logs/bare-tree-route.txt` (`tools/play.py run --route-file ... --from none --seconds 105`) shows it from about 80 s and backs away from about 91 s with the current save.
+
+Ruled out, each by a run with the crown still behaving the same (runs 781..786, 0 driver resets): occlusion reports (`OOT_OQ_VISIBLE=1`); the plant list at 0x29cb0a000 (programs 6cb6f80d and b55ba187: it grows from 132 to 280 groups while the crown appears, but skipping it removes near plants and the crown stays); the buckets at 0x2a169c010 and 0x2a0ccc010, whose counts read 0 (skipping 69066810 and 2f4435de changes nothing visible on the crown). No shader fails to lower and no draw is skipped.
+
+Near and far dumps are in `build/logs/dump-treenear` (frame 3405) and `dump-treefar` (frame 3860). The main colour pass has 1304 draws near and 1398 far, and the pipelines found in only one of them are 3 single draws on each side, so the crown is not a material of its own. The largest differences are vs b30a9f44 / fs 16ff2e6b (411 draws near, 446 far) and vs 3ab2bdee / fs b1d3a7f1 (33 and 45). Next: find which of those draws carry the crown (crop the tree in the pass images, then a per-pipeline skip switch), and check whether the game adds the near leaves from the GPU readback list the foliage code uses (the lists at 0x29bc1a000 and 0x29bc1d000), which has not been tested. `OOT_MESH_SERIES` holds 8192 slots, about 100 frames at this draw count.
