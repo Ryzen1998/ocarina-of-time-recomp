@@ -3840,8 +3840,8 @@ uint64_t sm86_probe_tag(const uint8_t *code, uint32_t code_size) {
 
 static uint64_t probe_tag_calc(const uint8_t *code, uint32_t code_size) {
     uint64_t tag = 0, h = 0;
-    const char *names[4] = {"OOT_SM86_PROBE", "OOT_SM86_COUNT", "OOT_SM86_FORCE", "OOT_ISBE_SPY"};
-    for (int i = 0; i < 4; i++) {
+    const char *names[5] = {"OOT_SM86_PROBE", "OOT_SM86_COUNT", "OOT_SM86_FORCE", "OOT_ISBE_SPY", "OOT_SM86_COUNT_RANGE"};
+    for (int i = 0; i < 5; i++) {
         const char *e = getenv(names[i]);
         if (!e || !*e) continue;
         if (!h) h = fnv64(code, code_size);
@@ -3992,6 +3992,24 @@ static void count_emit(L *l, uint32_t k) {
         emit(l, base(l, 0x5cb0000000000000ull, d, 0) | ((uint64_t)2 << 8) | ((uint64_t)2 << 10) | ((uint64_t)d << 20) | ((uint64_t)1 << 49));
     }
     else mov_imm(l, d, 1);
+    // OOT_SM86_COUNT_RANGE=<code hash>:<reg>:<lo>:<hi> (decimal): only threads with lo <= R[reg] < hi add to the counters.
+    static int rr = -2, rlo, rhi;
+    if (rr == -2) {
+        const char *e = getenv("OOT_SM86_COUNT_RANGE"), *c = e ? strchr(e, ':') : NULL;
+        rr = -1;
+        if (c) sscanf(c + 1, "%d:%d:%d", &rr, &rlo, &rhi);
+    }
+    if (rr >= 0) {
+        uint32_t t = S(l, s + 3), u = S(l, s + 4), v = S(l, s + 5);
+        to_reg_into(l, reg_src((uint32_t)rr), t);
+        to_reg_into(l, reg_src((uint32_t)rr), u);
+        mov_imm(l, v, (uint32_t)rlo);
+        emit(l, base(l, 0x5b50000000000000ull, t, t) | ((uint64_t)v << 20) | ((uint64_t)PT << 39) | ((uint64_t)6 << 49) | ((uint64_t)1 << 48));   // >= lo: ~0
+        mov_imm(l, v, (uint32_t)rhi);
+        emit(l, base(l, 0x5b50000000000000ull, u, u) | ((uint64_t)v << 20) | ((uint64_t)PT << 39) | ((uint64_t)1 << 49) | ((uint64_t)1 << 48));   // < hi: ~0
+        emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)t << 20) | ((uint64_t)PT << 48));   // LOP.AND
+        emit(l, base(l, 0x5c40000000000000ull, d, d) | ((uint64_t)u << 20) | ((uint64_t)PT << 48));
+    }
     Src w = {0};
     w.kind = 2, w.cb_bank = 0, w.cb_off = SM86_COUNT_C0;
     to_reg_into(l, w, a);

@@ -368,6 +368,8 @@ static const char *copy_out(VkExec *ex, VkImage image, VkFormat vf, VkImageAspec
 static uint64_t frame_now(void);
 static uint64_t bd_addr, bd_size, bd_off, bd_stride;
 static uint32_t bd_w, bd_h;
+static char bd_cs[17];
+static int bd_cs_slot;
 static uint8_t *bd_prev;
 static FILE *bufs_f;
 
@@ -1089,6 +1091,14 @@ void vk_dump_dispatch(VkExec *ex, const GfxShader *cs, VkPipeline p, const VkPip
         rt_log("vk_dump: first compute dispatch: dumping frame %llu from here", (unsigned long long)dump_frame);
     }
     if (!active()) goto out;
+    if (bd_cs[0] && !bd_size) {   // OOT_DUMP_BUF=cs:...: the buffer this dispatch has in that slot, from here on
+        char hx[17];
+        snprintf(hx, sizeof hx, "%016llx", (unsigned long long)shader_hash(cs));
+        if (!strncmp(hx, bd_cs, strlen(bd_cs)) && bd_cs_slot >= 0 && bd_cs_slot < 16 && ex->ssbo[5][bd_cs_slot].addr) {
+            bd_addr = ex->ssbo[5][bd_cs_slot].addr, bd_size = ex->ssbo[5][bd_cs_slot].size;
+            rt_log("vk_dump: OOT_DUMP_BUF follows slot %d of %s: %#llx+%#llx", bd_cs_slot, hx, (unsigned long long)bd_addr, (unsigned long long)bd_size);
+        }
+    }
     int n = seq++;
     pass_decide(0);
     last_targets = 0;
@@ -1269,7 +1279,12 @@ void vk_dump_init(void) {
     images_f = fopen(path, "w");
     if (!passes_f || !images_f) rt_fatal("vk_dump: cannot write to %s", dir);
     const char *bf = cfg_get("OOT_DUMP_BUF");
-    if (bf && *bf) {
+    if (bf && !strncmp(bf, "cs:", 3)) {   // OOT_DUMP_BUF=cs:<shader hash prefix>:<storage slot>: that slot of the first dispatch of the program (addresses move between runs)
+        const char *c = strchr(bf + 3, ':');
+        if (c && (size_t)(c - bf - 3) < sizeof bd_cs) memcpy(bd_cs, bf + 3, (size_t)(c - bf - 3)), bd_cs_slot = atoi(c + 1);
+        snprintf(path, sizeof path, "%s/bufs.txt", dir);
+        if (bd_cs[0] && !(bufs_f = fopen(path, "w"))) bd_cs[0] = 0;
+    } else if (bf && *bf) {
         char *q;
         bd_addr = strtoull(bf, &q, 0);
         if (*q == ':') bd_size = strtoull(q + 1, &q, 0);
