@@ -620,7 +620,12 @@ static void sweep_pressure(void) {   // tex_lock held
     for (Tex *e = rel_head, *next; e && dropped < PRESSURE_STEP; e = next) {
         next = e->rel_next;
         int old = rel_age && now - e->rel_frame >= (uint64_t)rel_age;
-        if (!old && (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty)) continue;
+        // Unwritten mirrored entries used to go at any age: the game takes those back within frames (Kokiri Forest, 2026-11-09: 180
+        // dropped and 45 refilled every 60 frames, about 53 MiB of texture copies a frame on the replay thread), so they
+        // wait for the same age as the others. OOT_TEX_DROP_CLEAN=1: the old rule.
+        static int drop_clean = -1;
+        if (drop_clean < 0) { const char *c = getenv("OOT_TEX_DROP_CLEAN"); drop_clean = c && c[0] == '1'; }
+        if (!old && (!drop_clean || !e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty)) continue;
         if (old && (!e->pub.mirrored || e->pub.gpu_owned || e->gpu_dirty)) n_age_drops++;
         destroy_tex(e);
         dropped++, n_pressure_drops++;
@@ -749,6 +754,46 @@ static int storage_readable(const void *p, size_t n) {
     return 1;
 }
 
+// OOT_TEX_CHURN=<frames> (diagnostic): which textures are uploaded again and again, with the frames since their last
+// upload, every <frames> frames (the 60 MiB a frame of texture uploads in Kokiri Forest, 2026-11-09).
+enum { CH_N = 8192 };
+typedef struct { uint64_t addr, last, bytes; uint32_t w, h, fmt, n, gap_sum, re; } ChEnt;
+static ChEnt ch_tab[CH_N];
+static int ch_n;
+static int ch_cmp(const void *a, const void *b) {
+    uint64_t x = ((const ChEnt *)a)->bytes, y = ((const ChEnt *)b)->bytes;
+    return x < y ? 1 : x > y ? -1 : 0;
+}
+static void churn_note(const Tex *e, uint64_t bytes) {
+    static int period = -1;
+    if (period < 0) { const char *c = getenv("OOT_TEX_CHURN"); period = c && *c ? atoi(c) : 0; }
+    if (!period) return;
+    uint64_t now = __atomic_load_n(&gfx_counters.frames, __ATOMIC_RELAXED);
+    static uint64_t next;
+    int k = 0;
+    while (k < ch_n && !(ch_tab[k].addr == e->pub.addr && ch_tab[k].w == e->t.d.width && ch_tab[k].h == e->t.d.height && ch_tab[k].fmt == (uint32_t)e->t.d.format)) k++;
+    if (k == ch_n && ch_n < CH_N) ch_tab[ch_n++] = (ChEnt){e->pub.addr, now, 0, e->t.d.width, e->t.d.height, (uint32_t)e->t.d.format, 0, 0, 0};
+    if (k < ch_n) {
+        ChEnt *c = &ch_tab[k];
+        if (c->n) c->gap_sum += (uint32_t)(now - c->last);
+        c->n++, c->bytes += bytes, c->last = now, c->re += e->uploaded != 0;
+    }
+    if (now >= next) {
+        if (next) {
+            qsort(ch_tab, (size_t)ch_n, sizeof *ch_tab, ch_cmp);
+            uint64_t all = 0;
+            for (int i = 0; i < ch_n; i++) all += ch_tab[i].bytes;
+            rt_log("texchurn: frame %llu: %d textures, %.0f MiB uploaded in the period", (unsigned long long)now, ch_n, all / 1048576.0);
+            for (int i = 0; i < ch_n && i < 16; i++) {
+                const ChEnt *c = &ch_tab[i];
+                rt_log("texchurn:   %#llx %ux%u fmt %#x: x%u (%u re-uploads), %.1f MiB, mean gap %.1f frames", (unsigned long long)c->addr, c->w, c->h, c->fmt,
+                       c->n, c->re, c->bytes / 1048576.0, c->n > 1 ? (double)c->gap_sum / (c->n - 1) : 0.0);
+            }
+        }
+        ch_n = 0, next = now + (uint64_t)period;
+    }
+}
+
 static void upload(Tex *e) {
     static volatile long n_bad, n_undecoded, n_unmapped;
     const tex_t *t = &e->t;
@@ -781,7 +826,9 @@ static void upload(Tex *e) {
     VkCommandBuffer cb = vk_upload_begin();
     VkBuffer sb, rbuf = VK_NULL_HANDLE;
     VmaAllocation ralloc = NULL;
+    uint64_t ta0 = kern_now_ns();
     uint8_t *stg = vk_staging(total, &sb, NULL), *rmap = acheck ? vk_staging(decoded, &rbuf, &ralloc) : NULL;
+    uint64_t ta1 = kern_now_ns(), tsw = 0;
     k = 0;
     for (uint32_t lv = 0; lv < levels; lv++)
         for (uint32_t ly = 0; ly < layers; ly++, k++) {
@@ -791,11 +838,12 @@ static void upload(Tex *e) {
             uint8_t *dst = stg + rg[k].bufferOffset, *tmp = (astc && !agpu) || rgb ? malloc(raw) : NULL;
             if (!readable) {
                 memset(tmp ? tmp : dst, 0, raw);
-            } else if (nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
+            } else if (ta0 = kern_now_ns(), nvn_deswizzle(d, lv, ly, t->mem, tmp ? tmp : dst, rb)) {
+                tsw += kern_now_ns() - ta0;
                 log_limited(&n_bad, "texture %#llx fmt %#x target %d: level %u layer %u has no CPU layout; uploaded as zeros",
                             (unsigned long long)e->pub.addr, d->format, d->target, lv, ly);
                 memset(tmp ? tmp : dst, 0, raw);
-            }
+            } else tsw += kern_now_ns() - ta0;
             if (lv == 0 && ly == 0) tex_raw_dump(d, tmp ? tmp : dst, raw, bw, bh, astc);
             if (agpu) {
                 ar[k] = (VkAstcRegion){.src = rg[k].bufferOffset, .w = w, .h = h, .slices = sl, .level = lv, .layer = ly};
@@ -843,6 +891,8 @@ static void upload(Tex *e) {
     free(ar);
     free(rg);
     uint64_t dt = kern_now_ns() - u0;
+    churn_note(e, total);
+    perf_tex_note(e->uploaded, total, ta1 - u0 - (kern_now_ns() - ta1 > 0 ? 0 : 0), tsw);
     if (e->uploaded) {
         n_reuploads++, perf_count(PERF_CNT_TEX_REUP);
         ru_n++, ru_bytes += t->L.size, ru_ns += dt;

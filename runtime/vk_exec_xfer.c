@@ -93,16 +93,87 @@ static void event_cb(void *arg) {
     free(e);
 }
 
+static uint64_t ticks_of_ns(uint64_t ns) { return (uint64_t)((unsigned __int128)ns * 12 / 625); }
+static int rts_state;   // 0 not set up, 1 on, -1 off (OOT_CNT_GPU, below)
+
 // NVNcounterData = {counter, timestamp}; timestamps are Tegra 19.2 MHz ticks (the base of GetSystemTick).
 static void write_counter(uint64_t addr, uint64_t counter) {
-    uint64_t rec[2] = {counter, (uint64_t)((unsigned __int128)kern_now_ns() * 12 / 625)};
+    uint64_t rec[2] = {counter, rts_state > 0 ? kern_now_ns() / 32 : ticks_of_ns(kern_now_ns())};
     memcpy((void *)(uintptr_t)addr, rec, sizeof rec);
+    static long long log_from = -2;   // OOT_CNT_LOG=<frame>: the first 120 reports from that frame on (diagnostic)
+    if (log_from == -2) { const char *e = getenv("OOT_CNT_LOG"); log_from = e && *e ? atoll(e) : -1; }
+    if (log_from >= 0 && gfx_stats().frames >= (uint64_t)log_from) {
+        static int n;
+        if (n++ < 120) rt_log("cntlog: frame %llu addr %#llx counter %llu ticks %llu", (unsigned long long)gfx_stats().frames, (unsigned long long)addr, (unsigned long long)counter, (unsigned long long)rec[1]);
+    }
 }
 
+// Timestamp reports carry the GPU's own time of the point they were recorded at (2026-11-09). Stamped from the CPU at the
+// fence, every report of a submission read the same instant to a few microseconds, and the game takes its wind and
+// falling-leaf time step from the difference of two raw reports: the leaves hung in the air and never expired
+// (swordboiMacNative docs/reference/frame-rate.md, "A game that reads raw timestamp reports at another rate", MIT:
+// behaviour, and the 31.25 MHz: the Switch 2's rate, which the game assumes for these raw values). OOT_CNT_GPU=1 turns it
+// on; default off (run-908..911: no speed change, and the leaves that hang in the air stayed hanging).
+enum { RTS_SLOTS = 8192 };
+static VkQueryPool rts_pool;
+static uint32_t rts_next;
+static volatile LONG rts_busy[RTS_SLOTS];
+static double rts_period;
+static uint64_t rts_mask;
+static uint64_t ticks_of_ns(uint64_t ns);
+static int rts_ready(void) {
+    if (rts_state) return rts_state > 0;
+    rts_state = -1;
+    const char *e = getenv("OOT_CNT_GPU");
+    if (!(e && e[0] == '1')) return 0;   // off by default: run-908..911 showed no speed or leaf change
+    VkCtx *c = vk_ctx();
+    uint32_t nq = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, NULL);
+    VkQueueFamilyProperties *qp = calloc(nq ? nq : 1, sizeof *qp);
+    if (!qp) return 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(c->phys, &nq, qp);
+    uint32_t bits = c->gfx_family < nq ? qp[c->gfx_family].timestampValidBits : 0;
+    free(qp);
+    rts_period = c->props.limits.timestampPeriod;
+    VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = RTS_SLOTS};
+    if (!bits || rts_period <= 0 || vkCreateQueryPool(c->device, &qi, NULL, &rts_pool) != VK_SUCCESS) return 0;
+    rts_mask = bits >= 64 ? ~0ull : (1ull << bits) - 1;
+    vkResetQueryPool(c->device, rts_pool, 0, RTS_SLOTS);
+    rts_state = 1;
+    rt_log("vk_exec: timestamp reports carry the GPU's time at their point in the stream, in 31.25 MHz ticks (OOT_CNT_GPU=1)");
+    return 1;
+}
+typedef struct { uint64_t addr; int slot; } RtsCb;
+// The GPU clock on the host's epoch: an anchor that follows the host when the two drift apart by more than a frame.
+static uint64_t rts_host_ns(uint64_t gpu_ns) {
+    static uint64_t base_gpu, base_cpu;
+    static int have;
+    uint64_t cpu = kern_now_ns();
+    if (!have) have = 1, base_gpu = gpu_ns, base_cpu = cpu;
+    uint64_t ns = base_cpu + (gpu_ns - base_gpu);
+    if (ns > cpu || cpu - ns > 30000000ull) {   // ahead of the host or a frame behind: anchor again
+        base_gpu = gpu_ns, base_cpu = cpu;
+        ns = cpu;
+    }
+    return ns;
+}
+// A timestamp report's value on the Switch 2 clock (ns, 32 per tick). OOT_CNT_GPU=0: 19.2 MHz as before.
+static void write_counter_ns(uint64_t addr, uint64_t counter, uint64_t ns) {
+    uint64_t rec[2] = {counter, rts_state > 0 ? ns / 32 : ticks_of_ns(ns)};
+    memcpy((void *)(uintptr_t)addr, rec, sizeof rec);
+}
 static void counter_cb(void *arg) {
-    uint64_t *addr = arg;
-    write_counter(*addr, 0);
-    free(addr);
+    RtsCb *a = arg;
+    uint64_t ns = kern_now_ns();
+    if (a->slot >= 0) {
+        uint64_t v[2] = {0, 0};
+        VkResult r = vkGetQueryPoolResults(vk_ctx()->device, rts_pool, (uint32_t)a->slot, 1, sizeof v, v, sizeof v, VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        if (r == VK_SUCCESS && v[1]) ns = rts_host_ns((uint64_t)((double)(v[0] & rts_mask) * rts_period));
+        vkResetQueryPool(vk_ctx()->device, rts_pool, (uint32_t)a->slot, 1);
+        InterlockedExchange(&rts_busy[a->slot], 0);
+    }
+    write_counter_ns(a->addr, 0, ns);
+    free(a);
 }
 
 // Reports queued by the replay that the GPU has not finished. The condition of RENDER_COND reads a timestamp one as 0
@@ -318,9 +389,17 @@ static void report_counter(VkExec *ex, const p_report_counter *p) {
     if (samples && oq_mode() == 2) write_counter(p->addr, 1u << 20);   // not ready yet: visible
     if (samples) oq_report(ex, p->addr);
     else {
-        uint64_t *a = malloc(sizeof *a);
+        RtsCb *a = malloc(sizeof *a);
         if (!a) rt_fatal("vk: out of memory");
-        *a = p->addr;
+        a->addr = p->addr, a->slot = -1;
+        if (rts_ready()) {
+            uint32_t s = InterlockedIncrement((volatile LONG *)&rts_next) % RTS_SLOTS;
+            if (!InterlockedCompareExchange(&rts_busy[s], 1, 0)) {
+                a->slot = (int)s;
+                vkCmdWriteTimestamp2(ex->cb, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, rts_pool, s);
+                ex->recorded++;
+            }
+        }
         vk_completion_add(ex->fence, counter_cb, a);
     }
     pending[pending_head++ % PENDING] = (typeof(pending[0])){p->addr, ex->fence, samples};

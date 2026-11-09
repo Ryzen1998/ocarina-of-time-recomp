@@ -479,9 +479,46 @@ void perf_summary_flush(void) {   // at exit (prof_write)
     summary_t0 = 0;
 }
 
+// OOT_FRAME_CSV=<file> (diagnostic, off by default): one line per frame with the interval, the render thread's waits,
+// the replay and the texture uploads of the frame. The 60 s frametime lines name only the five worst frames of a period.
+static volatile LONG64 csv_tex_new, csv_tex_re, csv_tex_bytes, csv_tex_alloc, csv_tex_swz;
+void perf_tex_note(int re, uint64_t bytes, uint64_t alloc_ns, uint64_t swizzle_ns) {
+    InterlockedIncrement64(re ? &csv_tex_re : &csv_tex_new);
+    InterlockedAdd64(&csv_tex_bytes, (LONG64)bytes);
+    InterlockedAdd64(&csv_tex_alloc, (LONG64)alloc_ns);
+    InterlockedAdd64(&csv_tex_swz, (LONG64)swizzle_ns);
+}
+static void csv_frame(uint64_t frame, uint64_t now, uint64_t d, uint64_t rep) {
+    static FILE *f;
+    static int state;
+    static uint64_t t0, gpu_prev;
+    if (state < 0) return;
+    if (!state) {
+        const char *p = getenv("OOT_FRAME_CSV");
+        if (!p || !*p || !(f = fopen(p, "w"))) { state = -1; return; }
+        state = 1, t0 = now;
+        fprintf(f, "frame,t_s,ms,pace,fence,drain,pipe,xlate,tex,astc,replay,gpu,tex_new,tex_re,tex_mib,tex_alloc,tex_swizzle,vram_mib\n");
+    }
+    static uint64_t vram;
+    if (!(frame % 30)) {
+        extern __attribute__((weak)) int vk_mem_vram(uint64_t *used, uint64_t *budget, int *exact);
+        uint64_t u = 0, b; int ex;
+        if (vk_mem_vram && vk_mem_vram(&u, &b, &ex)) vram = u;
+    }
+    uint64_t gpu = perf_gpu_busy_total();
+    LONG64 nw = InterlockedExchange64(&csv_tex_new, 0), re = InterlockedExchange64(&csv_tex_re, 0), by = InterlockedExchange64(&csv_tex_bytes, 0);
+    LONG64 al = InterlockedExchange64(&csv_tex_alloc, 0), sw = InterlockedExchange64(&csv_tex_swz, 0);
+    fprintf(f, "%llu,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%lld,%lld,%.2f,%.2f,%.2f,%.0f\n", (unsigned long long)frame, (now - t0) / 1e9, d / 1e6,
+            frame_ns[PERF_PACE] / 1e6, frame_ns[PERF_FENCE] / 1e6, frame_ns[PERF_DRAIN] / 1e6, frame_ns[PERF_PIPE] / 1e6, frame_ns[PERF_XLATE] / 1e6,
+            frame_ns[PERF_TEX] / 1e6, frame_ns[PERF_ASTC] / 1e6, rep / 1e6, (gpu - gpu_prev) / 1e6, (long long)nw, (long long)re, by / 1048576.0, al / 1e6, sw / 1e6, vram / 1048576.0);
+    gpu_prev = gpu;
+    if (!(frame % 60)) fflush(f);
+}
+
 // Returns the replay time since the previous present.
 static uint64_t ft_frame(uint64_t frame, uint64_t now, uint64_t d) {
     LONG64 rep = InterlockedExchange64(&frame_replay_ns, 0);
+    csv_frame(frame, now, d, (uint64_t)rep);
     if (!summary_t0) {   // the first present starts the period; there is no interval yet
         summary_t0 = now;
         ft.t0 = now;

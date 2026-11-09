@@ -62,11 +62,18 @@ NVN_API(nvnDeviceIsExternalDebuggerAttached) { ret_x(c, 0); }
 NVN_API(nvnDeviceSetAutomaticCheckpointsMask) { (void)c; }
 
 // ---------- timestamps: counters are written in Tegra 19.2 MHz ticks, the base of GetSystemTick (rt_ticks)
+// A report's timestamp ticks: 31.25 MHz, the Switch 2's rate (vk_exec_xfer.c, the reports of the game's raw timestamp differences), unless OOT_CNT_GPU=0.
+static int report_rate_switch2(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("OOT_CNT_GPU"); on = e && e[0] == '1'; }
+    return on;
+}
+static uint64_t report_ticks_to_ns(uint64_t t) { return report_rate_switch2() ? t * 32 : t / 12 * 625 + t % 12 * 625 / 12; }
 static uint64_t ticks_to_ns(uint64_t t) { return t / 12 * 625 + t % 12 * 625 / 12; }
 // uint64_t nvnDeviceGetCurrentTimestampInNanoseconds(const NVNdevice *d)
 NVN_API(nvnDeviceGetCurrentTimestampInNanoseconds) { ret_x(c, ticks_to_ns(rt_ticks())); }
 // uint64_t nvnDeviceGetTimestampInNanoseconds(const NVNdevice *d, const NVNcounterData *counter)
-NVN_API(nvnDeviceGetTimestampInNanoseconds) { ret_x(c, ticks_to_ns(((const NVNcounterData *)arg_p(c, 1))->timestamp)); }
+NVN_API(nvnDeviceGetTimestampInNanoseconds) { ret_x(c, report_ticks_to_ns(((const NVNcounterData *)arg_p(c, 1))->timestamp)); }
 
 // ---------- memory pools and buffers
 // size_t nvnMemoryPoolGetSize(const NVNmemoryPool *p)
